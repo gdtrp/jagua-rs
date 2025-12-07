@@ -134,6 +134,7 @@ pub struct SqsProcessor {
     sqs_client: SqsClient,
     s3_client: S3Client,
     s3_bucket: String,
+    aws_region: String,
     input_queue_url: String,
     output_queue_url: String,
     cancellation_registry: Arc<Mutex<HashMap<String, bool>>>,
@@ -150,6 +151,7 @@ impl SqsProcessor {
         sqs_client: SqsClient,
         s3_client: S3Client,
         s3_bucket: String,
+        aws_region: String,
         input_queue_url: String,
         output_queue_url: String,
     ) -> Self {
@@ -157,6 +159,7 @@ impl SqsProcessor {
             sqs_client,
             s3_client,
             s3_bucket,
+            aws_region,
             input_queue_url,
             output_queue_url,
             cancellation_registry: Arc::new(Mutex::new(HashMap::new())),
@@ -170,7 +173,7 @@ impl SqsProcessor {
         request_id: &str,
         filename: &str,
     ) -> Result<String> {
-        upload_svg_to_s3_internal(&self.s3_client, &self.s3_bucket, svg_bytes, request_id, filename).await
+        upload_svg_to_s3_internal(&self.s3_client, &self.s3_bucket, &self.aws_region, svg_bytes, request_id, filename).await
     }
 
     /// Download SVG from S3 URL
@@ -260,12 +263,13 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
 async fn upload_svg_to_s3_internal(
     s3_client: &S3Client,
     s3_bucket: &str,
+    aws_region: &str,
     svg_bytes: &[u8],
     request_id: &str,
     filename: &str,
 ) -> Result<String> {
     let s3_key = format!("nesting/{}/{}", request_id, filename);
-    let s3_url = format!("s3://{}/{}", s3_bucket, s3_key);
+    let s3_url = format!("https://{}.s3.{}.amazonaws.com/{}", s3_bucket, aws_region, s3_key);
     
     info!("Uploading SVG to S3: bucket={}, key={}, size={} bytes", 
         s3_bucket, s3_key, svg_bytes.len());
@@ -653,6 +657,7 @@ impl SqsProcessor {
             let sqs_client_for_task = self.sqs_client.clone();
             let s3_client_for_task = self.s3_client.clone();
             let s3_bucket_for_task = self.s3_bucket.clone();
+            let aws_region_for_task = self.aws_region.clone();
             let output_queue_url_for_task = output_queue_url.to_string();
             let correlation_id_for_task = request.correlation_id.clone();
             let bin_width_for_task = bin_width;
@@ -672,6 +677,7 @@ impl SqsProcessor {
                     let first_page_svg_url = match upload_svg_to_s3_internal(
                         &s3_client_for_task,
                         &s3_bucket_for_task,
+                        &aws_region_for_task,
                         first_page_bytes,
                         &correlation_id_for_task,
                         "first-page.svg",
@@ -690,6 +696,7 @@ impl SqsProcessor {
                     let last_page_svg_url = match upload_svg_to_s3_internal(
                         &s3_client_for_task,
                         &s3_bucket_for_task,
+                        &aws_region_for_task,
                         last_page_bytes,
                         &correlation_id_for_task,
                         "last-page.svg",

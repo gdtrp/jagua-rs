@@ -26,11 +26,13 @@ async fn main() -> Result<()> {
         .context("OUTPUT_QUEUE_URL environment variable is required")?;
     let s3_bucket = env::var("S3_BUCKET")
         .context("S3_BUCKET environment variable is required")?;
+    let aws_region = env::var("AWS_REGION").unwrap_or_else(|_| "eu-north-1".to_string());
 
     info!("Configuration:");
     info!("  INPUT_QUEUE_URL: {}", input_queue_url);
     info!("  OUTPUT_QUEUE_URL: {}", output_queue_url);
     info!("  S3_BUCKET: {}", s3_bucket);
+    info!("  AWS_REGION: {}", aws_region);
     
     // Log AWS configuration
     info!("AWS Configuration:");
@@ -58,7 +60,7 @@ async fn main() -> Result<()> {
     let s3_client = S3Client::new(&config);
 
     // Create processor
-    let processor = SqsProcessor::new(sqs_client, s3_client, s3_bucket, input_queue_url, output_queue_url);
+    let processor = SqsProcessor::new(sqs_client, s3_client, s3_bucket, aws_region, input_queue_url, output_queue_url);
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
