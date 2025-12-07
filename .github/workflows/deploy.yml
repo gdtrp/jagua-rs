@@ -16,7 +16,7 @@ env:
   ECS_CLUSTER_STAGING: CUTLStagingCluster
   ECS_SERVICE_STAGING: CUTLStagingJaguaSqsProcessorService
   ECS_CLUSTER_PROD: CUTL-prodProductionCluster
-  ECS_SERVICE_PROD: CUTL-prodProductionClusterJaguaSqsProcessorService
+  ECS_SERVICE_PROD: CUTL-prodProductionJaguaSqsProcessorService
 
 jobs:
   build-and-push:
