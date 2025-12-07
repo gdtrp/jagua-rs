@@ -670,8 +670,22 @@ impl SqsProcessor {
                     // Get the first and last page SVGs for uploading to S3
                     let first_page_bytes = result.page_svgs.first()
                         .unwrap_or_else(|| &result.combined_svg);
-                    let last_page_bytes = result.page_svgs.last()
-                        .unwrap_or_else(|| &result.combined_svg);
+                    
+                    // If all parts are placed, generate empty page for last page
+                    // Otherwise, use unplaced parts SVG if available, or last filled page
+                    let last_page_bytes: Vec<u8> = if result.parts_placed == result.total_parts_requested {
+                        // All parts placed - generate empty page
+                        info!("Improvement handler: Hit branch - all parts placed ({}), generating empty page", result.parts_placed);
+                        generate_empty_page_svg(bin_width_for_task, bin_height_for_task)
+                    } else if let Some(ref unplaced_svg) = result.unplaced_parts_svg {
+                        // Some parts unplaced - use unplaced parts SVG
+                        info!("Improvement handler: Hit branch - some parts unplaced ({} of {}), using unplaced parts SVG", result.parts_placed, result.total_parts_requested);
+                        unplaced_svg.clone()
+                    } else {
+                        // No unplaced parts SVG - use last filled page or first page
+                        info!("Improvement handler: Hit branch - no unplaced parts SVG available, using last filled page or first page (parts_placed: {} of {})", result.parts_placed, result.total_parts_requested);
+                        result.page_svgs.last().unwrap_or(first_page_bytes).clone()
+                    };
                     
                     // Upload first page SVG to S3
                     let first_page_svg_url = match upload_svg_to_s3_internal(
@@ -697,7 +711,7 @@ impl SqsProcessor {
                         &s3_client_for_task,
                         &s3_bucket_for_task,
                         &aws_region_for_task,
-                        last_page_bytes,
+                        &last_page_bytes,
                         &correlation_id_for_task,
                         "last-page.svg",
                     ).await {
@@ -830,8 +844,22 @@ impl SqsProcessor {
             // Use first page SVG for first sheet
             let first_page_bytes = nesting_result.page_svgs.first()
                 .unwrap_or_else(|| &nesting_result.combined_svg);
-            let last_page_bytes = nesting_result.page_svgs.last()
-                .unwrap_or_else(|| &nesting_result.combined_svg);
+            
+            // If all parts are placed, generate empty page for last page
+            // Otherwise, use unplaced parts SVG if available, or last filled page
+            let last_page_bytes: Vec<u8> = if nesting_result.parts_placed == nesting_result.total_parts_requested {
+                // All parts placed - generate empty page
+                info!("Final handler: Hit branch - all parts placed ({}), generating empty page", nesting_result.parts_placed);
+                generate_empty_page_svg(bin_width, bin_height)
+            } else if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
+                // Some parts unplaced - use unplaced parts SVG
+                info!("Final handler: Hit branch - some parts unplaced ({} of {}), using unplaced parts SVG", nesting_result.parts_placed, nesting_result.total_parts_requested);
+                unplaced_svg.clone()
+            } else {
+                // No unplaced parts SVG - use last filled page or first page
+                info!("Final handler: Hit branch - no unplaced parts SVG available, using last filled page or first page (parts_placed: {} of {})", nesting_result.parts_placed, nesting_result.total_parts_requested);
+                nesting_result.page_svgs.last().unwrap_or(first_page_bytes).clone()
+            };
             
             // Upload first page SVG to S3
             let first_page_svg_url = match self.upload_svg_to_s3(first_page_bytes, &request.correlation_id, "first-page.svg").await {
@@ -846,7 +874,7 @@ impl SqsProcessor {
             };
             
             // Upload last page SVG to S3
-            let last_page_svg_url = match self.upload_svg_to_s3(last_page_bytes, &request.correlation_id, "last-page.svg").await {
+            let last_page_svg_url = match self.upload_svg_to_s3(&last_page_bytes, &request.correlation_id, "last-page.svg").await {
                 Ok(url) => {
                     info!("Uploaded final result last page SVG to S3: {}", url);
                     Some(url)
