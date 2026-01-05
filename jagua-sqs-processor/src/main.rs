@@ -85,8 +85,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start listening and processing (single-threaded)
-    let result = processor.listen_and_process(1, shutdown_rx).await;
+    // Start listening and processing
+    let result = processor.listen_and_process(shutdown_rx).await;
 
     // Give a moment for any final cleanup
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

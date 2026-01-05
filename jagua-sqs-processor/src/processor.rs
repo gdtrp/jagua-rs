@@ -2,17 +2,29 @@ use anyhow::{anyhow, Context, Result};
 use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_s3::Client as S3Client;
 use base64::{engine::general_purpose, Engine as _};
-use futures::StreamExt;
-use jagua_utils::svg_nesting::{NestingStrategy, AdaptiveNestingStrategy};
-use log::{debug, error, info};
+use jagua_utils::svg_nesting::{NestingStrategy, AdaptiveNestingStrategy, NestingResult};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+
+/// Default maximum concurrent processing tasks
+const DEFAULT_MAX_CONCURRENT_TASKS: usize = 20;
+
+/// Maximum retry attempts for AWS operations
+const MAX_RETRY_ATTEMPTS: u32 = 3;
+
+/// Base delay for exponential backoff (in milliseconds)
+const RETRY_BASE_DELAY_MS: u64 = 100;
+
+/// TTL for orphaned cancellation registry entries (in seconds)
+const CANCELLATION_REGISTRY_TTL_SECS: u64 = 300; // 5 minutes
 
 /// Request message structure for SQS queue
 /// For cancellation requests, only `correlation_id` and `cancelled: true` are required.
@@ -51,10 +63,6 @@ pub struct SqsNestingRequest {
     pub cancelled: bool,
 }
 
-fn encode_svg(bytes: &[u8]) -> String {
-    general_purpose::STANDARD.encode(bytes)
-}
-
 /// Generate an empty page SVG (used when all parts are placed)
 fn generate_empty_page_svg(bin_width: f32, bin_height: f32) -> Vec<u8> {
     format!(
@@ -78,12 +86,6 @@ fn generate_empty_page_svg(bin_width: f32, bin_height: f32) -> Vec<u8> {
     .into_bytes()
 }
 
-fn sanitize_svg_fields(response: &SqsNestingResponse) -> SqsNestingResponse {
-    let mut sanitized = response.clone();
-    // URLs are already small, no need to sanitize
-    sanitized
-}
-
 fn decode_svg(encoded: &str) -> Result<Vec<u8>> {
     general_purpose::STANDARD
         .decode(encoded)
@@ -99,6 +101,93 @@ fn current_timestamp() -> u64 {
 
 fn default_rotations() -> usize {
     8
+}
+
+/// Helper to safely lock a mutex, recovering from poison errors
+fn safe_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Retry an async operation with exponential backoff
+async fn retry_with_backoff<F, Fut, T, E>(
+    operation_name: &str,
+    mut operation: F,
+) -> std::result::Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(e) if attempts < MAX_RETRY_ATTEMPTS => {
+                let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * 2u64.pow(attempts - 1));
+                warn!(
+                    "{} failed (attempt {}/{}): {}. Retrying in {:?}...",
+                    operation_name, attempts, MAX_RETRY_ATTEMPTS, e, delay
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => {
+                error!(
+                    "{} failed after {} attempts: {}",
+                    operation_name, attempts, e
+                );
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Determine the last page SVG bytes based on nesting result
+/// Returns empty page SVG if all parts placed, unplaced parts SVG if available,
+/// otherwise the last filled page
+fn determine_last_page_svg(
+    result: &NestingResult,
+    first_page_bytes: &[u8],
+    bin_width: f32,
+    bin_height: f32,
+) -> Vec<u8> {
+    if result.parts_placed == result.total_parts_requested {
+        // All parts placed - generate empty page
+        info!(
+            "All parts placed ({}), generating empty page",
+            result.parts_placed
+        );
+        generate_empty_page_svg(bin_width, bin_height)
+    } else if let Some(ref unplaced_svg) = result.unplaced_parts_svg {
+        // Some parts unplaced - use unplaced parts SVG
+        info!(
+            "Some parts unplaced ({} of {}), using unplaced parts SVG",
+            result.parts_placed, result.total_parts_requested
+        );
+        unplaced_svg.clone()
+    } else {
+        // No unplaced parts SVG - use last filled page or first page
+        info!(
+            "No unplaced parts SVG available, using last filled page (parts_placed: {} of {})",
+            result.parts_placed, result.total_parts_requested
+        );
+        result.page_svgs.last().unwrap_or(&first_page_bytes.to_vec()).clone()
+    }
+}
+
+/// Get the maximum concurrent tasks from environment or use default
+fn get_max_concurrent_tasks() -> usize {
+    std::env::var("MAX_CONCURRENT_TASKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_TASKS)
+}
+
+/// Cancellation registry entry with timestamp for TTL-based cleanup
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CancellationEntry {
+    pub(crate) cancelled: bool,
+    pub(crate) created_at: Instant,
 }
 
 /// Response message structure for SQS queue
@@ -137,13 +226,78 @@ pub struct SqsProcessor {
     aws_region: String,
     input_queue_url: String,
     output_queue_url: String,
-    cancellation_registry: Arc<Mutex<HashMap<String, bool>>>,
+    cancellation_registry: Arc<Mutex<HashMap<String, CancellationEntry>>>,
 }
 
 impl SqsProcessor {
+    /// Mark a correlation_id as cancelled. Returns true if it was already registered.
     fn mark_cancelled(&self, correlation_id: &str) -> bool {
-        let mut registry = self.cancellation_registry.lock().unwrap();
-        registry.insert(correlation_id.to_string(), true).is_some()
+        let mut registry = safe_lock(&self.cancellation_registry);
+        if let Some(entry) = registry.get_mut(correlation_id) {
+            entry.cancelled = true;
+            true
+        } else {
+            // Insert new entry for future cancellation check
+            registry.insert(
+                correlation_id.to_string(),
+                CancellationEntry {
+                    cancelled: true,
+                    created_at: Instant::now(),
+                },
+            );
+            false
+        }
+    }
+
+    /// Check if a correlation_id is cancelled
+    fn is_cancelled(&self, correlation_id: &str) -> bool {
+        let registry = safe_lock(&self.cancellation_registry);
+        registry
+            .get(correlation_id)
+            .map(|e| e.cancelled)
+            .unwrap_or(false)
+    }
+
+    /// Register a correlation_id in the cancellation registry
+    fn register_correlation_id(&self, correlation_id: &str) {
+        let mut registry = safe_lock(&self.cancellation_registry);
+        registry.insert(
+            correlation_id.to_string(),
+            CancellationEntry {
+                cancelled: false,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Remove a correlation_id from the cancellation registry
+    fn unregister_correlation_id(&self, correlation_id: &str) {
+        let mut registry = safe_lock(&self.cancellation_registry);
+        registry.remove(correlation_id);
+    }
+
+    /// Clean up expired entries from the cancellation registry
+    fn cleanup_expired_entries(&self) {
+        let mut registry = safe_lock(&self.cancellation_registry);
+        let now = Instant::now();
+        let ttl = Duration::from_secs(CANCELLATION_REGISTRY_TTL_SECS);
+
+        let expired_keys: Vec<String> = registry
+            .iter()
+            .filter(|(_, entry)| now.duration_since(entry.created_at) > ttl)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for key in &expired_keys {
+            registry.remove(key);
+        }
+
+        if !expired_keys.is_empty() {
+            info!(
+                "Cleaned up {} expired entries from cancellation registry",
+                expired_keys.len()
+            );
+        }
     }
 
     /// Create a new SQS processor
@@ -164,16 +318,6 @@ impl SqsProcessor {
             output_queue_url,
             cancellation_registry: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    /// Upload SVG to S3 and return the S3 URL
-    async fn upload_svg_to_s3(
-        &self,
-        svg_bytes: &[u8],
-        request_id: &str,
-        filename: &str,
-    ) -> Result<String> {
-        upload_svg_to_s3_internal(&self.s3_client, &self.s3_bucket, &self.aws_region, svg_bytes, request_id, filename).await
     }
 
     /// Download SVG from S3 URL
@@ -216,19 +360,25 @@ impl SqsProcessor {
         };
 
         // Collect the body stream into bytes
-        let mut svg_bytes = Vec::new();
-        let mut body_stream = response.body;
-        use futures::StreamExt;
-        while let Some(chunk_result) = body_stream.next().await {
-            let chunk = chunk_result.context("Failed to read chunk from S3 object body")?;
-            svg_bytes.extend_from_slice(&chunk);
-        }
+        let svg_bytes = response
+            .body
+            .collect()
+            .await
+            .context("Failed to read S3 object body")?
+            .into_bytes()
+            .to_vec();
         info!("Downloaded SVG from S3: {} bytes", svg_bytes.len());
         Ok(svg_bytes)
     }
 }
 
 /// Parse S3 URL and extract bucket and key
+/// Supports multiple formats:
+/// - s3://bucket/key
+/// - https://bucket.s3.region.amazonaws.com/key (virtual-hosted style)
+/// - https://bucket.s3-region.amazonaws.com/key (virtual-hosted style with dash)
+/// - https://s3.region.amazonaws.com/bucket/key (path-style)
+/// - https://s3-region.amazonaws.com/bucket/key (path-style with dash)
 fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
     // Handle s3://bucket/key format
     if s3_url.starts_with("s3://") {
@@ -236,27 +386,55 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
         if let Some(slash_pos) = path.find('/') {
             let bucket = path[..slash_pos].to_string();
             let key = path[slash_pos + 1..].to_string();
+            if bucket.is_empty() || key.is_empty() {
+                return Err(anyhow!("Invalid S3 URL: bucket or key is empty: {}", s3_url));
+            }
             return Ok((bucket, key));
         }
-        return Err(anyhow!("Invalid S3 URL format: {}", s3_url));
+        return Err(anyhow!("Invalid S3 URL format (missing key): {}", s3_url));
     }
-    
-    // Handle https://bucket.s3.region.amazonaws.com/key format
+
+    // Handle HTTPS formats
     if s3_url.starts_with("https://") {
         let url = s3_url.strip_prefix("https://").unwrap();
-        // Extract bucket (first part before .s3)
+
+        // Check for path-style URL: https://s3.region.amazonaws.com/bucket/key
+        // or https://s3-region.amazonaws.com/bucket/key
+        if url.starts_with("s3.") || url.starts_with("s3-") {
+            // Path-style URL
+            if let Some(aws_pos) = url.find(".amazonaws.com/") {
+                let path = &url[aws_pos + 15..];
+                if let Some(slash_pos) = path.find('/') {
+                    let bucket = path[..slash_pos].to_string();
+                    let key = path[slash_pos + 1..].to_string();
+                    if bucket.is_empty() || key.is_empty() {
+                        return Err(anyhow!("Invalid S3 path-style URL: bucket or key is empty: {}", s3_url));
+                    }
+                    return Ok((bucket, key));
+                }
+                return Err(anyhow!("Invalid S3 path-style URL (missing key): {}", s3_url));
+            }
+        }
+
+        // Virtual-hosted style: https://bucket.s3.region.amazonaws.com/key
+        // or https://bucket.s3-region.amazonaws.com/key
         if let Some(s3_pos) = url.find(".s3") {
             let bucket = url[..s3_pos].to_string();
             // Extract key (everything after .amazonaws.com/)
             if let Some(aws_pos) = url.find(".amazonaws.com/") {
                 let key = url[aws_pos + 15..].to_string();
+                if bucket.is_empty() || key.is_empty() {
+                    return Err(anyhow!("Invalid S3 virtual-hosted URL: bucket or key is empty: {}", s3_url));
+                }
                 return Ok((bucket, key));
             }
+            return Err(anyhow!("Invalid S3 virtual-hosted URL (missing .amazonaws.com): {}", s3_url));
         }
-        return Err(anyhow!("Invalid S3 HTTPS URL format: {}", s3_url));
+
+        return Err(anyhow!("Unrecognized S3 HTTPS URL format: {}", s3_url));
     }
-    
-    Err(anyhow!("Unsupported S3 URL format: {}", s3_url))
+
+    Err(anyhow!("Unsupported S3 URL format (must start with s3:// or https://): {}", s3_url))
 }
 
 /// Internal helper function to upload SVG to S3 (used by both improvement and final responses)
@@ -341,15 +519,21 @@ impl SqsProcessor {
         queue_url: &str,
         response: &SqsNestingResponse,
     ) -> Result<()> {
-        let sanitized_response = sanitize_svg_fields(response);
-        let sanitized_body = serde_json::to_string(&sanitized_response)
-            .unwrap_or_else(|_| "<failed to serialize sanitized response>".to_string());
+        let sqs_client = self.sqs_client.clone();
+        let queue_url_owned = queue_url.to_string();
+        let response_clone = response.clone();
 
-        Self::send_message_to_sqs(&self.sqs_client, queue_url, response).await?;
+        retry_with_backoff("send_to_output_queue", || {
+            let client = sqs_client.clone();
+            let url = queue_url_owned.clone();
+            let resp = response_clone.clone();
+            async move { Self::send_message_to_sqs(&client, &url, &resp).await }
+        })
+        .await?;
 
-        info!(
-            "Emitted response to {} with stripped payload: {}",
-            queue_url, sanitized_body
+        debug!(
+            "Emitted response to {}: correlation_id={}, parts_placed={}, is_final={}",
+            queue_url, response.correlation_id, response.parts_placed, response.is_final
         );
 
         Ok(())
@@ -608,13 +792,10 @@ impl SqsProcessor {
         output_queue_url: &str,
     ) -> Result<()> {
         // Register correlation_id in cancellation registry
-        {
-            let mut registry = self.cancellation_registry.lock().unwrap();
-            registry.insert(request.correlation_id.clone(), false);
-        }
+        self.register_correlation_id(&request.correlation_id);
 
         // Ensure cleanup happens even on error
-        let result = {
+        let result = async {
             // Unwrap required fields (validation already done in process_message)
             let bin_width = request.bin_width.unwrap();
             let bin_height = request.bin_height.unwrap();
@@ -622,7 +803,7 @@ impl SqsProcessor {
             let amount_of_parts = request.amount_of_parts.unwrap();
 
             // Get SVG bytes - either from S3 or from base64
-            let decode_start = std::time::Instant::now();
+            let decode_start = Instant::now();
             let svg_bytes = if let Some(ref svg_url) = request.svg_url {
                 // Download from S3
                 info!("Downloading SVG from S3: {}", svg_url);
@@ -635,8 +816,8 @@ impl SqsProcessor {
             };
             info!("SVG payload ready: {} bytes (took {:?})", svg_bytes.len(), decode_start.elapsed());
 
-            // Create cancellation checker closure
-            let cancellation_registry = self.cancellation_registry.clone();
+            // Create cancellation checker closure using the helper method
+            let processor_clone = self.clone();
             let correlation_id_clone = request.correlation_id.clone();
             let cancellation_check_count = Arc::new(AtomicU64::new(0));
             let cancellation_check_count_for_log = cancellation_check_count.clone();
@@ -645,13 +826,12 @@ impl SqsProcessor {
                 if count % 1000 == 0 {
                     log::debug!("Cancellation checker called {} times", count);
                 }
-                let registry = cancellation_registry.lock().unwrap();
-                registry.get(&correlation_id_clone).copied().unwrap_or(false)
+                processor_clone.is_cancelled(&correlation_id_clone)
             };
 
             // Create channel for sending improvement results from sync callback to async task
-            let (tx, mut rx) = mpsc::unbounded_channel::<jagua_utils::svg_nesting::NestingResult>();
-            
+            let (tx, mut rx) = mpsc::unbounded_channel::<NestingResult>();
+
             // Spawn async task to handle improvement messages
             info!("Spawning async task to handle improvement messages");
             let sqs_client_for_task = self.sqs_client.clone();
@@ -662,65 +842,62 @@ impl SqsProcessor {
             let correlation_id_for_task = request.correlation_id.clone();
             let bin_width_for_task = bin_width;
             let bin_height_for_task = bin_height;
-            let _improvement_task_handle = tokio::spawn(async move {
+
+            let improvement_task_handle = tokio::spawn(async move {
                 info!("Improvement task started, waiting for messages...");
                 while let Some(result) = rx.recv().await {
                     info!("Improvement task received message: {} parts placed, {} pages", result.parts_placed, result.page_svgs.len());
-                    
+
                     // Get the first and last page SVGs for uploading to S3
                     let first_page_bytes = result.page_svgs.first()
-                        .unwrap_or_else(|| &result.combined_svg);
-                    
-                    // If all parts are placed, generate empty page for last page
-                    // Otherwise, use unplaced parts SVG if available, or last filled page
-                    let last_page_bytes: Vec<u8> = if result.parts_placed == result.total_parts_requested {
-                        // All parts placed - generate empty page
-                        info!("Improvement handler: Hit branch - all parts placed ({}), generating empty page", result.parts_placed);
-                        generate_empty_page_svg(bin_width_for_task, bin_height_for_task)
-                    } else if let Some(ref unplaced_svg) = result.unplaced_parts_svg {
-                        // Some parts unplaced - use unplaced parts SVG
-                        info!("Improvement handler: Hit branch - some parts unplaced ({} of {}), using unplaced parts SVG", result.parts_placed, result.total_parts_requested);
-                        unplaced_svg.clone()
-                    } else {
-                        // No unplaced parts SVG - use last filled page or first page
-                        info!("Improvement handler: Hit branch - no unplaced parts SVG available, using last filled page or first page (parts_placed: {} of {})", result.parts_placed, result.total_parts_requested);
-                        result.page_svgs.last().unwrap_or(first_page_bytes).clone()
-                    };
-                    
-                    // Upload first page SVG to S3
-                    let first_page_svg_url = match upload_svg_to_s3_internal(
-                        &s3_client_for_task,
-                        &s3_bucket_for_task,
-                        &aws_region_for_task,
+                        .unwrap_or(&result.combined_svg);
+
+                    // Use shared helper function to determine last page
+                    let last_page_bytes = determine_last_page_svg(
+                        &result,
                         first_page_bytes,
-                        &correlation_id_for_task,
-                        "first-page.svg",
-                    ).await {
+                        bin_width_for_task,
+                        bin_height_for_task,
+                    );
+
+                    // Upload first page SVG to S3 with retry
+                    let first_page_svg_url = match retry_with_backoff("upload improvement first page", || {
+                        let client = s3_client_for_task.clone();
+                        let bucket = s3_bucket_for_task.clone();
+                        let region = aws_region_for_task.clone();
+                        let bytes = first_page_bytes.clone();
+                        let corr_id = correlation_id_for_task.clone();
+                        async move {
+                            upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "first-page.svg").await
+                        }
+                    }).await {
                         Ok(url) => {
                             info!("Uploaded improvement first page SVG to S3: {}", url);
                             Some(url)
                         }
                         Err(e) => {
-                            error!("Failed to upload improvement first page SVG to S3: {}", e);
+                            error!("Failed to upload improvement first page SVG to S3 after retries: {}", e);
                             None
                         }
                     };
-                    
-                    // Upload last page SVG to S3
-                    let last_page_svg_url = match upload_svg_to_s3_internal(
-                        &s3_client_for_task,
-                        &s3_bucket_for_task,
-                        &aws_region_for_task,
-                        &last_page_bytes,
-                        &correlation_id_for_task,
-                        "last-page.svg",
-                    ).await {
+
+                    // Upload last page SVG to S3 with retry
+                    let last_page_svg_url = match retry_with_backoff("upload improvement last page", || {
+                        let client = s3_client_for_task.clone();
+                        let bucket = s3_bucket_for_task.clone();
+                        let region = aws_region_for_task.clone();
+                        let bytes = last_page_bytes.clone();
+                        let corr_id = correlation_id_for_task.clone();
+                        async move {
+                            upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "last-page.svg").await
+                        }
+                    }).await {
                         Ok(url) => {
                             info!("Uploaded improvement last page SVG to S3: {}", url);
                             Some(url)
                         }
                         Err(e) => {
-                            error!("Failed to upload improvement last page SVG to S3: {}", e);
+                            error!("Failed to upload improvement last page SVG to S3 after retries: {}", e);
                             None
                         }
                     };
@@ -737,28 +914,18 @@ impl SqsProcessor {
                         error_message: None,
                     };
 
-                    info!(
-                        "Sending improvement response: {} parts placed",
-                        response.parts_placed
-                    );
+                    info!("Sending improvement response: {} parts placed", response.parts_placed);
 
-                    // Send to SQS using the same method as error responses
-                    info!("Attempting to send improvement to queue: {}", output_queue_url_for_task);
-                    match Self::send_message_to_sqs(&sqs_client_for_task, &output_queue_url_for_task, &response).await {
-                        Ok(()) => {
-                            info!("Successfully sent improvement response to queue");
-                        }
-                        Err(e) => {
-                            error!("Failed to send improvement to queue: {}", e);
-                            // Log the error chain for debugging
-                            let mut error_chain = format!("{}", e);
-                            let mut source = e.source();
-                            while let Some(err) = source {
-                                error_chain.push_str(&format!(": {}", err));
-                                source = err.source();
-                            }
-                            error!("Full error chain: {}", error_chain);
-                        }
+                    // Send to SQS with retry
+                    if let Err(e) = retry_with_backoff("send improvement to SQS", || {
+                        let client = sqs_client_for_task.clone();
+                        let url = output_queue_url_for_task.clone();
+                        let resp = response.clone();
+                        async move { Self::send_message_to_sqs(&client, &url, &resp).await }
+                    }).await {
+                        error!("Failed to send improvement to queue after retries: {}", e);
+                    } else {
+                        info!("Successfully sent improvement response to queue");
                     }
                 }
                 info!("Improvement task finished (channel closed)");
@@ -767,41 +934,32 @@ impl SqsProcessor {
             // Create improvement callback that sends to channel
             info!("Creating improvement callback");
             let tx_for_callback = tx.clone();
-            let improvement_callback: Option<jagua_utils::svg_nesting::ImprovementCallback> = 
-                Some(Box::new(move |result: jagua_utils::svg_nesting::NestingResult| -> Result<()> {
+            let improvement_callback: Option<jagua_utils::svg_nesting::ImprovementCallback> =
+                Some(Box::new(move |result: NestingResult| -> Result<()> {
                     info!("Improvement callback called from blocking thread: {} parts placed, {} pages", result.parts_placed, result.page_svgs.len());
                     // Send result to channel (non-blocking for unbounded channel)
-                    match tx_for_callback.send(result) {
-                        Ok(()) => {
-                            info!("Improvement result sent to channel successfully from blocking thread");
-                            Ok(())
-                        }
-                        Err(e) => {
-                            error!("Failed to send improvement result to channel: {}", e);
-                            Err(anyhow!("Failed to send improvement result to channel: {}", e))
-                        }
-                    }
+                    tx_for_callback.send(result)
+                        .map_err(|e| anyhow!("Failed to send improvement result to channel: {}", e))
                 }));
 
             // Use adaptive nesting strategy with cancellation checker
             info!("Creating AdaptiveNestingStrategy with cancellation checker");
-            let strategy_start = std::time::Instant::now();
+            let strategy_start = Instant::now();
             let strategy = AdaptiveNestingStrategy::with_cancellation_checker(Box::new(cancellation_checker));
             info!("Strategy created (took {:?})", strategy_start.elapsed());
-            
+
             // Clone cancellation_check_count for logging after spawn_blocking
             let cancellation_check_count_for_final_log = cancellation_check_count.clone();
-            
+
             // Run nest() in a blocking task to avoid blocking the async runtime
-            // This allows the improvement task to process messages while optimization runs
             info!("Starting nesting optimization in spawn_blocking task");
-            let nest_start = std::time::Instant::now();
+            let nest_start = Instant::now();
             let svg_bytes_for_nest = svg_bytes.clone();
             let amount_of_rotations = request.amount_of_rotations;
             let correlation_id_for_error = request.correlation_id.clone();
             let nesting_result = tokio::task::spawn_blocking(move || {
                 info!("Inside spawn_blocking: calling strategy.nest()");
-                let nest_call_start = std::time::Instant::now();
+                let nest_call_start = Instant::now();
                 let result = strategy.nest(
                     bin_width,
                     bin_height,
@@ -816,6 +974,7 @@ impl SqsProcessor {
             })
             .await
             .context("Failed to spawn blocking task for nesting")?;
+
             info!("spawn_blocking task completed (took {:?})", nest_start.elapsed());
             let nesting_result = nesting_result.with_context(|| {
                 format!(
@@ -828,10 +987,13 @@ impl SqsProcessor {
 
             // Drop the sender to signal the async task that no more improvements will come
             drop(tx);
-            
-            // Wait a bit for any pending improvement messages to be sent
-            // This ensures all improvements are sent before we send the final result
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // Wait for improvement task to complete (properly await instead of fixed sleep)
+            info!("Waiting for improvement task to complete...");
+            if let Err(e) = improvement_task_handle.await {
+                error!("Improvement task panicked: {}", e);
+            }
+            info!("Improvement task completed");
 
             info!(
                 "Nesting complete: {} parts placed out of {} requested ({} page SVGs generated)",
@@ -840,47 +1002,55 @@ impl SqsProcessor {
                 nesting_result.page_svgs.len()
             );
 
-            // Prepare final response images
-            // Use first page SVG for first sheet
+            // Prepare final response images using shared helper
             let first_page_bytes = nesting_result.page_svgs.first()
-                .unwrap_or_else(|| &nesting_result.combined_svg);
-            
-            // If all parts are placed, generate empty page for last page
-            // Otherwise, use unplaced parts SVG if available, or last filled page
-            let last_page_bytes: Vec<u8> = if nesting_result.parts_placed == nesting_result.total_parts_requested {
-                // All parts placed - generate empty page
-                info!("Final handler: Hit branch - all parts placed ({}), generating empty page", nesting_result.parts_placed);
-                generate_empty_page_svg(bin_width, bin_height)
-            } else if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
-                // Some parts unplaced - use unplaced parts SVG
-                info!("Final handler: Hit branch - some parts unplaced ({} of {}), using unplaced parts SVG", nesting_result.parts_placed, nesting_result.total_parts_requested);
-                unplaced_svg.clone()
-            } else {
-                // No unplaced parts SVG - use last filled page or first page
-                info!("Final handler: Hit branch - no unplaced parts SVG available, using last filled page or first page (parts_placed: {} of {})", nesting_result.parts_placed, nesting_result.total_parts_requested);
-                nesting_result.page_svgs.last().unwrap_or(first_page_bytes).clone()
-            };
-            
-            // Upload first page SVG to S3
-            let first_page_svg_url = match self.upload_svg_to_s3(first_page_bytes, &request.correlation_id, "first-page.svg").await {
+                .unwrap_or(&nesting_result.combined_svg);
+
+            let last_page_bytes = determine_last_page_svg(
+                &nesting_result,
+                first_page_bytes,
+                bin_width,
+                bin_height,
+            );
+
+            // Upload first page SVG to S3 with retry
+            let first_page_svg_url = match retry_with_backoff("upload final first page", || {
+                let s3_client = self.s3_client.clone();
+                let bucket = self.s3_bucket.clone();
+                let region = self.aws_region.clone();
+                let bytes = first_page_bytes.clone();
+                let corr_id = request.correlation_id.clone();
+                async move {
+                    upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "first-page.svg").await
+                }
+            }).await {
                 Ok(url) => {
                     info!("Uploaded final result first page SVG to S3: {}", url);
                     Some(url)
                 }
                 Err(e) => {
-                    error!("Failed to upload final result first page SVG to S3: {}", e);
+                    error!("Failed to upload final result first page SVG to S3 after retries: {}", e);
                     None
                 }
             };
-            
-            // Upload last page SVG to S3
-            let last_page_svg_url = match self.upload_svg_to_s3(&last_page_bytes, &request.correlation_id, "last-page.svg").await {
+
+            // Upload last page SVG to S3 with retry
+            let last_page_svg_url = match retry_with_backoff("upload final last page", || {
+                let s3_client = self.s3_client.clone();
+                let bucket = self.s3_bucket.clone();
+                let region = self.aws_region.clone();
+                let bytes = last_page_bytes.clone();
+                let corr_id = request.correlation_id.clone();
+                async move {
+                    upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "last-page.svg").await
+                }
+            }).await {
                 Ok(url) => {
                     info!("Uploaded final result last page SVG to S3: {}", url);
                     Some(url)
                 }
                 Err(e) => {
-                    error!("Failed to upload final result last page SVG to S3: {}", e);
+                    error!("Failed to upload final result last page SVG to S3 after retries: {}", e);
                     None
                 }
             };
@@ -909,34 +1079,63 @@ impl SqsProcessor {
             info!("Sent final result to queue");
 
             Ok(())
-        };
+        }.await;
 
         // Cleanup: remove correlation_id from cancellation registry (always happens)
-        {
-            let mut registry = self.cancellation_registry.lock().unwrap();
-            registry.remove(&request.correlation_id);
-        }
+        self.unregister_correlation_id(&request.correlation_id);
 
         result
     }
 
     /// Listen and process messages from the queue (concurrent processing)
-    /// Processes up to 20 messages concurrently using tokio tasks with semaphore-based concurrency control.
+    /// Processes messages concurrently using tokio tasks with semaphore-based concurrency control.
+    /// The maximum number of concurrent tasks is configurable via MAX_CONCURRENT_TASKS env var (default: 20).
     pub async fn listen_and_process(
         &self,
-        _worker_count: usize, // Ignored, kept for compatibility
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<()> {
-        info!("Starting concurrent worker on queue: {} (max 20 concurrent tasks)", self.input_queue_url);
+        let max_concurrent = get_max_concurrent_tasks();
+        info!(
+            "Starting concurrent worker on queue: {} (max {} concurrent tasks)",
+            self.input_queue_url, max_concurrent
+        );
 
-        // Create semaphore to limit concurrent processing to 20 tasks
-        let semaphore = Arc::new(Semaphore::new(20));
+        // Create semaphore to limit concurrent processing
+        let semaphore = Arc::new(Semaphore::new(max_concurrent));
+
+        // Track all spawned tasks for graceful shutdown
+        let mut active_tasks: JoinSet<(String, bool)> = JoinSet::new();
+
+        // Track last cleanup time for cancellation registry
+        let mut last_cleanup = Instant::now();
+        let cleanup_interval = Duration::from_secs(60); // Cleanup every minute
 
         loop {
+            // Periodic cleanup of expired cancellation registry entries
+            if last_cleanup.elapsed() > cleanup_interval {
+                self.cleanup_expired_entries();
+                last_cleanup = Instant::now();
+            }
+
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    info!("Received shutdown signal");
+                    info!("Received shutdown signal, waiting for {} active tasks to complete...", active_tasks.len());
                     break;
+                }
+                // Handle completed tasks (non-blocking check)
+                Some(result) = active_tasks.join_next(), if !active_tasks.is_empty() => {
+                    match result {
+                        Ok((receipt_handle, success)) => {
+                            if success {
+                                debug!("Task completed successfully for receipt_handle: {}", receipt_handle);
+                            } else {
+                                warn!("Task completed with error for receipt_handle: {}", receipt_handle);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Task panicked: {}", e);
+                        }
+                    }
                 }
                 result = self.sqs_client
                     .receive_message()
@@ -970,51 +1169,61 @@ impl SqsProcessor {
                             };
                             let message_id = message.message_id().map(|s| s.to_string());
 
-                            // Acknowledge (delete) message immediately after receiving to prevent duplicate processing
-                            let sqs_client_for_delete = self.sqs_client.clone();
-                            let input_queue_url_for_delete = self.input_queue_url.clone();
-                            let receipt_handle_for_delete = receipt_handle.clone();
-                            let message_id_for_delete = message_id.clone();
-                            
-                            if let Err(e) = sqs_client_for_delete
-                                .delete_message()
-                                .queue_url(&input_queue_url_for_delete)
-                                .receipt_handle(&receipt_handle_for_delete)
-                                .send()
-                                .await
-                            {
-                                error!("Failed to acknowledge message: {}", e);
-                                continue; // Skip processing if we can't acknowledge
-                            }
-
                             if let Some(msg_id) = &message_id {
-                                info!("Acknowledged message {}, processing concurrently", msg_id);
+                                info!("Received message {}, spawning processing task", msg_id);
                             } else {
-                                info!("Acknowledged message, processing concurrently");
+                                info!("Received message, spawning processing task");
                             }
 
                             // Clone necessary data for the spawned task
                             let processor = self.clone();
                             let semaphore_clone = semaphore.clone();
-                            let mut shutdown_rx_clone = shutdown_rx.resubscribe();
+                            let sqs_client_clone = self.sqs_client.clone();
+                            let input_queue_url_clone = self.input_queue_url.clone();
+                            let receipt_handle_clone = receipt_handle.clone();
 
                             // Spawn concurrent task for processing
-                            tokio::spawn(async move {
-                                // Acquire semaphore permit (waits if 20 tasks are already running)
+                            // Message is deleted AFTER successful processing to prevent data loss
+                            active_tasks.spawn(async move {
+                                // Acquire semaphore permit (waits if max tasks are already running)
                                 let _permit = match semaphore_clone.acquire().await {
                                     Ok(permit) => permit,
                                     Err(e) => {
                                         error!("Failed to acquire semaphore permit: {}", e);
-                                        return;
+                                        return (receipt_handle_clone, false);
                                     }
                                 };
 
                                 // Process the message
                                 let process_result = processor.process_message(&receipt_handle, &body).await;
+                                let success = process_result.is_ok();
+
                                 if let Err(e) = &process_result {
                                     error!("Error during message processing: {}", e);
                                 }
-                                // Permit is automatically released when dropped here
+
+                                // Delete message from queue AFTER processing completes
+                                // This ensures messages are not lost if processing fails
+                                if let Err(e) = retry_with_backoff("delete_message", || {
+                                    let client = sqs_client_clone.clone();
+                                    let url = input_queue_url_clone.clone();
+                                    let handle = receipt_handle_clone.clone();
+                                    async move {
+                                        client
+                                            .delete_message()
+                                            .queue_url(&url)
+                                            .receipt_handle(&handle)
+                                            .send()
+                                            .await
+                                            .map_err(|e| anyhow!("SQS delete failed: {}", e))
+                                    }
+                                }).await {
+                                    error!("Failed to delete message after processing: {}", e);
+                                    // Message will become visible again after visibility timeout
+                                    // and may be reprocessed (at-least-once delivery)
+                                }
+
+                                (receipt_handle_clone, success)
                             });
                         }
                     }
@@ -1022,14 +1231,31 @@ impl SqsProcessor {
             }
         }
 
-        info!("Worker exiting gracefully");
+        // Graceful shutdown: wait for all active tasks to complete
+        info!("Waiting for {} active tasks to complete...", active_tasks.len());
+        while let Some(result) = active_tasks.join_next().await {
+            match result {
+                Ok((receipt_handle, success)) => {
+                    if success {
+                        info!("Shutdown: task completed successfully for receipt_handle: {}", receipt_handle);
+                    } else {
+                        warn!("Shutdown: task completed with error for receipt_handle: {}", receipt_handle);
+                    }
+                }
+                Err(e) => {
+                    error!("Shutdown: task panicked: {}", e);
+                }
+            }
+        }
+
+        info!("Worker exiting gracefully, all tasks completed");
         Ok(())
     }
 }
 
 #[cfg(test)]
 impl SqsProcessor {
-    pub(crate) fn cancellation_registry_handle(&self) -> Arc<Mutex<HashMap<String, bool>>> {
+    pub(crate) fn cancellation_registry_handle(&self) -> Arc<Mutex<HashMap<String, CancellationEntry>>> {
         self.cancellation_registry.clone()
     }
 }
@@ -1039,37 +1265,48 @@ mod tests {
     use super::*;
     use aws_config::BehaviorVersion;
     use aws_sdk_sqs::Client as SqsClient;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-    use tokio::sync::broadcast;
-    use tokio::time::{Duration, Instant};
+    use tokio::time::Duration;
 
     #[test]
     fn test_cancellation_registry_insert_and_get() {
-        let registry: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+        let registry: Arc<Mutex<HashMap<String, CancellationEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // Insert a cancellation flag
         {
             let mut reg = registry.lock().unwrap();
-            reg.insert("test-id-1".to_string(), true);
+            reg.insert(
+                "test-id-1".to_string(),
+                CancellationEntry {
+                    cancelled: true,
+                    created_at: Instant::now(),
+                },
+            );
         }
 
         // Check that it's set
         {
             let reg = registry.lock().unwrap();
-            assert_eq!(reg.get("test-id-1"), Some(&true));
+            assert_eq!(reg.get("test-id-1").map(|e| e.cancelled), Some(true));
             assert_eq!(reg.get("test-id-2"), None);
         }
     }
 
     #[test]
     fn test_cancellation_registry_remove() {
-        let registry: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+        let registry: Arc<Mutex<HashMap<String, CancellationEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // Insert and then remove
         {
             let mut reg = registry.lock().unwrap();
-            reg.insert("test-id-1".to_string(), false);
+            reg.insert(
+                "test-id-1".to_string(),
+                CancellationEntry {
+                    cancelled: false,
+                    created_at: Instant::now(),
+                },
+            );
         }
 
         {
@@ -1082,6 +1319,101 @@ mod tests {
             let reg = registry.lock().unwrap();
             assert_eq!(reg.get("test-id-1"), None);
         }
+    }
+
+    #[test]
+    fn test_safe_lock_recovers_from_poison() {
+        // This test verifies that safe_lock recovers from poisoned mutexes
+        let mutex = Mutex::new(42);
+
+        // Poison the mutex by panicking while holding the lock
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        }));
+        assert!(result.is_err(), "Should have panicked");
+
+        // Normal lock() would fail, but safe_lock should recover
+        let value = safe_lock(&mutex);
+        assert_eq!(*value, 42);
+    }
+
+    #[test]
+    fn test_parse_s3_url_s3_scheme() {
+        let (bucket, key) = parse_s3_url("s3://my-bucket/path/to/file.svg").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "path/to/file.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_virtual_hosted() {
+        let (bucket, key) =
+            parse_s3_url("https://my-bucket.s3.us-east-1.amazonaws.com/path/to/file.svg").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "path/to/file.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_virtual_hosted_dash_region() {
+        let (bucket, key) =
+            parse_s3_url("https://my-bucket.s3-us-east-1.amazonaws.com/path/to/file.svg").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "path/to/file.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_path_style() {
+        let (bucket, key) =
+            parse_s3_url("https://s3.us-east-1.amazonaws.com/my-bucket/path/to/file.svg").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "path/to/file.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_path_style_dash_region() {
+        let (bucket, key) =
+            parse_s3_url("https://s3-us-east-1.amazonaws.com/my-bucket/path/to/file.svg").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "path/to/file.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_invalid() {
+        assert!(parse_s3_url("http://example.com/file.svg").is_err());
+        assert!(parse_s3_url("s3://").is_err());
+        assert!(parse_s3_url("s3://bucket").is_err());
+        assert!(parse_s3_url("s3://bucket/").is_err());
+    }
+
+    #[test]
+    fn test_get_max_concurrent_tasks() {
+        // These tests must run sequentially to avoid race conditions with env vars
+        // Test 1: Default value when env var is not set
+        std::env::remove_var("MAX_CONCURRENT_TASKS");
+        assert_eq!(
+            get_max_concurrent_tasks(),
+            DEFAULT_MAX_CONCURRENT_TASKS,
+            "Should use default when env var not set"
+        );
+
+        // Test 2: Valid value from env var
+        std::env::set_var("MAX_CONCURRENT_TASKS", "50");
+        assert_eq!(
+            get_max_concurrent_tasks(),
+            50,
+            "Should use value from env var"
+        );
+
+        // Test 3: Invalid value falls back to default
+        std::env::set_var("MAX_CONCURRENT_TASKS", "not-a-number");
+        assert_eq!(
+            get_max_concurrent_tasks(),
+            DEFAULT_MAX_CONCURRENT_TASKS,
+            "Should fall back to default for invalid value"
+        );
+
+        // Cleanup
+        std::env::remove_var("MAX_CONCURRENT_TASKS");
     }
 
     #[test]
@@ -1127,16 +1459,15 @@ mod tests {
             sqs_client,
             s3_client,
             "test-bucket".to_string(),
+            "us-east-1".to_string(),
             "test-input-queue".to_string(),
             "test-output-queue".to_string(),
         );
 
         let correlation_id = "parallel-cancelled".to_string();
-        let registry = processor.cancellation_registry_handle();
-        {
-            let mut reg = registry.lock().unwrap();
-            reg.insert(correlation_id.clone(), false);
-        }
+
+        // Register the correlation_id first (simulating an active processing task)
+        processor.register_correlation_id(&correlation_id);
 
         let cancel_processor = processor.clone();
         let cancellation_request = SqsNestingRequest {
@@ -1154,17 +1485,14 @@ mod tests {
         let cancellation_body =
             serde_json::to_string(&cancellation_request).expect("serialize cancellation");
 
-        let registry_clone = registry.clone();
+        let processor_for_watcher = processor.clone();
         let correlation_id_clone = correlation_id.clone();
         let watcher = tokio::spawn(async move {
             let timeout = Duration::from_secs(2);
             let start = Instant::now();
             loop {
-                {
-                    let reg = registry_clone.lock().unwrap();
-                    if reg.get(&correlation_id_clone).copied().unwrap_or(false) {
-                        break;
-                    }
+                if processor_for_watcher.is_cancelled(&correlation_id_clone) {
+                    break;
                 }
 
                 if start.elapsed() > timeout {
@@ -1185,12 +1513,98 @@ mod tests {
         watcher.await.expect("Watcher task failed");
         canceller.await.expect("Canceller task failed");
 
-        let reg = registry.lock().unwrap();
-        assert_eq!(
-            reg.get(&correlation_id),
-            Some(&true),
+        assert!(
+            processor.is_cancelled(&correlation_id),
             "Cancellation flag should be set to true"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_registry_cleanup() {
+        let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+        let sqs_client = SqsClient::new(&config);
+        let s3_client = aws_sdk_s3::Client::new(&config);
+        let processor = SqsProcessor::new(
+            sqs_client,
+            s3_client,
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            "test-input-queue".to_string(),
+            "test-output-queue".to_string(),
+        );
+
+        // Register a correlation_id
+        processor.register_correlation_id("test-cleanup");
+        assert!(!processor.is_cancelled("test-cleanup"));
+
+        // Unregister it
+        processor.unregister_correlation_id("test-cleanup");
+
+        // It should be gone (is_cancelled returns false for non-existent entries)
+        let registry = processor.cancellation_registry_handle();
+        let reg = registry.lock().unwrap();
+        assert!(reg.get("test-cleanup").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_success() {
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result: std::result::Result<i32, String> =
+            retry_with_backoff("test_op", || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(42)
+                }
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_eventual_success() {
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result: std::result::Result<i32, String> =
+            retry_with_backoff("test_op", || {
+                let count = call_count_clone.clone();
+                async move {
+                    let calls = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if calls < 3 {
+                        Err(format!("Failed attempt {}", calls))
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_all_failures() {
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result: std::result::Result<i32, String> =
+            retry_with_backoff("test_op", || {
+                let count = call_count_clone.clone();
+                async move {
+                    let calls = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    Err(format!("Failed attempt {}", calls))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(call_count.load(Ordering::SeqCst), MAX_RETRY_ATTEMPTS as u64);
     }
 
     #[tokio::test]
@@ -1240,22 +1654,15 @@ mod tests {
         match result {
             Ok(response) => {
                 println!("✓ Successfully got object from S3");
-                
+
                 // Try to read the body
-                let mut body_stream = response.body;
-                use futures::StreamExt;
-                let mut svg_bytes = Vec::new();
-                while let Some(chunk_result) = body_stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            svg_bytes.extend_from_slice(&chunk);
-                        }
-                        Err(e) => {
-                            println!("✗ Error reading chunk: {}", e);
-                            return;
-                        }
+                let svg_bytes = match response.body.collect().await {
+                    Ok(data) => data.into_bytes().to_vec(),
+                    Err(e) => {
+                        println!("✗ Error reading body: {}", e);
+                        return;
                     }
-                }
+                };
                 println!("✓ Successfully downloaded {} bytes", svg_bytes.len());
                 
                 // Try to parse as SVG
