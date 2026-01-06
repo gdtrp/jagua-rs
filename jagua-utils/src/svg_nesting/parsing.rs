@@ -41,6 +41,58 @@ fn parse_single_coord(token: &str) -> Result<f32> {
         .map_err(|e| anyhow::anyhow!("Failed to parse coordinate '{}': {}", token, e))
 }
 
+/// Parse arc parameters which might be comma or space separated
+/// Returns (rx, ry, x_rotation, large_arc, sweep, x, y, tokens_consumed)
+fn parse_arc_params(
+    tokens: &[&str],
+    start_idx: usize,
+) -> Result<(f32, f32, f32, bool, bool, f32, f32, usize)> {
+    let mut values: Vec<f32> = Vec::new();
+    let mut idx = start_idx;
+
+    // We need 7 values: rx, ry, x-rotation, large-arc, sweep, x, y
+    while values.len() < 7 && idx < tokens.len() {
+        let token = tokens[idx];
+
+        // Split by comma and parse each part
+        for part in token.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Ok(val) = part.parse::<f32>() {
+                values.push(val);
+                if values.len() >= 7 {
+                    break;
+                }
+            } else {
+                // Not a number, stop parsing
+                break;
+            }
+        }
+        idx += 1;
+    }
+
+    if values.len() < 7 {
+        anyhow::bail!(
+            "Arc command requires 7 parameters, got {} at token {}",
+            values.len(),
+            start_idx
+        );
+    }
+
+    Ok((
+        values[0],           // rx
+        values[1],           // ry
+        values[2],           // x-rotation
+        values[3] != 0.0,    // large-arc flag
+        values[4] != 0.0,    // sweep flag
+        values[5],           // x
+        values[6],           // y
+        idx - start_idx,     // tokens consumed
+    ))
+}
+
 /// Converts a circle to SVG path data (approximated as a polygon)
 pub fn circle_to_path(cx: f32, cy: f32, r: f32) -> String {
     let mut path = String::new();
@@ -621,13 +673,10 @@ pub fn parse_subpath(tokens: &[&str], start_idx: usize) -> Result<(Vec<Point>, u
             "A" | "a" => {
                 let is_relative = token == "a";
                 // A requires: rx ry x-axis-rotation large-arc-flag sweep-flag x y
-                if i + 7 <= tokens.len() {
-                    let rx = parse_single_coord(tokens[i + 1])?;
-                    let ry = parse_single_coord(tokens[i + 2])?;
-                    let x_rotation = parse_single_coord(tokens[i + 3])?;
-                    let large_arc = parse_single_coord(tokens[i + 4])? != 0.0;
-                    let sweep = parse_single_coord(tokens[i + 5])? != 0.0;
-                    let (x, y, consumed) = parse_coordinate_pair(tokens[i + 6], i + 6, tokens)?;
+                // Parameters may be comma or space separated
+                if i + 1 < tokens.len() {
+                    let (rx, ry, x_rotation, large_arc, sweep, x, y, consumed) =
+                        parse_arc_params(tokens, i + 1)?;
 
                     let end = if is_relative {
                         (current_x + x, current_y + y)
@@ -652,7 +701,7 @@ pub fn parse_subpath(tokens: &[&str], start_idx: usize) -> Result<(Vec<Point>, u
                     current_y = end.1;
                     last_control_point = None;
                     last_command = LastCommand::ArcTo(is_relative);
-                    i += 6 + consumed;
+                    i += 1 + consumed;
                 } else {
                     i += 1;
                 }
@@ -750,14 +799,16 @@ pub fn parse_subpath(tokens: &[&str], start_idx: usize) -> Result<(Vec<Point>, u
     }
 
     // Ensure minimum 3 points for a valid polygon
+    // If fewer than 3 points, return empty (invalid polygon/line segment - skip it)
     if final_points.len() < 3 {
-        anyhow::bail!(
-            "Sub-path has only {} points after filtering (minimum 3 required). \
-             Original had {} points, cleaned to {}.",
+        log::debug!(
+            "Sub-path has only {} points after filtering (minimum 3 required for polygon). \
+             Original had {} points, cleaned to {}. Skipping this sub-path.",
             final_points.len(),
             original_count,
             cleaned_count
         );
+        return Ok((Vec::new(), i));
     }
 
     // Final duplicate check
@@ -793,7 +844,11 @@ pub fn parse_svg_path(path_data: &str) -> Result<(Vec<Point>, Vec<Vec<Point>>)> 
     }
 
     if all_subpaths.is_empty() {
-        anyhow::bail!("No valid sub-paths found in SVG path data");
+        anyhow::bail!(
+            "No valid polygons found in SVG path data. \
+             All sub-paths were either empty or had fewer than 3 points \
+             (lines and open paths cannot be used for nesting)."
+        );
     }
 
     // Find the sub-path with the largest absolute area (outer boundary)

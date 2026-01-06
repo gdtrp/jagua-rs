@@ -1416,43 +1416,14 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
     let _ = env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .try_init();
-    let test_svg = r#"<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="-138.78426 759.0409821521932 277.56852 367.0778200047157">
-  <path d="M 136.063,1046.93 V 975.687" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M -82.8053,775.372 H -117.165" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 117.165,1122.52 h -234.33" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 136.063,1103.62 v -56.69" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M -136.063,975.687 V 794.269" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -136.063,1103.62 v -56.69" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M 136.063,1011.31 H -136.063" style="fill:none;stroke:#000000;stroke-width:1.286;stroke-dasharray:15.1181, 7.5591, 3.7795, 7.5591, 3.7795, 7.5591"/>
-  <path d="M 136.063,975.687 V 794.269" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M 117.165,775.372 H 82.8053" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M -136.063,1046.93 V 975.687" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -107.71653,1053.5433 a 12.283465,12.283465 0 0 0 0,24.5669" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M 88.8189,1078.11 H 107.717" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 107.71653,1078.1102 a 12.283465,12.283465 0 0 0 0,-24.5669" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M 107.717,1053.54 H 88.8189" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -107.717,1078.11 h 18.8981" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -88.818898,1078.1102 a 12.283465,12.283465 0 0 0 0,-24.5669" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M -88.8189,1053.54 H -107.717" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 88.818898,1053.5433 a 12.283465,12.283465 0 0 0 0,24.5669" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 110.551,907.655 v -75.59" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -85.9843,907.655 v -75.59" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -110.55118,907.65522 a 12.283465,12.283465 0 0 0 24.566928,0" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 85.9843,832.065 v 75.59" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -85.984252,832.06467 a 12.283465,12.283465 0 0 0 -24.566928,0" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 85.984252,907.65522 a 12.283465,12.283465 0 0 0 24.566928,0" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -110.551,832.065 v 75.59" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 110.55118,832.06467 a 12.283465,12.283465 0 0 0 -24.566928,0" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -117.16535,775.37176 a 18.897638,18.897638 0 0 0 -18.89764,18.89764" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -136.06299,1103.622 a 18.897638,18.897638 0 0 0 18.89764,18.8977" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M 136.06299,794.2694 A 18.897638,18.897638 0 0 0 117.16535,775.37176" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 117.16535,1122.5197 a 18.897638,18.897638 0 0 0 18.89764,-18.8977" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m -75.277545,782.24362 a 75.590551,75.590551 0 0 0 150.55509,0" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="m 82.8053,775.37176 a 7.559055,7.559055 0 0 0 -7.527755,6.87186" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
-  <path d="M -75.277545,782.24362 A 7.559055,7.559055 0 0 0 -82.8053,775.37176" style="fill:none;stroke:#007fff;stroke-width:4.285;stroke-linecap:round"/>
+    // Test with a closed polygon using H, V, and A commands
+    // This is a rounded rectangle: starts at top-left, goes right with arc at top-right,
+    // down with arc at bottom-right, left with arc at bottom-left, up with arc at top-left
+    let test_svg = r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+  <path d="M 20,0 H 180 A 20,20 0 0 1 200,20 V 80 A 20,20 0 0 1 180,100 H 20 A 20,20 0 0 1 0,80 V 20 A 20,20 0 0 1 20,0 z" fill="#007fff"/>
 </svg>
-"#;
+"##;
 
     // Calculate bin dimensions: 210mm * 72 / 25.4 and 80mm * 72 / 25.4
     let bin_width = 1500.0 * 72.0 / 25.4;
