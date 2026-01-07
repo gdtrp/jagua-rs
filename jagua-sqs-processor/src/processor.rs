@@ -379,6 +379,8 @@ impl SqsProcessor {
 /// - https://bucket.s3-region.amazonaws.com/key (virtual-hosted style with dash)
 /// - https://s3.region.amazonaws.com/bucket/key (path-style)
 /// - https://s3-region.amazonaws.com/bucket/key (path-style with dash)
+/// - http://hostname:port/bucket/key (path-style, for localstack/minio)
+/// - https://hostname:port/bucket/key (path-style, for localstack/minio)
 fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
     // Handle s3://bucket/key format
     if s3_url.starts_with("s3://") {
@@ -394,47 +396,65 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
         return Err(anyhow!("Invalid S3 URL format (missing key): {}", s3_url));
     }
 
-    // Handle HTTPS formats
-    if s3_url.starts_with("https://") {
-        let url = s3_url.strip_prefix("https://").unwrap();
+    // Handle HTTP/HTTPS formats
+    let url = if let Some(stripped) = s3_url.strip_prefix("https://") {
+        stripped
+    } else if let Some(stripped) = s3_url.strip_prefix("http://") {
+        stripped
+    } else {
+        return Err(anyhow!("Unsupported S3 URL format (must start with s3://, http://, or https://): {}", s3_url));
+    };
 
-        // Check for path-style URL: https://s3.region.amazonaws.com/bucket/key
-        // or https://s3-region.amazonaws.com/bucket/key
-        if url.starts_with("s3.") || url.starts_with("s3-") {
-            // Path-style URL
-            if let Some(aws_pos) = url.find(".amazonaws.com/") {
-                let path = &url[aws_pos + 15..];
-                if let Some(slash_pos) = path.find('/') {
-                    let bucket = path[..slash_pos].to_string();
-                    let key = path[slash_pos + 1..].to_string();
-                    if bucket.is_empty() || key.is_empty() {
-                        return Err(anyhow!("Invalid S3 path-style URL: bucket or key is empty: {}", s3_url));
-                    }
-                    return Ok((bucket, key));
-                }
-                return Err(anyhow!("Invalid S3 path-style URL (missing key): {}", s3_url));
-            }
-        }
-
-        // Virtual-hosted style: https://bucket.s3.region.amazonaws.com/key
-        // or https://bucket.s3-region.amazonaws.com/key
-        if let Some(s3_pos) = url.find(".s3") {
-            let bucket = url[..s3_pos].to_string();
-            // Extract key (everything after .amazonaws.com/)
-            if let Some(aws_pos) = url.find(".amazonaws.com/") {
-                let key = url[aws_pos + 15..].to_string();
+    // Check for AWS path-style URL: https://s3.region.amazonaws.com/bucket/key
+    // or https://s3-region.amazonaws.com/bucket/key
+    if url.starts_with("s3.") || url.starts_with("s3-") {
+        // Path-style URL
+        if let Some(aws_pos) = url.find(".amazonaws.com/") {
+            let path = &url[aws_pos + 15..];
+            if let Some(slash_pos) = path.find('/') {
+                let bucket = path[..slash_pos].to_string();
+                let key = path[slash_pos + 1..].to_string();
                 if bucket.is_empty() || key.is_empty() {
-                    return Err(anyhow!("Invalid S3 virtual-hosted URL: bucket or key is empty: {}", s3_url));
+                    return Err(anyhow!("Invalid S3 path-style URL: bucket or key is empty: {}", s3_url));
                 }
                 return Ok((bucket, key));
             }
-            return Err(anyhow!("Invalid S3 virtual-hosted URL (missing .amazonaws.com): {}", s3_url));
+            return Err(anyhow!("Invalid S3 path-style URL (missing key): {}", s3_url));
         }
-
-        return Err(anyhow!("Unrecognized S3 HTTPS URL format: {}", s3_url));
     }
 
-    Err(anyhow!("Unsupported S3 URL format (must start with s3:// or https://): {}", s3_url))
+    // Virtual-hosted style: https://bucket.s3.region.amazonaws.com/key
+    // or https://bucket.s3-region.amazonaws.com/key
+    if let Some(s3_pos) = url.find(".s3") {
+        let bucket = url[..s3_pos].to_string();
+        // Extract key (everything after .amazonaws.com/)
+        if let Some(aws_pos) = url.find(".amazonaws.com/") {
+            let key = url[aws_pos + 15..].to_string();
+            if bucket.is_empty() || key.is_empty() {
+                return Err(anyhow!("Invalid S3 virtual-hosted URL: bucket or key is empty: {}", s3_url));
+            }
+            return Ok((bucket, key));
+        }
+        return Err(anyhow!("Invalid S3 virtual-hosted URL (missing .amazonaws.com): {}", s3_url));
+    }
+
+    // Path-style URL for non-AWS S3-compatible services (e.g., localstack, minio):
+    // http://hostname:port/bucket/key or https://hostname:port/bucket/key
+    // Find the first slash after the host (and optional port)
+    if let Some(first_slash) = url.find('/') {
+        let path = &url[first_slash + 1..];
+        if let Some(second_slash) = path.find('/') {
+            let bucket = path[..second_slash].to_string();
+            let key = path[second_slash + 1..].to_string();
+            if bucket.is_empty() || key.is_empty() {
+                return Err(anyhow!("Invalid S3-compatible URL: bucket or key is empty: {}", s3_url));
+            }
+            return Ok((bucket, key));
+        }
+        return Err(anyhow!("Invalid S3-compatible URL (missing key after bucket): {}", s3_url));
+    }
+
+    Err(anyhow!("Invalid S3-compatible URL format: {}", s3_url))
 }
 
 /// Internal helper function to upload SVG to S3 (used by both improvement and final responses)
@@ -1379,10 +1399,37 @@ mod tests {
 
     #[test]
     fn test_parse_s3_url_invalid() {
-        assert!(parse_s3_url("http://example.com/file.svg").is_err());
+        assert!(parse_s3_url("ftp://example.com/file.svg").is_err());
         assert!(parse_s3_url("s3://").is_err());
         assert!(parse_s3_url("s3://bucket").is_err());
         assert!(parse_s3_url("s3://bucket/").is_err());
+        // http:// with only bucket, no key
+        assert!(parse_s3_url("http://localhost:4566/bucket").is_err());
+        assert!(parse_s3_url("http://localhost:4566/bucket/").is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_localstack() {
+        // LocalStack/Minio path-style URL
+        let (bucket, key) = parse_s3_url("http://localstack:4566/my-bucket/path/to/file.svg").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "path/to/file.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_localstack_https() {
+        // LocalStack/Minio path-style URL with HTTPS
+        let (bucket, key) = parse_s3_url("https://localhost:4566/my-bucket/path/to/file.svg").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "path/to/file.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_minio() {
+        // Minio without port
+        let (bucket, key) = parse_s3_url("http://minio.local/my-bucket/path/to/file.svg").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "path/to/file.svg");
     }
 
     #[test]

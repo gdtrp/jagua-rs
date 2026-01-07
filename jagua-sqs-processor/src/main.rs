@@ -44,6 +44,9 @@ async fn main() -> Result<()> {
     // Initialize AWS clients - both use LocalStack endpoint if provided
     let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
 
+    // Check if using custom endpoint (LocalStack/Minio)
+    let use_path_style = env::var("AWS_ENDPOINT_URL").is_ok() || env::var("AWS_ENDPOINT_URL_SQS").is_ok();
+
     // Configure LocalStack endpoint if provided (applies to both SQS and S3)
     if let Ok(endpoint_url) = env::var("AWS_ENDPOINT_URL") {
         config_loader = config_loader.endpoint_url(&endpoint_url);
@@ -57,7 +60,18 @@ async fn main() -> Result<()> {
 
     let config = config_loader.load().await;
     let sqs_client = SqsClient::new(&config);
-    let s3_client = S3Client::new(&config);
+
+    // Create S3 client - use path-style addressing for LocalStack/Minio
+    // (virtual-hosted style like bucket.localstack:4566 won't work with local services)
+    let s3_client = if use_path_style {
+        info!("Using path-style S3 addressing for LocalStack/Minio compatibility");
+        let s3_config = aws_sdk_s3::config::Builder::from(&config)
+            .force_path_style(true)
+            .build();
+        S3Client::from_conf(s3_config)
+    } else {
+        S3Client::new(&config)
+    };
 
     // Create processor
     let processor = SqsProcessor::new(sqs_client, s3_client, s3_bucket, aws_region, input_queue_url, output_queue_url);

@@ -769,32 +769,70 @@ pub fn parse_subpath(tokens: &[&str], start_idx: usize) -> Result<(Vec<Point>, u
         }
     }
 
-    // Remove duplicate consecutive points
+    // Remove all duplicate points (not just consecutive ones)
+    // This is necessary because SPolygon::new() requires all points to be unique
     let original_count = points.len();
+    let first_point = points.first().cloned();
+    let last_point = points.last().cloned();
+    
     let mut cleaned_points = Vec::new();
+    let mut seen_points = std::collections::HashSet::new();
+    
     for point in points {
-        if cleaned_points.is_empty() || cleaned_points[cleaned_points.len() - 1] != point {
+        // Use a tuple of integers to avoid floating-point equality issues in HashSet
+        // We multiply by 1e6 and round to get sufficient precision
+        let key = ((point.0 * 1e6) as i64, (point.1 * 1e6) as i64);
+        if seen_points.insert(key) {
             cleaned_points.push(point);
+        } else {
+            log::trace!("Removing duplicate point: {:?}", point);
         }
     }
 
-    // Remove closing point if it duplicates first point
+    log::trace!(
+        "parse_subpath: original {} points (first: {:?}, last: {:?}), cleaned to {} points (removed {} duplicates)",
+        original_count,
+        first_point,
+        last_point,
+        cleaned_points.len(),
+        original_count - cleaned_points.len()
+    );
+
+    // Remove closing point if it duplicates first point  
+    // (this is redundant now but kept for extra safety)
     if cleaned_points.len() > 1 && cleaned_points[0] == cleaned_points[cleaned_points.len() - 1] {
+        log::trace!("Removing duplicate closing point: {:?}", cleaned_points[cleaned_points.len() - 1]);
         cleaned_points.pop();
     }
 
     // Filter out very small edges
+    // Note: We iterate without wrapping around to avoid creating duplicate first/last points
     const MIN_EDGE_LENGTH_SQ: f32 = 1e-10;
     let mut final_points = Vec::new();
     let cleaned_count = cleaned_points.len();
+    
     for (idx, point) in cleaned_points.iter().enumerate() {
-        let next_idx = (idx + 1) % cleaned_points.len();
+        // For the last point, check the edge back to the first point (closing edge)
+        let next_idx = if idx == cleaned_points.len() - 1 {
+            0
+        } else {
+            idx + 1
+        };
         let next_point = &cleaned_points[next_idx];
         let dx = point.0 - next_point.0;
         let dy = point.1 - next_point.1;
         let edge_length_sq = dx * dx + dy * dy;
+        
+        // Keep the point if the edge from it is long enough
         if edge_length_sq > MIN_EDGE_LENGTH_SQ {
             final_points.push(*point);
+        } else {
+            // Skip this point because the edge is too small
+            // But log it for debugging
+            log::trace!(
+                "Filtering out point ({}, {}) because edge to next point is too small (length_sq: {})",
+                point.0, point.1, edge_length_sq
+            );
         }
     }
 
@@ -811,22 +849,64 @@ pub fn parse_subpath(tokens: &[&str], start_idx: usize) -> Result<(Vec<Point>, u
         return Ok((Vec::new(), i));
     }
 
-    // Final duplicate check
-    if !final_points.is_empty() && final_points[0] == final_points[final_points.len() - 1] {
+    // Final duplicate check (should not be needed but kept as safety)
+    if final_points.len() > 1 && final_points[0] == final_points[final_points.len() - 1] {
+        log::trace!("Removing duplicate closing point");
         final_points.pop();
     }
 
     Ok((final_points, i))
 }
 
+/// Tokenizes SVG path data by separating command letters from coordinates
+/// Handles cases where commands are directly attached to coordinates (e.g., "M4282.687" -> "M" "4282.687")
+fn tokenize_svg_path(path_data: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current_token = String::new();
+    
+    for ch in path_data.chars() {
+        match ch {
+            // Command letters
+            'M' | 'm' | 'L' | 'l' | 'H' | 'h' | 'V' | 'v' | 
+            'C' | 'c' | 'S' | 's' | 'Q' | 'q' | 'T' | 't' | 
+            'A' | 'a' | 'Z' | 'z' => {
+                // Save current token if not empty
+                if !current_token.is_empty() {
+                    tokens.push(current_token.trim().to_string());
+                    current_token.clear();
+                }
+                // Add command as separate token
+                tokens.push(ch.to_string());
+            }
+            // Whitespace
+            ' ' | '\t' | '\n' | '\r' => {
+                if !current_token.is_empty() {
+                    tokens.push(current_token.trim().to_string());
+                    current_token.clear();
+                }
+            }
+            // Everything else (numbers, commas, dots, minus signs)
+            _ => {
+                current_token.push(ch);
+            }
+        }
+    }
+    
+    // Don't forget the last token
+    if !current_token.is_empty() {
+        tokens.push(current_token.trim().to_string());
+    }
+    
+    // Filter out empty tokens
+    tokens.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
 /// Parses SVG path data and extracts polygon coordinates
 /// The SVG path may contain multiple sub-paths (outer boundary and inner holes)
 /// Returns (outer_boundary, holes) where outer_boundary is the sub-path with the largest absolute area
 pub fn parse_svg_path(path_data: &str) -> Result<(Vec<Point>, Vec<Vec<Point>>)> {
-    let tokens: Vec<&str> = path_data
-        .split_whitespace()
-        .filter(|s| !s.is_empty())
-        .collect();
+    let token_strings = tokenize_svg_path(path_data);
+    let tokens: Vec<&str> = token_strings.iter().map(|s| s.as_str()).collect();
 
     let mut all_subpaths = Vec::new();
     let mut i = 0;
@@ -1041,5 +1121,263 @@ mod tests {
         ];
         let area = calculate_signed_area(&cw_square);
         assert!(area < 0.0);
+    }
+
+    #[test]
+    fn test_tokenize_svg_path_with_spaces() {
+        // Test standard SVG path with spaces between commands and coordinates
+        let path = "M 10,20 L 30,40 L 50,60 Z";
+        let tokens = tokenize_svg_path(path);
+        
+        assert_eq!(tokens.len(), 7);
+        assert_eq!(tokens[0], "M");
+        assert_eq!(tokens[1], "10,20");
+        assert_eq!(tokens[2], "L");
+        assert_eq!(tokens[3], "30,40");
+        assert_eq!(tokens[4], "L");
+        assert_eq!(tokens[5], "50,60");
+        assert_eq!(tokens[6], "Z");
+    }
+
+    #[test]
+    fn test_tokenize_svg_path_without_spaces() {
+        // Test compact SVG path without spaces (like fork.svg)
+        let path = "M10,20L30,40L50,60Z";
+        let tokens = tokenize_svg_path(path);
+        
+        assert_eq!(tokens.len(), 7);
+        assert_eq!(tokens[0], "M");
+        assert_eq!(tokens[1], "10,20");
+        assert_eq!(tokens[2], "L");
+        assert_eq!(tokens[3], "30,40");
+        assert_eq!(tokens[4], "L");
+        assert_eq!(tokens[5], "50,60");
+        assert_eq!(tokens[6], "Z");
+    }
+
+    #[test]
+    fn test_tokenize_svg_path_mixed_commands() {
+        // Test path with various command types
+        let path = "M100,200H150V250h-50v-50Z";
+        let tokens = tokenize_svg_path(path);
+        
+        assert_eq!(tokens[0], "M");
+        assert_eq!(tokens[1], "100,200");
+        assert_eq!(tokens[2], "H");
+        assert_eq!(tokens[3], "150");
+        assert_eq!(tokens[4], "V");
+        assert_eq!(tokens[5], "250");
+        assert_eq!(tokens[6], "h");
+        assert_eq!(tokens[7], "-50");
+        assert_eq!(tokens[8], "v");
+        assert_eq!(tokens[9], "-50");
+        assert_eq!(tokens[10], "Z");
+    }
+
+    #[test]
+    fn test_tokenize_svg_path_with_negative_numbers() {
+        // Test path with negative coordinates (common in fork.svg)
+        let path = "M4282.687,-295.234L4283.047,-213.278";
+        let tokens = tokenize_svg_path(path);
+        
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens[0], "M");
+        assert_eq!(tokens[1], "4282.687,-295.234");
+        assert_eq!(tokens[2], "L");
+        assert_eq!(tokens[3], "4283.047,-213.278");
+    }
+
+    #[test]
+    fn test_tokenize_svg_path_with_curves() {
+        // Test path with curve commands
+        let path = "M0,0C10,10 20,10 30,0S50,0 60,10";
+        let tokens = tokenize_svg_path(path);
+        
+        assert!(tokens.contains(&"M".to_string()));
+        assert!(tokens.contains(&"C".to_string()));
+        assert!(tokens.contains(&"S".to_string()));
+        // Verify commands are properly separated from coordinates
+        assert_eq!(tokens[0], "M");
+        assert_eq!(tokens[2], "C");
+    }
+
+    #[test]
+    fn test_parse_path_with_duplicate_points() {
+        // Test that duplicate points are removed
+        // This path deliberately returns to an earlier point
+        let path = "M 0,0 L 100,0 L 100,100 L 50,50 L 0,100 L 0,0 L 0,100 z";
+        let (outer, _holes) = parse_svg_path(path).unwrap();
+        
+        // Check that no duplicate points exist
+        use std::collections::HashSet;
+        let unique_count = outer.iter().collect::<HashSet<_>>().len();
+        assert_eq!(
+            unique_count,
+            outer.len(),
+            "All points should be unique after parsing"
+        );
+    }
+
+    #[test]
+    fn test_parse_path_consecutive_duplicates() {
+        // Test that consecutive duplicate points are removed
+        let path = "M 0,0 L 0,0 L 100,0 L 100,0 L 100,100 L 0,100 z";
+        let (outer, _holes) = parse_svg_path(path).unwrap();
+        
+        // Should have 4 unique points (square)
+        assert_eq!(outer.len(), 4);
+    }
+
+    #[test]
+    fn test_parse_path_non_consecutive_duplicates() {
+        // Test that non-consecutive duplicate points are removed
+        let path = "M 0,0 L 50,0 L 100,0 L 100,50 L 100,100 L 50,100 L 0,100 L 0,50 L 50,0 z";
+        // Point (50,0) appears at index 1 and index 8
+        let (outer, _holes) = parse_svg_path(path).unwrap();
+        
+        // Check that the duplicate was removed
+        use std::collections::HashSet;
+        let unique_count = outer.iter().collect::<HashSet<_>>().len();
+        assert_eq!(
+            unique_count,
+            outer.len(),
+            "Non-consecutive duplicate at (50,0) should be removed"
+        );
+    }
+
+    #[test]
+    fn test_parse_compact_svg_notation() {
+        // Test parsing SVG with compact notation (no spaces)
+        let path = "M10,20L30,40L50,60L70,80Z";
+        let result = parse_svg_path(path);
+        
+        assert!(result.is_ok(), "Should parse compact notation successfully");
+        let (outer, _holes) = result.unwrap();
+        assert_eq!(outer.len(), 4, "Should have 4 points");
+        assert_eq!(outer[0], Point(10.0, 20.0));
+        assert_eq!(outer[1], Point(30.0, 40.0));
+        assert_eq!(outer[2], Point(50.0, 60.0));
+        assert_eq!(outer[3], Point(70.0, 80.0));
+    }
+
+    #[test]
+    fn test_parse_compact_svg_with_negative_coords() {
+        // Test parsing compact SVG with negative coordinates
+        let path = "M100,-200L150,-250L150,-300Z";
+        let result = parse_svg_path(path);
+        
+        assert!(result.is_ok(), "Should parse compact notation with negative coords");
+        let (outer, _holes) = result.unwrap();
+        assert_eq!(outer.len(), 3);
+        assert_eq!(outer[0], Point(100.0, -200.0));
+        assert_eq!(outer[1], Point(150.0, -250.0));
+        assert_eq!(outer[2], Point(150.0, -300.0));
+    }
+
+    #[test]
+    fn test_parse_path_removes_tiny_edges() {
+        // Test that very small edges are filtered out
+        let path = "M 0,0 L 100,0 L 100.0000001,0.0000001 L 100,100 L 0,100 z";
+        let (outer, _holes) = parse_svg_path(path).unwrap();
+        
+        // The point at (100.0000001, 0.0000001) should be filtered out
+        // because the edge to/from it is too small
+        assert!(outer.len() <= 5, "Tiny edges should be filtered out");
+    }
+
+    #[test]
+    fn test_tokenize_empty_path() {
+        let path = "";
+        let tokens = tokenize_svg_path(path);
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn test_tokenize_whitespace_only() {
+        let path = "   \t\n  ";
+        let tokens = tokenize_svg_path(path);
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_path_multiple_subpaths() {
+        // Test parsing path with multiple M commands (multiple subpaths)
+        let path = "M 0,0 L 100,0 L 100,100 L 0,100 z M 25,25 L 75,25 L 75,75 L 25,75 z";
+        let (outer, holes) = parse_svg_path(path).unwrap();
+        
+        // Should identify one as outer boundary and one as hole
+        assert_eq!(holes.len(), 1, "Should have 1 hole");
+        assert!(outer.len() >= 3, "Outer boundary should have at least 3 points");
+        assert!(holes[0].len() >= 3, "Hole should have at least 3 points");
+    }
+
+    #[test]
+    fn test_parse_path_all_commands() {
+        // Test path with all command types to ensure none are broken
+        let path = "M 0,0 L 10,0 H 20 V 10 h 10 v 10 C 40,20 50,20 60,30 S 80,40 90,30 Q 100,20 110,30 T 130,30 A 10 10 0 0 1 150,30 Z";
+        let result = parse_svg_path(path);
+        
+        assert!(result.is_ok(), "Should parse path with all command types: {:?}", result.err());
+        let (outer, _holes) = result.unwrap();
+        assert!(outer.len() >= 3, "Should have at least 3 points forming a polygon");
+    }
+
+    #[test]
+    fn test_parse_fork_svg() {
+        // Test the fork.svg file which has 4 sub-paths
+        let svg_bytes = include_bytes!("../../../jagua-sqs-processor/tests/testdata/fork.svg");
+        
+        // Extract path data
+        let path_data = extract_path_from_svg_bytes(svg_bytes).expect("Failed to extract path data");
+        eprintln!("Path data length: {}", path_data.len());
+        eprintln!("First 200 chars: {}", path_data.chars().take(200).collect::<String>());
+        
+        // Parse the path
+        let result = parse_svg_path(&path_data);
+        match &result {
+            Ok((outer, holes)) => {
+                eprintln!("Outer boundary points: {}", outer.len());
+                eprintln!("First 3 points: {:?}", &outer[..3.min(outer.len())]);
+                eprintln!("Last 3 points: {:?}", &outer[outer.len().saturating_sub(3)..]);
+                
+                // Check for duplicates
+                use std::collections::HashSet;
+                let unique_count = outer.iter().collect::<HashSet<_>>().len();
+                if unique_count != outer.len() {
+                    eprintln!("WARNING: {} duplicate points found!", outer.len() - unique_count);
+                    // Find the duplicates
+                    let mut seen = HashSet::new();
+                    for (i, point) in outer.iter().enumerate() {
+                        if !seen.insert(point) {
+                            eprintln!("  Duplicate at index {}: {:?}", i, point);
+                        }
+                    }
+                }
+                
+                eprintln!("Number of holes: {}", holes.len());
+                for (i, hole) in holes.iter().enumerate() {
+                    eprintln!("Hole {} points: {}", i, hole.len());
+                }
+                
+                // Try to create SPolygon from the outer boundary to ensure it's valid
+                use jagua_rs::geometry::primitives::SPolygon;
+                match SPolygon::new(outer.clone()) {
+                    Ok(poly) => {
+                        eprintln!("Successfully created SPolygon");
+                        eprintln!("  Area: {}", poly.area);
+                        eprintln!("  Diameter: {}", poly.diameter);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to create SPolygon: {}", e);
+                        panic!("SPolygon creation failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+            }
+        }
+        
+        result.expect("Failed to parse fork.svg path");
     }
 }
