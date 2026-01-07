@@ -351,4 +351,71 @@ M 364.5,333.381 L 362.619,333.049 L 360.965,332.094 L 359.737,330.631 L 359.084,
 
         Ok(())
     }
+
+    #[test]
+    fn test_fork_svg_nesting() -> Result<()> {
+        let _ = env_logger::Builder::from_default_env()
+            .filter_level(log::LevelFilter::Debug)
+            .try_init();
+
+        // Test the fork.svg file which has 4 sub-paths (1 outer boundary + 3 holes)
+        // and uses compact notation without spaces between commands and coordinates
+        let svg_bytes = include_bytes!("../../jagua-sqs-processor/tests/testdata/fork.svg");
+        
+        debug!("Testing fork.svg with compact SVG notation (no spaces between commands and coords)");
+        debug!("Fork shape size: approximately 60x370 units (from viewBox)");
+        
+        let start = Instant::now();
+        let result = nest_svg_parts(
+            500.0, // bin_width - increased to accommodate the fork shape
+            1000.0, // bin_height - increased to accommodate the fork shape
+            10.0,   // spacing - increased for better clearance
+            svg_bytes,
+            3,     // amount_of_parts - reduced for initial test
+            4,     // amount_of_rotations
+            1,     // loops (ignored)
+            1,     // placements (ignored)
+        )?;
+
+        debug!(
+            "Placed {} parts out of 3 requested from fork.svg",
+            result.parts_placed
+        );
+
+        assert!(
+            result.parts_placed > 0,
+            "Expected at least 1 part to be placed from fork.svg, but got 0"
+        );
+        
+        assert_eq!(
+            result.total_parts_requested,
+            3,
+            "Expected total_parts_requested to be 3"
+        );
+
+        // Verify the combined SVG is valid
+        let combined_svg_str = String::from_utf8(result.combined_svg.clone())?;
+        assert!(
+            combined_svg_str.contains("<?xml"),
+            "Combined SVG should be a valid SVG document"
+        );
+        
+        // Verify item references match parts_placed
+        let re_item_use = Regex::new(r##"<use[^>]*href=["']#item_\d+["']"##).unwrap();
+        let item_count_in_svg = re_item_use.find_iter(&combined_svg_str).count();
+        assert_eq!(
+            item_count_in_svg,
+            result.parts_placed,
+            "SVG should contain {} item references but found {}",
+            result.parts_placed,
+            item_count_in_svg
+        );
+
+        assert!(
+            start.elapsed().as_secs() <= 30,
+            "Fork.svg nesting exceeded reasonable time bound (30 seconds)"
+        );
+
+        Ok(())
+    }
 }
