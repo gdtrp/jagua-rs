@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1200">
+  <rect width="1200" height="1200" fill="lightgray" stroke="black" stroke-width="2"/>
+  <text x="24" y="120" font-size="24" font-family="monospace" fill="black">
+    Parts placed: 1 of 5
+  </text>
+  <text x="24" y="180" font-size="18" font-family="monospace" fill="red">
+    Warning: No layout snapshots available - SVG generation may have failed
+  </text>
+</svg>

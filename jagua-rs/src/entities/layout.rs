@@ -60,11 +60,12 @@ impl Layout {
     /// Restores the layout to a previous state using a snapshot.
     pub fn restore(&mut self, layout_snapshot: &LayoutSnapshot) {
         assert_eq!(self.container.id, layout_snapshot.container.id);
+
         self.placed_items = layout_snapshot.placed_items.clone();
         self.cde.restore(&layout_snapshot.cde_snapshot);
 
         debug_assert!(assertions::layout_qt_matches_fresh_qt(self));
-        debug_assert!(assertions::layouts_match(self, layout_snapshot))
+        debug_assert!(assertions::snapshot_matches_layout(self, layout_snapshot))
     }
 
     /// Places an item in the layout at a specific position by applying a transformation.
@@ -84,9 +85,6 @@ impl Layout {
     }
 
     /// Removes an item from the layout by its unique key and returns the removed [`PlacedItem`].
-    /// If `commit_instant` is true, the removal is immediately fully executed to the collision detection engine.
-    /// If false, the item is disabled in the collision detection engine, but not yet fully removed.
-    /// Useful for scenarios with high probability of reverting the removal.
     pub fn remove_item(&mut self, pk: PItemKey) -> PlacedItem {
         let pi = self
             .placed_items

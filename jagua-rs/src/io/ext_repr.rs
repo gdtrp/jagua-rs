@@ -108,8 +108,14 @@ pub struct ExtTransformation {
 impl From<DTransformation> for ExtTransformation {
     fn from(dt: DTransformation) -> Self {
         ExtTransformation {
-            rotation: dt.rotation(),
+            rotation: dt.rotation().to_degrees(),
             translation: dt.translation(),
         }
+    }
+}
+
+impl From<ExtTransformation> for DTransformation {
+    fn from(ext_dt: ExtTransformation) -> Self {
+        DTransformation::new(ext_dt.rotation.to_radians(), ext_dt.translation)
     }
 }

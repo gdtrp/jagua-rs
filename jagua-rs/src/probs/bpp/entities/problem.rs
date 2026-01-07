@@ -42,8 +42,8 @@ impl BPProblem {
     }
 
     /// Places an item according to the provided [`BPPlacement`] in the problem.
-    pub fn place_item(&mut self, p_opt: BPPlacement) -> (LayKey, PItemKey) {
-        let lkey = match p_opt.layout_id {
+    pub fn place_item(&mut self, placement: BPPlacement) -> (LayKey, PItemKey) {
+        let lkey = match placement.layout_id {
             BPLayoutType::Open(lkey) => lkey,
             BPLayoutType::Closed { bin_id } => {
                 //open a new layout
@@ -52,17 +52,17 @@ impl BPProblem {
                 self.register_layout(layout)
             }
         };
-        let layout = &mut self.layouts[lkey];
-        let item = self.instance.item(p_opt.item_id);
-        let pik = layout.place_item(item, p_opt.d_transf);
 
-        self.register_included_item(p_opt.item_id);
+        let layout = &mut self.layouts[lkey];
+        let item = self.instance.item(placement.item_id);
+        let pik = layout.place_item(item, placement.d_transf);
+
+        self.register_included_item(placement.item_id);
 
         (lkey, pik)
     }
 
     /// Removes an item from a layout. If the layout is empty, it will be closed.
-    /// Set `commit_instantly` to false if there's a high chance that this modification will be reverted.
     pub fn remove_item(&mut self, lkey: LayKey, pik: PItemKey) -> BPPlacement {
         let pi = self.layouts[lkey].remove_item(pik);
         self.deregister_included_item(pi.item_id);
@@ -95,7 +95,9 @@ impl BPProblem {
     }
 
     /// Restores the state of the problem to the given [`BPSolution`].
-    pub fn restore(&mut self, solution: &BPSolution) {
+    /// Returns `true` if any of the layout keys changed (i.e., layouts were added or removed).
+    pub fn restore(&mut self, solution: &BPSolution) -> bool {
+        let mut layout_keys_changed = false;
         let mut layouts_to_remove = vec![];
 
         //Check which layouts from the problem are also present in the solution.
@@ -114,6 +116,7 @@ impl BPProblem {
 
         //Remove all layouts that were not present in the solution (or have a different bin)
         for lkey in layouts_to_remove {
+            layout_keys_changed = true;
             self.layouts.remove(lkey);
         }
 
@@ -121,6 +124,7 @@ impl BPProblem {
         for (lkey, ls) in solution.layout_snapshots.iter() {
             if !self.layouts.contains_key(lkey) {
                 self.layouts.insert(Layout::from_snapshot(ls));
+                layout_keys_changed = true;
             }
         }
 
@@ -150,6 +154,7 @@ impl BPProblem {
         }
 
         debug_assert!(problem_matches_solution(self, solution));
+        layout_keys_changed
     }
 
     pub fn density(&self) -> f32 {
@@ -246,7 +251,7 @@ impl BPPlacement {
     }
 }
 
-/// Enum to distinguish between both open [`Layout`]s, and potentially new ones.
+/// Enum to distinguish between already existing [`Layout`]s and new ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BPLayoutType {
     /// An existing layout, identified by its key
