@@ -636,6 +636,7 @@ async fn test_cancellation_request_handling() -> Result<()> {
         sqs_client,
         s3_client,
         "test-bucket".to_string(),
+        "us-east-1".to_string(),
         "test-input-queue".to_string(),
         "test-output-queue".to_string(),
     );
@@ -1404,6 +1405,396 @@ fn test_parse_and_serialize_dr_svg() -> Result<()> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root_dir = manifest_dir.parent().unwrap(); // This is the jagua-rs root
     let output_path = root_dir.join("dr_parsed_serialized.svg");
+    fs::write(&output_path, svg)?;
+    println!("Saved parsed and serialized SVG to: {:?}", output_path);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_e2e_processing_custom_svg() -> Result<()> {
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .try_init();
+    // Test with a closed polygon using H, V, and A commands
+    // This is a rounded rectangle: starts at top-left, goes right with arc at top-right,
+    // down with arc at bottom-right, left with arc at bottom-left, up with arc at top-left
+    let test_svg = r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+  <path d="M 20,0 H 180 A 20,20 0 0 1 200,20 V 80 A 20,20 0 0 1 180,100 H 20 A 20,20 0 0 1 0,80 V 20 A 20,20 0 0 1 20,0 z" fill="#007fff"/>
+</svg>
+"##;
+
+    // Calculate bin dimensions: 210mm * 72 / 25.4 and 80mm * 72 / 25.4
+    let bin_width = 1500.0 * 72.0 / 25.4;
+    let bin_height = 6000.0 * 72.0 / 25.4;
+
+    let request = SqsNestingRequest {
+        correlation_id: "test-custom-svg".to_string(),
+        svg_url: None,
+        svg_base64: Some(general_purpose::STANDARD.encode(test_svg.as_bytes())),
+        bin_width: Some(bin_width),
+        bin_height: Some(bin_height),
+        spacing: Some(2.0),
+        amount_of_parts: Some(1),
+        amount_of_rotations: 4,
+        output_queue_url: None,
+        cancelled: false,
+    };
+
+    let request_json = serde_json::to_string(&request)?;
+    let (responses, final_nesting_result) = process_request_direct(&request_json, None, None)?;
+
+    assert!(!responses.is_empty(), "Should have at least one response");
+
+    let final_response = responses
+        .iter()
+        .find(|r| r.is_final)
+        .ok_or_else(|| anyhow::anyhow!("No final response found"))?;
+
+    assert_eq!(final_response.correlation_id, "test-custom-svg");
+    assert!(final_response.parts_placed > 0);
+    assert!(final_response.is_final);
+    assert!(!final_response.is_improvement);
+
+    // Tests don't use S3, so URLs will be None
+    assert!(
+        final_response.first_page_svg_url.is_none(),
+        "Tests don't use S3, first_page_svg_url should be None"
+    );
+    assert!(
+        final_response.last_page_svg_url.is_none(),
+        "Tests don't use S3, last_page_svg_url should be None"
+    );
+
+    // Save the result SVG to project root for validation
+    use std::fs;
+    use std::path::PathBuf;
+    
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let project_root = manifest_dir.parent().unwrap();
+    
+    // Save final result SVG
+    if !final_nesting_result.page_svgs.is_empty() {
+        let output_path = project_root.join("custom_svg_e2e_result.svg");
+        let first_page_svg = &final_nesting_result.page_svgs[0];
+        fs::write(&output_path, first_page_svg)
+            .context("Failed to write result SVG to project root")?;
+        println!("Saved final first page SVG to: {}", output_path.display());
+        
+        // Save all pages if there are multiple
+        if final_nesting_result.page_svgs.len() > 1 {
+            for (i, page_svg) in final_nesting_result.page_svgs.iter().enumerate() {
+                let page_path = project_root.join(format!("custom_svg_e2e_result_page_{}.svg", i));
+                fs::write(&page_path, page_svg)
+                    .context("Failed to write page SVG")?;
+                println!("Saved final page {} SVG to: {}", i, page_path.display());
+            }
+        }
+    } else if !final_nesting_result.combined_svg.is_empty() {
+        // Fallback to combined_svg if page_svgs is empty
+        let output_path = project_root.join("custom_svg_e2e_result.svg");
+        fs::write(&output_path, &final_nesting_result.combined_svg)
+            .context("Failed to write result SVG to project root")?;
+        println!("Saved final combined SVG to: {}", output_path.display());
+    } else {
+        println!("Warning: No SVG data available to save (page_svgs and combined_svg are both empty)");
+        println!("  Parts placed: {}", final_nesting_result.parts_placed);
+        println!("  Total parts requested: {}", final_nesting_result.total_parts_requested);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_parse_and_serialize_custom_svg() -> Result<()> {
+    use jagua_utils::svg_nesting::{
+        calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+
+    // Test SVG with lines, circles, and paths
+    let test_svg = r#"<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" fill="none" width="215" height="101">
+<g id="KN_1" stroke-width="1" stroke="rgb(0,0,0)">
+<line x1="172.409736" y1="100.000000" x2="172.409736" y2="20.000000"/>
+</g>
+<g id="KN_2" stroke-width="1" stroke="rgb(0,0,0)">
+<line x1="47.469914" y1="20.000000" x2="47.469914" y2="100.000000"/>
+</g>
+<g id="KN_3" stroke-width="1" stroke="rgb(0,0,0)">
+<circle cx="69.939825" cy="30.000000" r="4.250000"/>
+</g>
+<g id="KN_4" stroke-width="1" stroke="rgb(0,0,0)">
+<circle cx="149.939825" cy="30.000000" r="4.250000"/>
+</g>
+<g id="KN_5" stroke-width="1" stroke="rgb(0,0,0)">
+<circle cx="149.939825" cy="90.000000" r="4.250000"/>
+</g>
+<g id="KN_6" stroke-width="1" stroke="rgb(0,0,0)">
+<circle cx="69.939825" cy="90.000000" r="4.250000"/>
+</g>
+<g id="KN_7" stroke-width="1" stroke="rgb(0,0,0)">
+<line x1="5.000003" y1="97.000000" x2="5.000003" y2="91.622777"/>
+<line x1="5.000003" y1="28.377223" x2="5.000003" y2="23.000000"/>
+<line x1="211.879647" y1="20.000000" x2="8.000003" y2="20.000000"/>
+<line x1="214.879647" y1="23.000000" x2="214.879647" y2="28.377223"/>
+<line x1="214.879647" y1="91.622777" x2="214.879647" y2="97.000000"/>
+<line x1="8.000003" y1="100.000000" x2="211.879647" y2="100.000000"/>
+<path d="M 5.000003,97.000000 A 3.000000,3.000000 0 0 0 8.000002 100.000000"/>
+<path d="M 5.000000,91.622777 A 32.500000,32.500000 0 0 0 5.000003 28.377224"/>
+<path d="M 8.000003,20.000000 A 3.000000,3.000000 0 0 0 5.000003 23.000000"/>
+<path d="M 214.879647,23.000000 A 3.000000,3.000000 0 0 0 211.879647 20.000000"/>
+<path d="M 214.879648,28.377223 A 32.500000,32.500000 0 0 0 214.879645 91.622776"/>
+<path d="M 211.879647,100.000000 A 3.000000,3.000000 0 0 0 214.879647 97.000000"/>
+<line x1="214.879650" y1="91.622780" x2="214.879640" y2="91.622780"/>
+</g>
+</svg>"#;
+
+    // Extract all paths, lines, and circles from the SVG and combine them
+    // The outer boundary is formed by the lines and arcs in KN_7
+    // The holes are the 4 circles (KN_3, KN_4, KN_5, KN_6)
+    
+    // Build the outer boundary path from lines and arcs in KN_7
+    // The boundary should be: arcs and lines connected in order to form a closed path
+    let svg_str = test_svg;
+    
+    // Extract all path elements (arcs)
+    let mut all_paths = Vec::new();
+    let mut search_start = 0;
+    while let Some(path_start) = svg_str[search_start..].find("<path") {
+        let absolute_start = search_start + path_start;
+        if let Some(d_start) = svg_str[absolute_start..].find("d=\"") {
+            let d_start = absolute_start + d_start + 3;
+            if let Some(d_end) = svg_str[d_start..].find("\"") {
+                let path_data = &svg_str[d_start..d_start + d_end];
+                all_paths.push(path_data.to_string());
+            }
+        }
+        search_start = absolute_start + 1;
+    }
+    
+    // Extract all line elements and convert them to path segments
+    let mut all_lines = Vec::new();
+    search_start = 0;
+    while let Some(line_start) = svg_str[search_start..].find("<line") {
+        let absolute_start = search_start + line_start;
+        // Extract x1, y1, x2, y2
+        let mut x1 = None;
+        let mut y1 = None;
+        let mut x2 = None;
+        let mut y2 = None;
+        
+        if let Some(x1_match) = svg_str[absolute_start..].find("x1=\"") {
+            let x1_start = absolute_start + x1_match + 4;
+            if let Some(x1_end) = svg_str[x1_start..].find("\"") {
+                x1 = svg_str[x1_start..x1_start + x1_end].parse::<f32>().ok();
+            }
+        }
+        if let Some(y1_match) = svg_str[absolute_start..].find("y1=\"") {
+            let y1_start = absolute_start + y1_match + 4;
+            if let Some(y1_end) = svg_str[y1_start..].find("\"") {
+                y1 = svg_str[y1_start..y1_start + y1_end].parse::<f32>().ok();
+            }
+        }
+        if let Some(x2_match) = svg_str[absolute_start..].find("x2=\"") {
+            let x2_start = absolute_start + x2_match + 4;
+            if let Some(x2_end) = svg_str[x2_start..].find("\"") {
+                x2 = svg_str[x2_start..x2_start + x2_end].parse::<f32>().ok();
+            }
+        }
+        if let Some(y2_match) = svg_str[absolute_start..].find("y2=\"") {
+            let y2_start = absolute_start + y2_match + 4;
+            if let Some(y2_end) = svg_str[y2_start..].find("\"") {
+                y2 = svg_str[y2_start..y2_start + y2_end].parse::<f32>().ok();
+            }
+        }
+        
+        if let (Some(x1_val), Some(y1_val), Some(x2_val), Some(y2_val)) = (x1, y1, x2, y2) {
+            // Convert line to path: L x2,y2 (assuming we start from x1,y1)
+            all_lines.push(format!("L {},{}", x2_val, y2_val));
+        }
+        
+        search_start = absolute_start + 1;
+    }
+    
+    // The arcs in the SVG form a continuous boundary when connected in order
+    // However, they're separate sub-paths. The parser will treat them as separate polygons
+    // and pick the largest one. Since all arcs together form the outer boundary,
+    // we need to ensure they're parsed as a single continuous path.
+    // The arcs should connect end-to-end, so we'll keep them as separate sub-paths
+    // and let the parser combine them, or we construct a single path manually.
+    
+    // For now, combine all paths - the parser will extract the largest area polygon
+    // which should be the combined outer boundary
+    let outer_path = if !all_paths.is_empty() {
+        all_paths.join(" ")
+    } else {
+        String::new()
+    };
+    
+    // Extract circles for holes
+    let mut circles = Vec::new();
+    search_start = 0;
+    while let Some(circle_start) = svg_str[search_start..].find("<circle") {
+        let absolute_start = search_start + circle_start;
+        if let Some(cx_match) = svg_str[absolute_start..].find("cx=\"") {
+            let cx_start = absolute_start + cx_match + 4;
+            if let Some(cx_end) = svg_str[cx_start..].find("\"") {
+                let cx_str = &svg_str[cx_start..cx_start + cx_end];
+                if let Some(cy_match) = svg_str[absolute_start..].find("cy=\"") {
+                    let cy_start = absolute_start + cy_match + 4;
+                    if let Some(cy_end) = svg_str[cy_start..].find("\"") {
+                        let cy_str = &svg_str[cy_start..cy_start + cy_end];
+                        if let Some(r_match) = svg_str[absolute_start..].find("r=\"") {
+                            let r_start = absolute_start + r_match + 3;
+                            if let Some(r_end) = svg_str[r_start..].find("\"") {
+                                let r_str = &svg_str[r_start..r_start + r_end];
+                                if let (Ok(cx), Ok(cy), Ok(r)) = (cx_str.parse::<f32>(), cy_str.parse::<f32>(), r_str.parse::<f32>()) {
+                                    circles.push((cx, cy, r));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        search_start = absolute_start + 1;
+    }
+    
+    println!("Extracted {} paths, {} circles", all_paths.len(), circles.len());
+    println!("Combined outer path: {}", outer_path);
+    
+    // Parse each arc sub-path separately and combine them
+    // Split the path by "M " to get individual arc paths
+    let mut all_subpaths_points = Vec::new();
+    for path_str in all_paths.iter() {
+        if let Ok((boundary, _)) = parse_svg_path(path_str) {
+            if !boundary.is_empty() {
+                all_subpaths_points.push(boundary);
+            }
+        }
+    }
+    
+    // Combine all sub-paths into a single polygon
+    // Remove duplicate points where arcs connect
+    let (mut outer_boundary, mut path_holes) = if !all_subpaths_points.is_empty() && all_subpaths_points.len() > 1 {
+        let mut combined = all_subpaths_points[0].clone();
+        for subpath in all_subpaths_points.iter().skip(1) {
+            if !combined.is_empty() && !subpath.is_empty() {
+                let last = combined.last().unwrap();
+                let first = &subpath[0];
+                // Use a larger threshold to snap nearby points (arcs might have slight endpoint mismatches)
+                let threshold = 1.0;
+                let dist_sq = (last.0 - first.0).powi(2) + (last.1 - first.1).powi(2);
+                if dist_sq < threshold * threshold {
+                    // Points are close - snap the last point to the first point for exact connection
+                    let _ = combined.pop();
+                    combined.push(*first);
+                    // Add the rest of the subpath
+                    combined.extend_from_slice(&subpath[1..]);
+                } else {
+                    // Points are far apart - add a connecting line segment
+                    combined.push(*first);
+                    combined.extend_from_slice(&subpath[1..]);
+                }
+            } else if !subpath.is_empty() {
+                combined.extend_from_slice(subpath);
+            }
+        }
+        (combined, Vec::new())
+    } else if !all_subpaths_points.is_empty() {
+        (all_subpaths_points[0].clone(), Vec::new())
+    } else {
+        parse_svg_path(&outer_path)?
+    };
+    
+    // Convert circles to holes
+    let mut holes = path_holes;
+    // circle_to_path is re-exported from jagua_utils::svg_nesting
+    use jagua_utils::svg_nesting::circle_to_path;
+    for (cx, cy, r) in circles {
+        let circle_path = circle_to_path(cx, cy, r);
+        if let Ok((mut circle_points, _)) = parse_svg_path(&circle_path) {
+            // Ensure circle is clockwise (negative area) for holes
+            let area = calculate_signed_area(&circle_points);
+            if area > 0.0 {
+                circle_points = reverse_winding(&circle_points);
+            }
+            holes.push(circle_points);
+        }
+    }
+    
+    println!(
+        "Parsed SVG: {} outer boundary points, {} holes",
+        outer_boundary.len(),
+        holes.len()
+    );
+
+    println!(
+        "Parsed SVG: {} outer boundary points, {} holes",
+        outer_boundary.len(),
+        holes.len()
+    );
+
+    // Ensure outer boundary is counter-clockwise (positive area)
+    let outer_area = calculate_signed_area(&outer_boundary);
+    println!("Outer boundary area: {}", outer_area);
+    if outer_area < 0.0 {
+        outer_boundary = reverse_winding(&outer_boundary);
+        println!("Reversed outer boundary winding (was clockwise)");
+    }
+
+    // Ensure holes are clockwise (negative area)
+    for (i, hole) in holes.iter_mut().enumerate() {
+        let hole_area = calculate_signed_area(hole);
+        if hole_area > 0.0 {
+            *hole = reverse_winding(hole);
+            println!("Reversed hole {} winding (was counter-clockwise, area: {})", i, hole_area);
+        }
+    }
+
+    // Convert back to SVG
+    let mut svg = String::new();
+    svg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    svg.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 215 101\">\n");
+    
+    // Build a single path with outer boundary and holes
+    // Outer boundary first, then holes (holes should be opposite winding)
+    let mut combined_path = points_to_svg_path(&outer_boundary.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
+    
+    // Add holes to the same path (they'll be cutouts due to fill-rule="evenodd")
+    for (i, hole) in holes.iter().enumerate() {
+        let hole_path = points_to_svg_path(&hole.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
+        // Remove the "M" and "z" from hole path and append to combined path
+        let hole_path_inner = hole_path.trim_start_matches("M ").trim_end_matches(" z");
+        combined_path.push_str(&format!(" M {} z", hole_path_inner));
+        println!("  Hole {}: {} points", i, hole.len());
+    }
+    
+    // Render as a single path with evenodd fill rule (holes will be cutouts)
+    svg.push_str(&format!(
+        "  <path d=\"{}\" fill=\"lightgray\" stroke=\"black\" stroke-width=\"2\" fill-rule=\"evenodd\"/>\n",
+        combined_path
+    ));
+    
+    // Also render holes separately in red for visualization/debugging
+    svg.push_str("  <!-- Holes rendered separately for visualization -->\n");
+    for (_i, hole) in holes.iter().enumerate() {
+        let hole_path = points_to_svg_path(&hole.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
+        svg.push_str(&format!(
+            "  <path d=\"{}\" fill=\"red\" stroke=\"blue\" stroke-width=\"1\" opacity=\"0.3\"/>\n",
+            hole_path
+        ));
+    }
+
+    svg.push_str("</svg>\n");
+
+    // Save to jagua-rs root folder (parent of jagua-sqs-processor)
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root_dir = manifest_dir.parent().unwrap(); // This is the jagua-rs root
+    let output_path = root_dir.join("custom_svg_parsed_serialized.svg");
     fs::write(&output_path, svg)?;
     println!("Saved parsed and serialized SVG to: {:?}", output_path);
 
