@@ -368,6 +368,25 @@ impl NestingStrategy for SimpleNestingStrategy {
             None
         };
 
+        // Calculate bin utilisation
+        let total_bin_area = bin_width * bin_height;
+        let utilisation = if total_bin_area > 0.0 {
+            let used_area: f32 = solution
+                .layout_snapshots
+                .values()
+                .flat_map(|ls| &ls.placed_items)
+                .map(|(_key, item)| {
+                    let bbox = &item.shape.bbox;
+                    bbox.width() * bbox.height()
+                })
+                .sum();
+            (used_area / total_bin_area).min(1.0).max(0.0)
+        } else {
+            0.0
+        };
+
+        log::debug!("Bin utilisation: {:.1}%", utilisation * 100.0);
+
         // Always use SVG count as source of truth since optimizer might report incorrect counts
         Ok(NestingResult {
             combined_svg: combined_svg.into_bytes(),
@@ -375,6 +394,7 @@ impl NestingStrategy for SimpleNestingStrategy {
             parts_placed: corrected_count,
             total_parts_requested: amount_of_parts,
             unplaced_parts_svg,
+            utilisation,
         })
     }
 }

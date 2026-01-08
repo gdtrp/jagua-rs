@@ -19,6 +19,8 @@ pub struct NestingResult {
     pub total_parts_requested: usize,
     /// SVG for unplaced parts (if any), showing remaining parts in a grid layout.
     pub unplaced_parts_svg: Option<Vec<u8>>,
+    /// Bin utilisation ratio (0.0 to 1.0) representing how much of the bin area is occupied by placed parts.
+    pub utilisation: f32,
 }
 
 /// Converts points to SVG path data
