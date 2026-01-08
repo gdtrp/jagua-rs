@@ -57,6 +57,35 @@ impl AdaptiveNestingStrategy {
             .unwrap_or(false)
     }
 
+    /// Calculate bin utilisation (density) from a solution
+    /// Returns a ratio between 0.0 and 1.0 representing how much of the bin area is occupied
+    fn calculate_bin_density(
+        &self,
+        solution: &BPSolution,
+        bin_width: f32,
+        bin_height: f32,
+    ) -> f32 {
+        let total_bin_area = bin_width * bin_height;
+
+        if total_bin_area <= 0.0 {
+            return 0.0;
+        }
+
+        // Sum up the bounding box areas of all placed items
+        let used_area: f32 = solution
+            .layout_snapshots
+            .values()
+            .flat_map(|ls| &ls.placed_items)
+            .map(|(_key, item)| {
+                let bbox = &item.shape.bbox;
+                bbox.width() * bbox.height()
+            })
+            .sum();
+
+        // Return utilisation ratio clamped to [0.0, 1.0]
+        (used_area / total_bin_area).min(1.0).max(0.0)
+    }
+
     /// Run a single optimization run with given parameters
     fn run_single_optimization(
         &self,
@@ -180,12 +209,18 @@ impl AdaptiveNestingStrategy {
             None
         };
 
+        // Calculate bin utilisation
+        let utilisation = self.calculate_bin_density(solution, bin_width, bin_height);
+
+        log::debug!("Bin utilisation: {:.1}%", utilisation * 100.0);
+
         Ok(NestingResult {
             combined_svg: combined_svg.into_bytes(),
             page_svgs,
             parts_placed: corrected_count,
             total_parts_requested: amount_of_parts,
             unplaced_parts_svg,
+            utilisation,
         })
     }
 }
@@ -321,6 +356,7 @@ impl NestingStrategy for AdaptiveNestingStrategy {
         const MAX_RUNS_WITHOUT_IMPROVEMENT: usize = 10;
         const MAX_RUN_DURATION_SECONDS: u64 = 60;
         const MAX_TOTAL_OPTIMIZATION_SECONDS: u64 = 600; // 10 minutes overall timeout
+        const HIGH_DENSITY_THRESHOLD: f32 = 0.80; // 80% bin utilisation is considered "good enough"
 
         'outer: loop {
             // Check overall timeout
@@ -451,15 +487,27 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                 }
 
                 log::info!(
-                    "Run {} completed: {} parts placed best result {} in {:.2}s",
+                    "Run {} completed: {} parts placed (utilisation {:.1}%), best result {} in {:.2}s",
                     total_runs,
-                    result.parts_placed, best_placed,
+                    result.parts_placed,
+                    result.utilisation * 100.0,
+                    best_placed,
                     run_duration.as_secs_f64()
                 );
 
                 // If we've placed all items in this run, we're done (even if it's not an improvement)
                 if result.parts_placed >= amount_of_parts {
                     log::info!("All parts placed, stopping optimization");
+                    return Ok(result);
+                }
+
+                // Check if bin density is high enough (good enough solution)
+                if result.utilisation >= HIGH_DENSITY_THRESHOLD {
+                    log::info!(
+                        "High bin utilisation achieved: {:.1}% (threshold: {:.1}%), stopping optimization",
+                        result.utilisation * 100.0,
+                        HIGH_DENSITY_THRESHOLD * 100.0
+                    );
                     return Ok(result);
                 }
 
@@ -526,6 +574,7 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                 parts_placed: 0,
                 total_parts_requested: amount_of_parts,
                 unplaced_parts_svg: None,
+                utilisation: 0.0,
             }
         }))
     }

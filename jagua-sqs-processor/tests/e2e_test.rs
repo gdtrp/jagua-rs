@@ -85,6 +85,7 @@ fn process_request_direct(
             first_page_svg_url: None, // Tests don't use S3
             last_page_svg_url: None, // Tests don't use S3
             parts_placed: result.parts_placed,
+            utilisation: result.utilisation,
             is_improvement: true,
             is_final: false,
             timestamp: current_timestamp(),
@@ -137,6 +138,7 @@ fn process_request_direct(
         first_page_svg_url: None, // Tests don't use S3
         last_page_svg_url: None, // Tests don't use S3
         parts_placed: nesting_result.parts_placed,
+        utilisation: nesting_result.utilisation,
         is_improvement: false,
         is_final: true,
         timestamp: current_timestamp(),
@@ -559,6 +561,7 @@ fn process_request_with_cancellation(
             first_page_svg_url: None, // Tests don't use S3
             last_page_svg_url: None, // Tests don't use S3
             parts_placed: result.parts_placed,
+            utilisation: result.utilisation,
             is_improvement: true,
             is_final: false,
             timestamp: current_timestamp(),
@@ -608,6 +611,7 @@ fn process_request_with_cancellation(
         first_page_svg_url: None, // Tests don't use S3
         last_page_svg_url: None, // Tests don't use S3
         parts_placed: nesting_result.parts_placed,
+        utilisation: nesting_result.utilisation,
         is_improvement: false,
         is_final: true,
         timestamp: current_timestamp(),
@@ -1165,6 +1169,7 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         first_page_svg_url: final_responses[0].first_page_svg_url.clone(),
                         last_page_svg_url: final_responses[0].last_page_svg_url.clone(),
                         parts_placed: final_responses[0].parts_placed,
+                        utilisation: final_responses[0].utilisation,
                         is_improvement: false,
                         is_final: true,
                         timestamp: current_timestamp(),
@@ -1178,6 +1183,7 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         page_svgs: vec![],
                         combined_svg: vec![],
                         unplaced_parts_svg: None,
+                        utilisation: final_responses[0].utilisation,
                     };
                     break (final_responses, nr.unwrap_or(dummy_result));
                 }

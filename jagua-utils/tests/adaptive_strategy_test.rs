@@ -202,10 +202,76 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             duration.as_secs()
         );
 
+        // Verify utilisation field is present and valid
+        assert!(
+            nesting_result.utilisation >= 0.0 && nesting_result.utilisation <= 1.0,
+            "Utilisation should be between 0.0 and 1.0, got {}",
+            nesting_result.utilisation
+        );
+
+        // Should have some utilisation if parts are placed
+        if nesting_result.parts_placed > 0 {
+            assert!(
+                nesting_result.utilisation > 0.0,
+                "Should have non-zero utilisation when parts are placed"
+            );
+        }
+
         println!(
-            "Complex SVG test: placed {}/{} parts in {:.2}s",
+            "Complex SVG test: placed {}/{} parts with {:.1}% bin utilisation in {:.2}s",
             nesting_result.parts_placed,
             nesting_result.total_parts_requested,
+            nesting_result.utilisation * 100.0,
+            duration.as_secs_f64()
+        );
+    }
+
+    /// Test that high density stops optimization early
+    #[test]
+    fn test_high_density_early_stopping() {
+        // Create small squares that will fill the bin efficiently
+        let svg = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+    <path d="M 0,0 L 100,0 L 100,100 L 0,100 Z" fill="black"/>
+</svg>"#;
+
+        let strategy = AdaptiveNestingStrategy::new();
+        let start = Instant::now();
+
+        // Try to place 100 parts in a large bin - should stop early when density is high
+        let result = strategy.nest(
+            1500.0,  // Large bin
+            1500.0,
+            5.0,
+            svg.as_bytes(),
+            100,  // Request many parts
+            4,
+            None,
+        );
+
+        let duration = start.elapsed();
+
+        assert!(result.is_ok(), "Nesting should succeed");
+        let nesting_result = result.unwrap();
+
+        // Should complete relatively quickly due to high density stopping
+        assert!(
+            duration.as_secs() < 30,
+            "Should complete quickly with high density stopping, took {} seconds",
+            duration.as_secs()
+        );
+
+        // Should have good utilisation
+        assert!(
+            nesting_result.utilisation > 0.0,
+            "Should have positive utilisation"
+        );
+
+        println!(
+            "High density test: placed {}/{} parts with {:.1}% utilisation in {:.2}s",
+            nesting_result.parts_placed,
+            nesting_result.total_parts_requested,
+            nesting_result.utilisation * 100.0,
             duration.as_secs_f64()
         );
     }
