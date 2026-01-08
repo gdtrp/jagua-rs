@@ -444,6 +444,12 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     run_duration.as_secs_f64()
                 );
 
+                // If we've placed all items in this run, we're done (even if it's not an improvement)
+                if result.parts_placed >= amount_of_parts {
+                    log::info!("All parts placed, stopping optimization");
+                    return Ok(result);
+                }
+
                 // Check if this is an improvement
                 if result.parts_placed > best_placed {
                     improved_this_batch = true;
@@ -462,12 +468,6 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                         if let Err(e) = callback(result.clone()) {
                             log::warn!("Failed to send improvement callback: {}", e);
                         }
-                    }
-
-                    // If we've placed all items, we're done
-                    if result.parts_placed >= amount_of_parts {
-                        log::info!("All parts placed, stopping optimization");
-                        return Ok(best_result.unwrap());
                     }
                 }
 
