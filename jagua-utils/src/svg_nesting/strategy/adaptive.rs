@@ -309,6 +309,7 @@ impl NestingStrategy for AdaptiveNestingStrategy {
         let instance = BPInstance::new(items, vec![bin]);
 
         // Adaptive optimization loop
+        let optimization_start = Instant::now();
         let mut loops = 1; // Start with 1 loop
         let mut placements = 10000; // Start with 10000 placements (n_samples)
         let _rotations = amount_of_rotations; // Start with requested rotations (currently not varied)
@@ -316,11 +317,23 @@ impl NestingStrategy for AdaptiveNestingStrategy {
         let mut best_result: Option<NestingResult> = None;
         let mut best_placed = 0;
         let mut total_runs = 0;
-        const MAX_TOTAL_RUNS: usize = 100;
+        const MAX_TOTAL_RUNS: usize = 40;
         const MAX_RUNS_WITHOUT_IMPROVEMENT: usize = 10;
         const MAX_RUN_DURATION_SECONDS: u64 = 60;
+        const MAX_TOTAL_OPTIMIZATION_SECONDS: u64 = 600; // 10 minutes overall timeout
 
         'outer: loop {
+            // Check overall timeout
+            let elapsed_total = optimization_start.elapsed().as_secs();
+            if elapsed_total >= MAX_TOTAL_OPTIMIZATION_SECONDS {
+                log::info!(
+                    "Reached maximum optimization time ({} seconds), stopping with {} parts placed",
+                    elapsed_total,
+                    best_placed
+                );
+                break 'outer;
+            }
+
             if self.is_cancelled() {
                 log::info!("Cancellation detected, stopping adaptive optimization");
                 break 'outer;
