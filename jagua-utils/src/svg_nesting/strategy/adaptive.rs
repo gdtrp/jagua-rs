@@ -133,10 +133,10 @@ impl AdaptiveNestingStrategy {
             }
         }
 
-        Ok((
-            best_placed,
-            best_solution.expect("At least one optimization run should succeed"),
-        ))
+        match best_solution {
+            Some(solution) => Ok((best_placed, solution)),
+            None => anyhow::bail!("No items could be placed in the bin"),
+        }
     }
 
     /// Generate SVG from solution
@@ -411,14 +411,29 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                 );
 
                 // Run optimization
-                let (_placed, solution) = self.run_single_optimization(
+                let optimization_result = self.run_single_optimization(
                     &instance,
                     &cde_config,
                     spacing,
                     loops,
                     placements,
                     total_runs,
-                )?;
+                );
+
+                let (_placed, solution) = match optimization_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("No items could be placed: {}", e);
+                        return Ok(NestingResult {
+                            combined_svg: Vec::new(),
+                            page_svgs: Vec::new(),
+                            parts_placed: 0,
+                            total_parts_requested: amount_of_parts,
+                            unplaced_parts_svg: None,
+                            utilisation: 0.0,
+                        });
+                    }
+                };
 
                 let run_duration = run_start.elapsed();
                 if run_duration.as_secs() > MAX_RUN_DURATION_SECONDS {

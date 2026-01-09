@@ -8,7 +8,15 @@ pub fn problem_matches_solution(bpp: &BPProblem, sol: &BPSolution) -> bool {
         time_stamp: _,
     } = sol;
 
-    assert_eq!(bpp.density(), sol.density(&bpp.instance));
+    let bpp_density = bpp.density();
+    let sol_density = sol.density(&bpp.instance);
+    // Handle NaN case: both NaN is valid (e.g., when no items placed)
+    assert!(
+        (bpp_density.is_nan() && sol_density.is_nan()) || bpp_density == sol_density,
+        "density mismatch: bpp={}, sol={}",
+        bpp_density,
+        sol_density
+    );
     assert_eq!(bpp.layouts.len(), layout_snapshots.len());
 
     // Check that each layout in the problem has a matching snapshot in the solution

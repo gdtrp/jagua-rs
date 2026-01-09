@@ -226,6 +226,63 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         );
     }
 
+    /// Test that when no items can be placed (part too large for bin),
+    /// the strategy returns 0 parts placed without panicking
+    #[test]
+    fn test_returns_zero_when_part_too_large_for_bin() {
+        // Create a large square SVG (500x500)
+        let svg = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500">
+    <path d="M 0,0 L 500,0 L 500,500 L 0,500 Z" fill="black"/>
+</svg>"#;
+
+        let strategy = AdaptiveNestingStrategy::new();
+
+        // Try to place the part in a bin that's too small (100x100 bin for 500x500 part)
+        let result = strategy.nest(
+            100.0,  // bin_width - smaller than the part
+            100.0,  // bin_height - smaller than the part
+            5.0,    // spacing
+            svg.as_bytes(),
+            1,      // amount_of_parts
+            4,      // amount_of_rotations
+            None,   // no callback
+        );
+
+        // Should succeed (not panic)
+        assert!(result.is_ok(), "Nesting should return Ok, not panic");
+
+        let nesting_result = result.unwrap();
+
+        // Should place 0 parts since the part doesn't fit
+        assert_eq!(
+            nesting_result.parts_placed, 0,
+            "Should place 0 parts when part is too large for bin"
+        );
+
+        // Should have empty SVG data
+        assert!(
+            nesting_result.combined_svg.is_empty(),
+            "Combined SVG should be empty when no parts placed"
+        );
+        assert!(
+            nesting_result.page_svgs.is_empty(),
+            "Page SVGs should be empty when no parts placed"
+        );
+
+        // Utilisation should be 0
+        assert_eq!(
+            nesting_result.utilisation, 0.0,
+            "Utilisation should be 0 when no parts placed"
+        );
+
+        // total_parts_requested should still reflect the original request
+        assert_eq!(
+            nesting_result.total_parts_requested, 1,
+            "Should still report 1 part was requested"
+        );
+    }
+
     /// Test that high density stops optimization early
     #[test]
     fn test_high_density_early_stopping() {
