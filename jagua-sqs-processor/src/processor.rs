@@ -1050,21 +1050,21 @@ impl SqsProcessor {
 
             info!("spawn_blocking task completed (took {:?})", nest_start.elapsed());
 
-            // Check if cooperative timeout was triggered
-            if timed_out_for_check.load(Ordering::SeqCst) {
-                error!(
-                    "Execution timeout after {:?} for correlation_id={}",
-                    execution_timeout, correlation_id_for_error
-                );
-                return Err(anyhow!("execution timeout"));
-            }
-
+            // Check if nesting succeeded
             let nesting_result = nesting_result.with_context(|| {
                 format!(
                     "Failed to process SVG nesting for correlation_id={}",
                     correlation_id_for_error
                 )
             })?;
+
+            // Log if timeout was triggered but we still got a result
+            if timed_out_for_check.load(Ordering::SeqCst) {
+                info!(
+                    "Timeout triggered but nesting completed with {} parts placed for correlation_id={}",
+                    nesting_result.parts_placed, correlation_id_for_error
+                );
+            }
             info!("Nesting result obtained successfully");
             info!("Cancellation checker was called {} times total", cancellation_check_count_for_final_log.load(Ordering::Relaxed));
 
