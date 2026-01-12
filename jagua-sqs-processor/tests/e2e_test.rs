@@ -1806,3 +1806,216 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that execution timeout is enforced and returns error response
+/// This test uses a 5-second timeout instead of the default 10 minutes
+/// Note: The cooperative cancellation in the nesting algorithm may take some time
+/// to detect the timeout, so we allow up to 120 seconds for the test to complete.
+#[tokio::test]
+async fn test_execution_timeout() -> Result<()> {
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Debug)
+        .try_init();
+
+    // Set timeout to 5 seconds for this test
+    std::env::set_var("EXECUTION_TIMEOUT_SECS", "5");
+
+    // Use a complex SVG with many parts to ensure processing takes longer than 5 seconds
+    let test_svg = r#"<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="90mm" height="90mm" viewBox="-45 -45 90 90" xmlns="http://www.w3.org/2000/svg" version="1.1">
+<title>Complex Test Shape</title>
+<path d="M 13.9062,42.7979 L 22.5,38.9707 L 30.1113,33.4414 L 36.4062,26.4502 L 41.1094,18.3027 L 44.0166,9.35645
+ L 45,-0 L 44.0166,-9.35645 L 41.1094,-18.3027 L 36.4062,-26.4502 L 30.1113,-33.4414 L 22.5,-38.9707
+ L 13.9062,-42.7979 L 4.7041,-44.7539 L -4.7041,-44.7539 L -13.9062,-42.7979 L -22.5,-38.9707 L -30.1113,-33.4414
+ L -36.4062,-26.4502 L -41.1094,-18.3027 L -44.0166,-9.35645 L -45,-0 L -44.0166,9.35645 L -41.1094,18.3027
+ L -36.4062,26.4502 L -30.1113,33.4414 L -22.5,38.9707 L -13.9062,42.7979 L -4.7041,44.7539 L 4.7041,44.7539 z
+" stroke="black" fill="lightgray" stroke-width="0.5"/>
+</svg>"#;
+
+    let request = SqsNestingRequest {
+        correlation_id: "test-execution-timeout".to_string(),
+        svg_url: None,
+        svg_base64: Some(general_purpose::STANDARD.encode(test_svg.as_bytes())),
+        bin_width: Some(500.0),
+        bin_height: Some(500.0),
+        spacing: Some(10.0),
+        amount_of_parts: Some(1000), // Large number of parts to ensure timeout
+        amount_of_rotations: 16, // More rotations to make it slower
+        output_queue_url: None,
+        cancelled: false,
+    };
+
+    let request_json = serde_json::to_string(&request)?;
+
+    // Process the request with timeout enabled via environment variable
+    let start = Instant::now();
+    let result = process_request_with_timeout(&request_json);
+    let elapsed = start.elapsed();
+
+    // Cleanup environment variable
+    std::env::remove_var("EXECUTION_TIMEOUT_SECS");
+
+    // The cooperative cancellation may take time to be detected (up to 2 minutes)
+    // The key test is that the timeout IS triggered and an error response is returned
+    assert!(
+        elapsed < Duration::from_secs(120),
+        "Processing should complete within 120 seconds, took {:?}",
+        elapsed
+    );
+
+    // Result should be an error with "execution timeout" message
+    match result {
+        Ok(responses) => {
+            // Check if we got an error response
+            let error_response = responses.iter().find(|r| r.error_message.is_some());
+            assert!(
+                error_response.is_some(),
+                "Should have received an error response with timeout message"
+            );
+            let error_msg = error_response.unwrap().error_message.as_ref().unwrap();
+            assert!(
+                error_msg.contains("execution timeout"),
+                "Error message should contain 'execution timeout', got: {}",
+                error_msg
+            );
+            println!("Received expected timeout error: {}", error_msg);
+        }
+        Err(e) => {
+            // Direct error from processing is also acceptable
+            let error_msg = format!("{}", e);
+            assert!(
+                error_msg.contains("execution timeout"),
+                "Error should contain 'execution timeout', got: {}",
+                error_msg
+            );
+            println!("Processing returned expected timeout error: {}", error_msg);
+        }
+    }
+
+    println!("Timeout test completed in {:?}", elapsed);
+    Ok(())
+}
+
+/// Process a request with timeout support (reads EXECUTION_TIMEOUT_SECS env var)
+fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResponse>> {
+    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let request: SqsNestingRequest = serde_json::from_str(request_json)?;
+
+    let svg_base64 = request
+        .svg_base64
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Missing required field: svg_base64"))?;
+    let bin_width = request
+        .bin_width
+        .ok_or_else(|| anyhow::anyhow!("Missing required field: bin_width"))?;
+    let bin_height = request
+        .bin_height
+        .ok_or_else(|| anyhow::anyhow!("Missing required field: bin_height"))?;
+    let spacing = request
+        .spacing
+        .ok_or_else(|| anyhow::anyhow!("Missing required field: spacing"))?;
+    let amount_of_parts = request
+        .amount_of_parts
+        .ok_or_else(|| anyhow::anyhow!("Missing required field: amount_of_parts"))?;
+
+    let svg_bytes = general_purpose::STANDARD
+        .decode(svg_base64)
+        .map_err(|e| anyhow::anyhow!("Failed to decode svg_base64: {}", e))?;
+
+    // Get timeout from env var (same as production code)
+    let timeout_secs: u64 = std::env::var("EXECUTION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600); // Default 10 minutes
+    let timeout = Duration::from_secs(timeout_secs);
+    let start_time = Instant::now();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let timed_out_for_checker = timed_out.clone();
+
+    let improvements: Arc<Mutex<Vec<SqsNestingResponse>>> = Arc::new(Mutex::new(Vec::new()));
+    let improvements_clone = improvements.clone();
+    let correlation_id = request.correlation_id.clone();
+
+    // Create a cancellation checker that also checks for timeout
+    let cancellation_checker = move || {
+        if start_time.elapsed() > timeout {
+            timed_out_for_checker.store(true, Ordering::SeqCst);
+            true // Signal cancellation
+        } else {
+            false
+        }
+    };
+
+    let callback = move |result: NestingResult| -> Result<()> {
+        let response = SqsNestingResponse {
+            correlation_id: correlation_id.clone(),
+            first_page_svg_url: None,
+            last_page_svg_url: None,
+            parts_placed: result.parts_placed,
+            utilisation: result.utilisation,
+            is_improvement: true,
+            is_final: false,
+            timestamp: current_timestamp(),
+            error_message: None,
+        };
+        improvements_clone.lock().unwrap().push(response);
+        Ok(())
+    };
+
+    let strategy = AdaptiveNestingStrategy::with_cancellation_checker(Box::new(cancellation_checker));
+    let nesting_result = strategy.nest(
+        bin_width,
+        bin_height,
+        spacing,
+        &svg_bytes,
+        amount_of_parts,
+        request.amount_of_rotations,
+        Some(Box::new(callback)),
+    );
+
+    // Check if we timed out
+    if timed_out.load(Ordering::SeqCst) {
+        // Return error response for timeout
+        let mut responses = improvements.lock().unwrap().clone();
+        responses.push(SqsNestingResponse {
+            correlation_id: request.correlation_id,
+            first_page_svg_url: None,
+            last_page_svg_url: None,
+            parts_placed: 0,
+            utilisation: 0.0,
+            is_improvement: false,
+            is_final: true,
+            timestamp: current_timestamp(),
+            error_message: Some("execution timeout".to_string()),
+        });
+        return Ok(responses);
+    }
+
+    match nesting_result {
+        Ok(result) => {
+            let mut responses = improvements.lock().unwrap().clone();
+            responses.push(SqsNestingResponse {
+                correlation_id: request.correlation_id,
+                first_page_svg_url: None,
+                last_page_svg_url: None,
+                parts_placed: result.parts_placed,
+                utilisation: result.utilisation,
+                is_improvement: false,
+                is_final: true,
+                timestamp: current_timestamp(),
+                error_message: None,
+            });
+            Ok(responses)
+        }
+        Err(e) => {
+            Err(anyhow::anyhow!("Nesting failed: {}", e))
+        }
+    }
+}

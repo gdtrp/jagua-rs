@@ -26,6 +26,9 @@ const RETRY_BASE_DELAY_MS: u64 = 100;
 /// TTL for orphaned cancellation registry entries (in seconds)
 const CANCELLATION_REGISTRY_TTL_SECS: u64 = 300; // 5 minutes
 
+/// Default execution timeout for nesting operations (in seconds)
+const DEFAULT_EXECUTION_TIMEOUT_SECS: u64 = 600; // 10 minutes
+
 /// Request message structure for SQS queue
 /// For cancellation requests, only `correlation_id` and `cancelled: true` are required.
 /// All other fields are required only when `cancelled` is false or not present.
@@ -181,6 +184,15 @@ fn get_max_concurrent_tasks() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_CONCURRENT_TASKS)
+}
+
+/// Get the execution timeout from environment or use default (10 minutes)
+fn get_execution_timeout() -> Duration {
+    let secs = std::env::var("EXECUTION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 /// Cancellation registry entry with timestamp for TTL-based cleanup
@@ -846,6 +858,11 @@ impl SqsProcessor {
             info!("SVG payload ready: {} bytes (took {:?})", svg_bytes.len(), decode_start.elapsed());
 
             // Create cancellation checker closure using the helper method
+            // The checker also monitors for execution timeout
+            let execution_timeout = get_execution_timeout();
+            let execution_start = Instant::now();
+            let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let timed_out_for_checker = timed_out.clone();
             let processor_clone = self.clone();
             let correlation_id_clone = request.correlation_id.clone();
             let cancellation_check_count = Arc::new(AtomicU64::new(0));
@@ -854,6 +871,12 @@ impl SqsProcessor {
                 let count = cancellation_check_count_for_log.fetch_add(1, Ordering::Relaxed) + 1;
                 if count % 1000 == 0 {
                     log::debug!("Cancellation checker called {} times", count);
+                }
+                // Check for timeout
+                if execution_start.elapsed() > execution_timeout {
+                    timed_out_for_checker.store(true, Ordering::SeqCst);
+                    log::warn!("Execution timeout reached after {:?}", execution_start.elapsed());
+                    return true;
                 }
                 processor_clone.is_cancelled(&correlation_id_clone)
             };
@@ -980,14 +1003,21 @@ impl SqsProcessor {
 
             // Clone cancellation_check_count for logging after spawn_blocking
             let cancellation_check_count_for_final_log = cancellation_check_count.clone();
+            let timed_out_for_check = timed_out.clone();
 
             // Run nest() in a blocking task to avoid blocking the async runtime
-            info!("Starting nesting optimization in spawn_blocking task");
+            // The cancellation checker handles timeout detection cooperatively
+            info!("Starting nesting optimization in spawn_blocking task (timeout: {:?})", execution_timeout);
             let nest_start = Instant::now();
             let svg_bytes_for_nest = svg_bytes.clone();
             let amount_of_rotations = request.amount_of_rotations;
             let correlation_id_for_error = request.correlation_id.clone();
-            let nesting_result = tokio::task::spawn_blocking(move || {
+            let correlation_id_for_timeout = request.correlation_id.clone();
+
+            // Use a longer failsafe timeout (execution_timeout + 60s buffer) in case cooperative cancellation is slow
+            let failsafe_timeout = execution_timeout + Duration::from_secs(60);
+
+            let nesting_future = tokio::task::spawn_blocking(move || {
                 info!("Inside spawn_blocking: calling strategy.nest()");
                 let nest_call_start = Instant::now();
                 let result = strategy.nest(
@@ -1001,11 +1031,34 @@ impl SqsProcessor {
                 );
                 info!("Inside spawn_blocking: strategy.nest() completed (took {:?})", nest_call_start.elapsed());
                 result
-            })
-            .await
-            .context("Failed to spawn blocking task for nesting")?;
+            });
+
+            // Apply failsafe timeout to the blocking task (cooperative timeout via cancellation checker is primary)
+            let nesting_result = match tokio::time::timeout(failsafe_timeout, nesting_future).await {
+                Ok(spawn_result) => {
+                    spawn_result.context("Failed to spawn blocking task for nesting")?
+                }
+                Err(_) => {
+                    // Failsafe timeout occurred (cooperative timeout should have triggered first)
+                    error!(
+                        "Failsafe execution timeout after {:?} for correlation_id={}",
+                        failsafe_timeout, correlation_id_for_timeout
+                    );
+                    return Err(anyhow!("execution timeout"));
+                }
+            };
 
             info!("spawn_blocking task completed (took {:?})", nest_start.elapsed());
+
+            // Check if cooperative timeout was triggered
+            if timed_out_for_check.load(Ordering::SeqCst) {
+                error!(
+                    "Execution timeout after {:?} for correlation_id={}",
+                    execution_timeout, correlation_id_for_error
+                );
+                return Err(anyhow!("execution timeout"));
+            }
+
             let nesting_result = nesting_result.with_context(|| {
                 format!(
                     "Failed to process SVG nesting for correlation_id={}",
@@ -1472,6 +1525,37 @@ mod tests {
 
         // Cleanup
         std::env::remove_var("MAX_CONCURRENT_TASKS");
+    }
+
+    #[test]
+    fn test_get_execution_timeout() {
+        // These tests must run sequentially to avoid race conditions with env vars
+        // Test 1: Default value when env var is not set
+        std::env::remove_var("EXECUTION_TIMEOUT_SECS");
+        assert_eq!(
+            get_execution_timeout(),
+            Duration::from_secs(DEFAULT_EXECUTION_TIMEOUT_SECS),
+            "Should use default (10 minutes) when env var not set"
+        );
+
+        // Test 2: Valid value from env var
+        std::env::set_var("EXECUTION_TIMEOUT_SECS", "5");
+        assert_eq!(
+            get_execution_timeout(),
+            Duration::from_secs(5),
+            "Should use value from env var"
+        );
+
+        // Test 3: Invalid value falls back to default
+        std::env::set_var("EXECUTION_TIMEOUT_SECS", "not-a-number");
+        assert_eq!(
+            get_execution_timeout(),
+            Duration::from_secs(DEFAULT_EXECUTION_TIMEOUT_SECS),
+            "Should fall back to default for invalid value"
+        );
+
+        // Cleanup
+        std::env::remove_var("EXECUTION_TIMEOUT_SECS");
     }
 
     #[test]
