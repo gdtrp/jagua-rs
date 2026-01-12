@@ -2019,3 +2019,79 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
         }
     }
 }
+
+/// Test with complex SVG (fireman.svg) that was causing hangs
+/// Uses 2-minute timeout - complex SVG needs more time
+#[tokio::test]
+async fn test_complex_svg_timeout() -> Result<()> {
+    use std::time::Duration;
+    use std::path::PathBuf;
+    use tokio::time::Instant;
+
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .try_init();
+
+    // Set timeout to 2 minutes for complex SVG processing
+    std::env::set_var("EXECUTION_TIMEOUT_SECS", "120");
+
+    // Load SVG from test data file
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let svg_path = manifest_dir.join("tests/testdata/fireman.svg");
+    let complex_svg = std::fs::read_to_string(&svg_path)
+        .with_context(|| format!("Failed to read SVG file: {:?}", svg_path))?;
+
+    let request = SqsNestingRequest {
+        correlation_id: "test-complex-svg-timeout".to_string(),
+        svg_url: None,
+        svg_base64: Some(general_purpose::STANDARD.encode(complex_svg.as_bytes())),
+        bin_width: Some(1500.0),
+        bin_height: Some(3000.0),
+        spacing: Some(2.0),
+        amount_of_parts: Some(3000),
+        amount_of_rotations: 4,
+        output_queue_url: None,
+        cancelled: false,
+    };
+
+    let request_json = serde_json::to_string(&request)?;
+
+    println!("Starting complex SVG test with 2-minute timeout...");
+    println!("  bin: 1500x3000, spacing: 2, parts: 3000, rotations: 4");
+
+    let start = Instant::now();
+    let result = process_request_with_timeout(&request_json);
+    let elapsed = start.elapsed();
+
+    // Cleanup environment variable
+    std::env::remove_var("EXECUTION_TIMEOUT_SECS");
+
+    println!("Test completed in {:?}", elapsed);
+
+    // Should complete within 4 minutes (2-minute timeout + cooperative detection overhead)
+    assert!(
+        elapsed < Duration::from_secs(240),
+        "Processing should complete within 240 seconds, took {:?}",
+        elapsed
+    );
+
+    match result {
+        Ok(responses) => {
+            let final_response = responses.iter().find(|r| r.is_final);
+            if let Some(resp) = final_response {
+                if let Some(ref err) = resp.error_message {
+                    println!("Got error response: {}", err);
+                    assert!(err.contains("execution timeout") || err.contains("cancelled"),
+                        "Expected timeout or cancellation error");
+                } else {
+                    println!("Completed successfully: {} parts placed", resp.parts_placed);
+                }
+            }
+        }
+        Err(e) => {
+            println!("Got error: {}", e);
+        }
+    }
+
+    Ok(())
+}
