@@ -485,7 +485,27 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     let offset_y = (bin_height - total_grid_height) / 2.0;
                     let item_template = instance.item(0);
 
-                    for i in 0..unplaced_count {
+                    // Calculate how many items to show on the last page
+                    // If 298 items fit per page, and we have 2702 unplaced:
+                    // 2702 % 298 = 20 items on the last page
+                    let parts_per_page = result.parts_placed.max(1);
+                    let remainder = unplaced_count % parts_per_page;
+                    let items_to_render = if remainder == 0 && unplaced_count > 0 {
+                        parts_per_page // Full last page
+                    } else {
+                        remainder
+                    };
+
+                    if unplaced_count > items_to_render {
+                        log::info!(
+                            "Last page shows {} of {} unplaced items ({} items/page)",
+                            items_to_render,
+                            unplaced_count,
+                            parts_per_page
+                        );
+                    }
+
+                    for i in 0..items_to_render {
                         let row = i / cols;
                         let col = i % cols;
                         let grid_x =
@@ -499,11 +519,16 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     let unplaced_snapshot = unplaced_layout.save();
                     let mut svg_options = SvgDrawOptions::default();
                     svg_options.highlight_cd_shapes = false;
+                    let label = if unplaced_count > items_to_render {
+                        format!("Unplaced parts: {} (showing {})", unplaced_count, items_to_render)
+                    } else {
+                        format!("Unplaced parts: {}", unplaced_count)
+                    };
                     let unplaced_svg_doc = s_layout_to_svg(
                         &unplaced_snapshot,
                         &instance,
                         svg_options,
-                        &format!("Unplaced parts: {}", unplaced_count),
+                        &label,
                     );
                     let unplaced_svg_str = unplaced_svg_doc.to_string();
                     let processed_unplaced_svg = post_process_svg(&unplaced_svg_str, &processed_holes);
