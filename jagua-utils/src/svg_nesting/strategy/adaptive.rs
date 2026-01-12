@@ -100,6 +100,12 @@ impl AdaptiveNestingStrategy {
         let mut best_placed = 0;
 
         for loop_idx in 0..loops {
+            // Check cancellation at the start of each loop iteration
+            if self.is_cancelled() {
+                log::debug!("Cancellation detected in optimization loop, breaking");
+                break;
+            }
+
             let seed = (seed_offset * 1000 + loop_idx) as u64;
             let lbf_config = LBFConfig {
                 cde_config: cde_config.clone(),
@@ -114,7 +120,10 @@ impl AdaptiveNestingStrategy {
 
             let mut optimizer =
                 LBFOptimizerBP::new(instance.clone(), lbf_config, SmallRng::seed_from_u64(seed));
-            let solution = optimizer.solve();
+
+            // Use solve_with_cancellation to allow early termination within the LBF optimizer
+            let cancellation_fn = || self.is_cancelled();
+            let solution = optimizer.solve_with_cancellation(Some(&cancellation_fn));
 
             let placed: usize = solution
                 .layout_snapshots

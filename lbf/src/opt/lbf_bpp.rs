@@ -40,16 +40,54 @@ impl LBFOptimizerBP {
         self.solve_with_callback::<fn(&BPSolution)>(None)
     }
 
-    pub fn solve_with_callback<F>(&mut self, mut on_solution: Option<&mut F>) -> BPSolution
+    /// Solve with an optional cancellation checker for early termination
+    pub fn solve_with_cancellation<C>(&mut self, cancellation_checker: Option<&C>) -> BPSolution
+    where
+        C: Fn() -> bool,
+    {
+        self.solve_internal::<fn(&BPSolution), C>(None, cancellation_checker)
+    }
+
+    pub fn solve_with_callback<F>(&mut self, on_solution: Option<&mut F>) -> BPSolution
     where
         F: FnMut(&BPSolution),
+    {
+        self.solve_internal::<F, fn() -> bool>(on_solution, None)
+    }
+
+    fn solve_internal<F, C>(
+        &mut self,
+        mut on_solution: Option<&mut F>,
+        cancellation_checker: Option<&C>,
+    ) -> BPSolution
+    where
+        F: FnMut(&BPSolution),
+        C: Fn() -> bool,
     {
         let start = Instant::now();
 
         'outer: for item_id in item_placement_order(&self.instance) {
+            // Check cancellation at the start of each item type
+            if let Some(checker) = cancellation_checker {
+                if checker() {
+                    debug!("[LBF] cancellation detected, stopping early");
+                    break 'outer;
+                }
+            }
+
             let item = self.instance.item(item_id);
             //place all items of this type
             'inner: while self.problem.item_demand_qtys[item_id] > 0 {
+                // Check cancellation periodically (every 100 items placed)
+                if self.problem.item_placed_qtys().sum::<usize>() % 100 == 0 {
+                    if let Some(checker) = cancellation_checker {
+                        if checker() {
+                            debug!("[LBF] cancellation detected during placement, stopping");
+                            break 'outer;
+                        }
+                    }
+                }
+
                 //find a position and insert it
                 let placement = search_layouts(
                     &self.problem,
