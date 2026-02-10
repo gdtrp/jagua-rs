@@ -177,14 +177,14 @@ impl MSPProblem {
     /// Modifies the width of the strip of the layout.
     /// If the width is non-positive, the layout is removed.
     pub fn change_strip_width(&mut self, lk: LayKey, new_width: f32) {
-        if new_width > 0.0 {
-            let strip = &mut self.strips[lk];
-            strip.set_width(new_width);
-            self.layouts[lk].swap_container(Container::from(*strip));
-        } else {
-            //Width must be positive, remove the layout
-            self.remove_layout(lk);
-        }
+        assert!(
+            new_width > 0.0,
+            "Strip width must be positive. Got: {}",
+            new_width
+        );
+        let strip = &mut self.strips[lk];
+        strip.set_width(new_width);
+        self.layouts[lk].swap_container(Container::from(*strip));
     }
 
     fn register_layout(&mut self, layout: Layout) -> LayKey {
@@ -240,6 +240,10 @@ impl MSPProblem {
     /// Returns the total width of the strips of all the layouts in the problem.
     pub fn total_strip_width(&self) -> f32 {
         self.strips.iter().map(|(_, s)| s.width).sum()
+    }
+
+    pub fn n_placed_items(&self) -> usize {
+        self.layouts.values().map(|l| l.placed_items.len()).sum()
     }
 }
 
