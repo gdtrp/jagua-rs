@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy};
+    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
@@ -18,12 +18,12 @@ mod tests {
         let strategy = AdaptiveNestingStrategy::new();
 
         // Try to place just 1 part in a large bin (should succeed on first run)
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1 }];
         let result = strategy.nest(
             500.0,  // bin_width - large enough to fit the part
             500.0,  // bin_height
             5.0,    // spacing
-            svg.as_bytes(),
-            1,      // amount_of_parts - just 1 part
+            &parts,
             4,      // amount_of_rotations
             None,   // no callback
         );
@@ -68,12 +68,12 @@ mod tests {
         let strategy = AdaptiveNestingStrategy::new();
 
         // Try to place 4 parts in a large bin
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 4 }];
         let result = strategy.nest(
             500.0,
             500.0,
             5.0,
-            svg.as_bytes(),
-            4,  // Request 4 parts
+            &parts,
             4,
             Some(Box::new(callback)),
         );
@@ -171,12 +171,12 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let start = Instant::now();
 
         // Use parameters from user's scenario: 1200x1200 bin, 2mm spacing, 4 rotations, 6 parts
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 6 }];
         let result = strategy.nest(
             1200.0,  // bin_width
             1200.0,  // bin_height
             2.0,     // spacing
-            svg.as_bytes(),
-            6,       // amount_of_parts
+            &parts,
             4,       // amount_of_rotations
             None,
         );
@@ -239,12 +239,12 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let strategy = AdaptiveNestingStrategy::new();
 
         // Try to place the part in a bin that's too small (100x100 bin for 500x500 part)
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1 }];
         let result = strategy.nest(
             100.0,  // bin_width - smaller than the part
             100.0,  // bin_height - smaller than the part
             5.0,    // spacing
-            svg.as_bytes(),
-            1,      // amount_of_parts
+            &parts,
             4,      // amount_of_rotations
             None,   // no callback
         );
@@ -283,6 +283,131 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         );
     }
 
+    /// Multi-part placement test with 3 different SVGs.
+    /// Nests them together and writes page SVGs + placements JSON to disk for visual validation.
+    #[test]
+    fn test_multi_part_placements_output() {
+        let _ = env_logger::try_init();
+
+        // Part 1: circle (30-point polygon approximation)
+        let svg_circle = r#"<?xml version="1.0" standalone="no"?>
+<svg width="90mm" height="90mm" viewBox="-45 -45 90 90" xmlns="http://www.w3.org/2000/svg" version="1.1">
+<path d="M 13.9062,42.7979 L 22.5,38.9707 L 30.1113,33.4414 L 36.4062,26.4502 L 41.1094,18.3027 L 44.0166,9.35645
+ L 45,-0 L 44.0166,-9.35645 L 41.1094,-18.3027 L 36.4062,-26.4502 L 30.1113,-33.4414 L 22.5,-38.9707
+ L 13.9062,-42.7979 L 4.7041,-44.7539 L -4.7041,-44.7539 L -13.9062,-42.7979 L -22.5,-38.9707 L -30.1113,-33.4414
+ L -36.4062,-26.4502 L -41.1094,-18.3027 L -44.0166,-9.35645 L -45,-0 L -44.0166,9.35645 L -41.1094,18.3027
+ L -36.4062,26.4502 L -30.1113,33.4414 L -22.5,38.9707 L -13.9062,42.7979 L -4.7041,44.7539 L 4.7041,44.7539 z
+" stroke="black" fill="lightgray" stroke-width="0.5"/>
+</svg>"#;
+
+        // Part 2: small square (80x80)
+        let svg_square = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80">
+    <path d="M 0,0 L 80,0 L 80,80 L 0,80 Z" fill="black"/>
+</svg>"#;
+
+        // Part 3: L-shape
+        let svg_lshape = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+    <path d="M 0,0 L 40,0 L 40,60 L 100,60 L 100,100 L 0,100 Z" fill="black"/>
+</svg>"#;
+
+        let parts = vec![
+            PartInput { svg_bytes: svg_circle.as_bytes().to_vec(), count: 10 },
+            PartInput { svg_bytes: svg_square.as_bytes().to_vec(), count: 15 },
+            PartInput { svg_bytes: svg_lshape.as_bytes().to_vec(), count: 12 },
+        ];
+
+        let strategy = AdaptiveNestingStrategy::new();
+
+        let result = strategy.nest(
+            1200.0,
+            1200.0,
+            5.0,
+            &parts,
+            4,
+            None,
+        );
+
+        assert!(result.is_ok(), "Multi-part nesting should succeed");
+        let nesting_result = result.unwrap();
+
+        assert!(nesting_result.parts_placed > 0, "Should place at least some parts");
+        assert!(!nesting_result.pages.is_empty(), "Pages should not be empty");
+
+        // Verify placement data consistency
+        let total_placements: usize = nesting_result.pages.iter().map(|p| p.placements.len()).sum();
+        assert_eq!(
+            total_placements,
+            nesting_result.parts_placed,
+            "Number of placements should match parts_placed"
+        );
+
+        // Verify all part_index values are within range
+        for page in &nesting_result.pages {
+            for p in &page.placements {
+                assert!(p.part_index < 3, "part_index {} should be < 3", p.part_index);
+            }
+        }
+
+        // Write output files for visual validation
+        let output_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_output")
+            .join("multi_part_placements");
+        // Clean stale files from previous runs
+        if output_dir.exists() {
+            std::fs::remove_dir_all(&output_dir).expect("clean output dir");
+        }
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // Write each page SVG
+        for (i, page_svg) in nesting_result.page_svgs.iter().enumerate() {
+            let path = output_dir.join(format!("page-{}.svg", i));
+            std::fs::write(&path, page_svg).expect("write page SVG");
+            println!("Wrote page SVG: {}", path.display());
+        }
+
+        // Write combined SVG
+        let combined_path = output_dir.join("combined.svg");
+        std::fs::write(&combined_path, &nesting_result.combined_svg).expect("write combined SVG");
+        println!("Wrote combined SVG: {}", combined_path.display());
+
+        // Write unplaced parts SVG if present
+        if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
+            let unplaced_path = output_dir.join("unplaced.svg");
+            std::fs::write(&unplaced_path, unplaced_svg).expect("write unplaced SVG");
+            println!("Wrote unplaced SVG: {}", unplaced_path.display());
+        }
+
+        // Write pages JSON (grouped placements by page)
+        let pages_json = serde_json::to_string_pretty(&nesting_result.pages)
+            .expect("serialize pages");
+        let pages_path = output_dir.join("pages.json");
+        std::fs::write(&pages_path, &pages_json).expect("write pages JSON");
+        println!("Wrote pages JSON: {}", pages_path.display());
+
+        println!(
+            "\nMulti-part placement test summary:");
+        println!(
+            "  Parts requested: {} (circle: 10, square: 15, L-shape: 12)",
+            nesting_result.total_parts_requested
+        );
+        println!("  Parts placed: {}", nesting_result.parts_placed);
+        println!("  Pages: {}", nesting_result.pages.len());
+        println!("  Utilisation: {:.1}%", nesting_result.utilisation * 100.0);
+        println!("  Output dir: {}", output_dir.display());
+
+        // Print per-page breakdown
+        for page in &nesting_result.pages {
+            println!(
+                "  Page {}: {} items, utilisation {:.1}%",
+                page.page_index,
+                page.placements.len(),
+                page.utilisation * 100.0
+            );
+        }
+    }
+
     /// Test that high density stops optimization early
     #[test]
     fn test_high_density_early_stopping() {
@@ -296,12 +421,12 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let start = Instant::now();
 
         // Try to place 100 parts in a large bin - should stop early when density is high
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 100 }];
         let result = strategy.nest(
             1500.0,  // Large bin
             1500.0,
             5.0,
-            svg.as_bytes(),
-            100,  // Request many parts
+            &parts,
             4,
             None,
         );

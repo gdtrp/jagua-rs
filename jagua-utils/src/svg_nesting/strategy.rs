@@ -9,6 +9,15 @@ pub use adaptive::AdaptiveNestingStrategy;
 use crate::svg_nesting::svg_generation::NestingResult;
 use anyhow::Result;
 
+/// A single part type with its SVG bytes and count
+#[derive(Debug, Clone)]
+pub struct PartInput {
+    /// SVG content as bytes
+    pub svg_bytes: Vec<u8>,
+    /// Number of copies of this part to nest
+    pub count: usize,
+}
+
 /// Callback function type for sending intermediate improvements
 /// Called when a better result is found during optimization
 pub type ImprovementCallback = Box<dyn Fn(NestingResult) -> Result<()> + Send + Sync>;
@@ -21,8 +30,7 @@ pub trait NestingStrategy: Send + Sync {
     /// * `bin_width` - Width of the bin
     /// * `bin_height` - Height of the bin
     /// * `spacing` - Minimum spacing between parts
-    /// * `svg_part_bytes` - SVG part as bytes
-    /// * `amount_of_parts` - Number of parts to place
+    /// * `parts` - Slice of part inputs, each with SVG bytes and count
     /// * `amount_of_rotations` - Number of discrete rotations to allow
     /// * `improvement_callback` - Optional callback to send intermediate improvements (called when better results are found)
     ///
@@ -33,8 +41,7 @@ pub trait NestingStrategy: Send + Sync {
         bin_width: f32,
         bin_height: f32,
         spacing: f32,
-        svg_part_bytes: &[u8],
-        amount_of_parts: usize,
+        parts: &[PartInput],
         amount_of_rotations: usize,
         improvement_callback: Option<ImprovementCallback>,
     ) -> Result<NestingResult>;

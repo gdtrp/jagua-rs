@@ -5,6 +5,38 @@ use jagua_rs::geometry::primitives::{Point, SPolygon};
 use jagua_rs::geometry::DTransformation;
 use jagua_rs::geometry::geo_traits::Transformable;
 use jagua_rs::geometry::OriginalShape;
+use serde::{Deserialize, Serialize};
+
+/// Per-item placement data describing where a part was placed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacedPartInfo {
+    /// Internal item ID assigned by the optimizer.
+    pub item_id: usize,
+    /// Which PartInput this came from (0-based index into the parts array).
+    pub part_index: usize,
+    /// Translation X in bin coordinates.
+    pub x: f32,
+    /// Translation Y in bin coordinates.
+    pub y: f32,
+    /// Rotation in degrees.
+    pub rotation: f32,
+}
+
+/// Per-page result grouping utilisation, placements, and optional SVG URL for a single sheet.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageResult {
+    /// Page index (0-based).
+    pub page_index: usize,
+    /// Utilisation ratio (0.0 to 1.0) for this page.
+    pub utilisation: f32,
+    /// S3 URL to the SVG for this page (populated by the SQS processor).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub svg_url: Option<String>,
+    /// Placements on this page.
+    pub placements: Vec<PlacedPartInfo>,
+}
 
 /// Result data returned after nesting SVG parts.
 #[derive(Clone, Debug)]
@@ -19,8 +51,10 @@ pub struct NestingResult {
     pub total_parts_requested: usize,
     /// SVG for unplaced parts (if any), showing remaining parts in a grid layout.
     pub unplaced_parts_svg: Option<Vec<u8>>,
-    /// Bin utilisation ratio (0.0 to 1.0) representing how much of the bin area is occupied by placed parts.
+    /// Average bin utilisation ratio (0.0 to 1.0) across all pages.
     pub utilisation: f32,
+    /// Per-page results: utilisation and placements grouped by page.
+    pub pages: Vec<PageResult>,
 }
 
 /// Converts points to SVG path data
@@ -251,6 +285,73 @@ pub fn generate_unplaced_parts_svg(
     Ok(processed_svg)
 }
 
+/// Post-processes SVG with per-item holes based on item ID
+/// Each item gets holes from the corresponding entry in `item_id_to_holes`.
+/// Items whose ID is out of range get no holes.
+pub fn post_process_svg_multi(svg_str: &str, item_id_to_holes: &[&[Vec<Point>]]) -> String {
+    use regex::Regex;
+
+    let mut result = svg_str.to_string();
+
+    // Change item fill color to white and remove fill-opacity (make fully opaque)
+    let re_fill = Regex::new(r##"fill="#FFC879""##).unwrap();
+    result = re_fill
+        .replace_all(&result, r##"fill="white""##)
+        .to_string();
+
+    // Remove fill-opacity from item paths (make fully opaque white)
+    let re_fill_opacity = Regex::new(
+        r##"(<g id="item_\d+">\s*<path[^>]*fill="white")[^>]*fill-opacity="[^"]*"([^>]*/>)"##,
+    )
+    .unwrap();
+    result = re_fill_opacity
+        .replace_all(&result, r##"${1}${2}"##)
+        .to_string();
+
+    // Change stroke color to gray for item paths
+    let re_stroke = Regex::new(r##"(<g id="item_\d+">\s*<path[^>]*stroke=")black(")"##).unwrap();
+    result = re_stroke
+        .replace_all(&result, r##"${1}gray${2}"##)
+        .to_string();
+
+    // Make container/bin transparent
+    let re_container_fill =
+        Regex::new(r##"(<g id="container_\d+">\s*<path[^>]*fill=")#CC824A(")"##).unwrap();
+    result = re_container_fill
+        .replace_all(&result, r##"${1}transparent${2}"##)
+        .to_string();
+
+    // For each item definition, add the correct holes based on item ID
+    let re_item =
+        Regex::new(r##"(<g id="item_(\d+)">\s*<path d=")([^"]+)(" [^>]*/>)"##).unwrap();
+
+    result = re_item
+        .replace_all(&result, |caps: &regex::Captures| -> String {
+            let item_start = caps.get(1).unwrap().as_str();
+            let item_id: usize = caps.get(2).unwrap().as_str().parse().unwrap_or(0);
+            let outer_path = caps.get(3).unwrap().as_str();
+            let item_end = caps.get(4).unwrap().as_str();
+
+            // Look up holes for this item ID
+            let holes = item_id_to_holes.get(item_id).copied().unwrap_or(&[]);
+
+            if holes.is_empty() {
+                return format!("{}{}{}", item_start, outer_path, item_end);
+            }
+
+            let mut combined_path = outer_path.to_string();
+            for hole in holes {
+                let hole_path = points_to_svg_path(hole);
+                combined_path.push_str(&format!(" {}", hole_path));
+            }
+
+            format!("{}{}{}", item_start, combined_path, item_end)
+        })
+        .to_string();
+
+    result
+}
+
 /// Extracts the inner content from an SVG document (everything inside <svg>...</svg>)
 /// Removes XML declaration and root <svg> tags, returning just the content
 fn extract_svg_inner_content(svg_str: &str) -> String {
@@ -270,22 +371,29 @@ fn extract_svg_inner_content(svg_str: &str) -> String {
     content
 }
 
-/// Combines multiple SVG documents into a single valid SVG document
-/// Extracts inner content from each SVG and wraps them in a single root <svg> element
+/// Combines multiple SVG documents into a single valid SVG document.
+/// Pages are stacked vertically with a gap between them.
 pub fn combine_svg_documents(svg_documents: &[String], bin_width: f32, bin_height: f32) -> String {
+    let num_pages = svg_documents.len();
+    let gap = bin_height * 0.02; // small gap between pages
+    let total_height = num_pages as f32 * bin_height + (num_pages.saturating_sub(1)) as f32 * gap;
+
     let mut combined = String::new();
     combined.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     combined.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {} {}\">\n",
-        bin_width, bin_height
+        bin_width, total_height
     ));
-    
-    for svg_doc in svg_documents {
+
+    for (i, svg_doc) in svg_documents.iter().enumerate() {
+        let y_offset = i as f32 * (bin_height + gap);
         let inner_content = extract_svg_inner_content(svg_doc);
-        combined.push_str(&inner_content);
-        combined.push('\n');
+        combined.push_str(&format!(
+            "<g transform=\"translate(0,{})\">\n{}\n</g>\n",
+            y_offset, inner_content
+        ));
     }
-    
+
     combined.push_str("</svg>");
     combined
 }

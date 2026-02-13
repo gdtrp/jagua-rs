@@ -4,8 +4,8 @@ use crate::svg_nesting::{
     parsing::{
         calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
     },
-    strategy::NestingStrategy,
-    svg_generation::{combine_svg_documents, NestingResult, post_process_svg},
+    strategy::{NestingStrategy, PartInput},
+    svg_generation::{PageResult, PlacedPartInfo, combine_svg_documents, NestingResult, post_process_svg_multi},
 };
 use anyhow::Result;
 use jagua_rs::collision_detection::CDEConfig;
@@ -57,21 +57,24 @@ impl AdaptiveNestingStrategy {
             .unwrap_or(false)
     }
 
-    /// Calculate bin utilisation (density) from a solution
-    /// Returns a ratio between 0.0 and 1.0 representing how much of the bin area is occupied
+    /// Calculate average bin utilisation (density) from a solution
+    /// Returns a ratio between 0.0 and 1.0 representing how much of the total bin area is occupied
     fn calculate_bin_density(
         &self,
         solution: &BPSolution,
         bin_width: f32,
         bin_height: f32,
     ) -> f32 {
-        let total_bin_area = bin_width * bin_height;
+        let single_bin_area = bin_width * bin_height;
+        let num_bins = solution.layout_snapshots.len();
 
-        if total_bin_area <= 0.0 {
+        if single_bin_area <= 0.0 || num_bins == 0 {
             return 0.0;
         }
 
-        // Sum up the bounding box areas of all placed items
+        let total_bin_area = single_bin_area * num_bins as f32;
+
+        // Sum up the bounding box areas of all placed items across all bins
         let used_area: f32 = solution
             .layout_snapshots
             .values()
@@ -149,14 +152,17 @@ impl AdaptiveNestingStrategy {
     }
 
     /// Generate SVG from solution
+    /// `item_id_to_holes` maps each item ID to its holes slice
+    /// `item_id_to_part_idx` maps each item ID to its part index (index into the parts array)
     fn generate_svg_from_solution(
         &self,
         solution: &BPSolution,
         instance: &BPInstance,
-        processed_holes: &[Vec<jagua_rs::geometry::primitives::Point>],
+        item_id_to_holes: &[&[Vec<jagua_rs::geometry::primitives::Point>]],
+        item_id_to_part_idx: &[usize],
         bin_width: f32,
         bin_height: f32,
-        amount_of_parts: usize,
+        total_parts_requested: usize,
     ) -> Result<NestingResult> {
         // Count items directly from the solution
         let total_items_placed: usize = solution
@@ -167,15 +173,16 @@ impl AdaptiveNestingStrategy {
 
         log::debug!("Optimization complete: {} parts placed", total_items_placed);
 
-        // Generate SVG output
+        // Generate SVG output and extract placement data
         let svg_options = SvgDrawOptions::default();
         let mut page_svg_strings: Vec<String> = Vec::new();
         let mut page_svgs: Vec<Vec<u8>> = Vec::new();
+        let mut pages: Vec<PageResult> = Vec::new();
 
         let mut layout_entries: Vec<_> = solution.layout_snapshots.iter().collect();
         layout_entries.sort_by_key(|(_, layout_snapshot)| layout_snapshot.container.id);
 
-        for (layout_key, layout_snapshot) in layout_entries {
+        for (page_index, (layout_key, layout_snapshot)) in layout_entries.iter().enumerate() {
             let svg_doc = s_layout_to_svg(
                 layout_snapshot,
                 instance,
@@ -183,9 +190,35 @@ impl AdaptiveNestingStrategy {
                 &format!("Layout {:?} - {} items", layout_key, total_items_placed),
             );
             let svg_str = svg_doc.to_string();
-            let processed_svg = post_process_svg(&svg_str, processed_holes);
+            let processed_svg = post_process_svg_multi(&svg_str, item_id_to_holes);
             page_svg_strings.push(processed_svg.clone());
             page_svgs.push(processed_svg.into_bytes());
+
+            // Compute per-page utilisation using actual polygon area (matches SVG density)
+            let page_util = layout_snapshot.density(instance);
+
+            // Extract placement data from this layout
+            let mut page_placements = Vec::new();
+            for (_key, placed_item) in layout_snapshot.placed_items.iter() {
+                let (x, y) = placed_item.d_transf.translation();
+                let rotation = placed_item.d_transf.rotation().to_degrees();
+                let item_id = placed_item.item_id;
+                let part_index = item_id_to_part_idx.get(item_id).copied().unwrap_or(0);
+                page_placements.push(PlacedPartInfo {
+                    item_id,
+                    part_index,
+                    x,
+                    y,
+                    rotation,
+                });
+            }
+
+            pages.push(PageResult {
+                page_index,
+                utilisation: page_util,
+                svg_url: None,
+                placements: page_placements,
+            });
         }
 
         // Combine all page SVGs into a single valid SVG document
@@ -207,29 +240,23 @@ impl AdaptiveNestingStrategy {
             );
         }
 
-        // Generate SVG for unplaced parts if any
-        let unplaced_count = amount_of_parts.saturating_sub(corrected_count);
-        let unplaced_parts_svg = if unplaced_count > 0 {
-            // For unplaced parts, we'll use the same logic as SimpleNestingStrategy
-            // This requires access to container_template and item_shape, which we'll need to pass
-            // For now, return None and handle it in the main nest function
-            None
+        // Calculate average bin utilisation
+        let utilisation = if pages.is_empty() {
+            0.0
         } else {
-            None
+            pages.iter().map(|p| p.utilisation).sum::<f32>() / pages.len() as f32
         };
 
-        // Calculate bin utilisation
-        let utilisation = self.calculate_bin_density(solution, bin_width, bin_height);
-
-        log::debug!("Bin utilisation: {:.1}%", utilisation * 100.0);
+        log::debug!("Average bin utilisation: {:.1}%", utilisation * 100.0);
 
         Ok(NestingResult {
             combined_svg: combined_svg.into_bytes(),
             page_svgs,
             parts_placed: corrected_count,
-            total_parts_requested: amount_of_parts,
-            unplaced_parts_svg,
+            total_parts_requested: total_parts_requested,
+            unplaced_parts_svg: None,
             utilisation,
+            pages,
         })
     }
 }
@@ -246,45 +273,16 @@ impl NestingStrategy for AdaptiveNestingStrategy {
         bin_width: f32,
         bin_height: f32,
         spacing: f32,
-        svg_part_bytes: &[u8],
-        amount_of_parts: usize,
+        parts: &[PartInput],
         amount_of_rotations: usize,
         improvement_callback: Option<crate::svg_nesting::strategy::ImprovementCallback>,
     ) -> Result<NestingResult> {
-        // Parse SVG (same as SimpleNestingStrategy)
-        let path_data = extract_path_from_svg_bytes(svg_part_bytes)?;
-        let (polygon_points, holes) = parse_svg_path(&path_data)?;
-
-        log::debug!(
-            "Parsed SVG path (adaptive mechanism): {} outer boundary points, {} holes",
-            polygon_points.len(),
-            holes.len()
-        );
-
-        // Ensure outer boundary is counter-clockwise (positive area)
-        let outer_area = calculate_signed_area(&polygon_points);
-        let polygon_points = if outer_area < 0.0 {
-            reverse_winding(&polygon_points)
-        } else {
-            polygon_points
-        };
-
-        // Ensure holes are clockwise (negative area)
-        let mut processed_holes = Vec::new();
-        for hole in holes.iter() {
-            let hole_area = calculate_signed_area(hole);
-            let processed_hole = if hole_area > 0.0 {
-                reverse_winding(hole)
-            } else {
-                hole.clone()
-            };
-            processed_holes.push(processed_hole);
+        // Parse all part SVGs and build per-part data
+        struct ParsedPart {
+            item_shape: OriginalShape,
+            processed_holes: Vec<Vec<jagua_rs::geometry::primitives::Point>>,
+            count: usize,
         }
-
-        // Build geometry
-        let polygon = SPolygon::new(polygon_points.clone())?;
-        let centroid = polygon.centroid();
-        let pre_transform = DTransformation::new(0.0, (-centroid.x(), -centroid.y()));
 
         let cde_config = CDEConfig {
             quadtree_depth: 5,
@@ -296,17 +294,59 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             },
         };
 
-        // Disable simplification to avoid issues with complex SVG shapes
-        // The simplify_tolerance of None means no simplification will be performed
         let importer = Importer::new(cde_config.clone(), None, Some(spacing), None);
 
-        let item_shape = OriginalShape {
-            shape: polygon,
-            pre_transform,
-            modify_mode: ShapeModifyMode::Inflate,
-            modify_config: importer.shape_modify_config,
-        };
+        let mut parsed_parts = Vec::with_capacity(parts.len());
+        for (part_idx, part) in parts.iter().enumerate() {
+            let path_data = extract_path_from_svg_bytes(&part.svg_bytes)?;
+            let (polygon_points, holes) = parse_svg_path(&path_data)?;
 
+            log::debug!(
+                "Parsed SVG path for part {} (adaptive): {} outer boundary points, {} holes",
+                part_idx,
+                polygon_points.len(),
+                holes.len()
+            );
+
+            let outer_area = calculate_signed_area(&polygon_points);
+            let polygon_points = if outer_area < 0.0 {
+                reverse_winding(&polygon_points)
+            } else {
+                polygon_points
+            };
+
+            let mut processed_holes = Vec::new();
+            for hole in holes.iter() {
+                let hole_area = calculate_signed_area(hole);
+                let processed_hole = if hole_area > 0.0 {
+                    reverse_winding(hole)
+                } else {
+                    hole.clone()
+                };
+                processed_holes.push(processed_hole);
+            }
+
+            let polygon = SPolygon::new(polygon_points)?;
+            let centroid = polygon.centroid();
+            let pre_transform = DTransformation::new(0.0, (-centroid.x(), -centroid.y()));
+
+            let item_shape = OriginalShape {
+                shape: polygon,
+                pre_transform,
+                modify_mode: ShapeModifyMode::Inflate,
+                modify_config: importer.shape_modify_config,
+            };
+
+            parsed_parts.push(ParsedPart {
+                item_shape,
+                processed_holes,
+                count: part.count,
+            });
+        }
+
+        let total_parts_requested: usize = parsed_parts.iter().map(|p| p.count).sum();
+
+        // Build container
         let bin_rect = Rect::try_new(0.0, 0.0, bin_width, bin_height)?;
         let bin_polygon = SPolygon::from(bin_rect);
         let container_shape = OriginalShape {
@@ -318,7 +358,7 @@ impl NestingStrategy for AdaptiveNestingStrategy {
 
         let container_template = Container::new(0, container_shape, vec![], cde_config.clone())?;
 
-        // Build instance with requested rotations (capped at 4)
+        // Build rotation range
         const MAX_ROTATIONS: usize = 4;
         let rotation_count = if amount_of_rotations == 0 {
             0
@@ -337,38 +377,53 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             RotationRange::Discrete(rotations)
         };
 
-        let mut items = Vec::with_capacity(amount_of_parts);
-        for i in 0..amount_of_parts {
-            let item = Item::new(
-                i,
-                item_shape.clone(),
-                rotation_range.clone(),
-                None,
-                cde_config.item_surrogate_config,
-            )?;
-            items.push((item, 1));
+        // Create items with consecutive IDs across all parts, tracking item_id → part_index
+        let mut items = Vec::with_capacity(total_parts_requested);
+        let mut item_id_to_part_idx: Vec<usize> = Vec::with_capacity(total_parts_requested);
+        let mut item_id = 0;
+        for (part_idx, parsed) in parsed_parts.iter().enumerate() {
+            for _ in 0..parsed.count {
+                let item = Item::new(
+                    item_id,
+                    parsed.item_shape.clone(),
+                    rotation_range.clone(),
+                    None,
+                    cde_config.item_surrogate_config,
+                )?;
+                items.push((item, 1));
+                item_id_to_part_idx.push(part_idx);
+                item_id += 1;
+            }
         }
 
-        let bin = Bin::new(container_template.clone(), 1, 0);
+        // Build per-item holes mapping (item_id → holes slice)
+        let item_id_to_holes: Vec<&[Vec<jagua_rs::geometry::primitives::Point>]> =
+            item_id_to_part_idx
+                .iter()
+                .map(|&part_idx| parsed_parts[part_idx].processed_holes.as_slice())
+                .collect();
+
+        // Stock = total_parts_requested ensures enough bins are available
+        // (worst case: each item needs its own bin)
+        let bin = Bin::new(container_template.clone(), total_parts_requested, 0);
         let instance = BPInstance::new(items, vec![bin]);
 
         // Adaptive optimization loop
         let optimization_start = Instant::now();
-        let mut loops = 1; // Start with 1 loop
-        let mut placements = 10000; // Start with 10000 placements (n_samples)
-        let _rotations = amount_of_rotations; // Start with requested rotations (currently not varied)
+        let mut loops = 1;
+        let mut placements = 10000;
 
         let mut best_result: Option<NestingResult> = None;
         let mut best_placed = 0;
+        let mut best_pages = usize::MAX;
         let mut total_runs = 0;
         const MAX_TOTAL_RUNS: usize = 40;
         const MAX_RUNS_WITHOUT_IMPROVEMENT: usize = 10;
         const MAX_RUN_DURATION_SECONDS: u64 = 60;
-        const MAX_TOTAL_OPTIMIZATION_SECONDS: u64 = 600; // 10 minutes overall timeout
-        const HIGH_DENSITY_THRESHOLD: f32 = 0.80; // 80% bin utilisation is considered "good enough"
+        const MAX_TOTAL_OPTIMIZATION_SECONDS: u64 = 600;
+        const HIGH_DENSITY_THRESHOLD: f32 = 0.50;
 
         'outer: loop {
-            // Check overall timeout
             let elapsed_total = optimization_start.elapsed().as_secs();
             if elapsed_total >= MAX_TOTAL_OPTIMIZATION_SECONDS {
                 log::info!(
@@ -389,12 +444,10 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                 break 'outer;
             }
 
-            // Try 10 runs with current parameters
             let mut improved_this_batch = false;
             let mut should_stop_due_to_timeout = false;
             let mut cancelled = false;
             for batch_run in 0..MAX_RUNS_WITHOUT_IMPROVEMENT {
-                // Check cancellation at start of each run
                 if self.is_cancelled() {
                     log::info!("Cancellation detected before starting run, stopping optimization");
                     cancelled = true;
@@ -419,7 +472,6 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     amount_of_rotations
                 );
 
-                // Run optimization
                 let optimization_result = self.run_single_optimization(
                     &instance,
                     &cde_config,
@@ -437,9 +489,10 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                             combined_svg: Vec::new(),
                             page_svgs: Vec::new(),
                             parts_placed: 0,
-                            total_parts_requested: amount_of_parts,
+                            total_parts_requested,
                             unplaced_parts_svg: None,
                             utilisation: 0.0,
+                            pages: Vec::new(),
                         });
                     }
                 };
@@ -455,43 +508,35 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     break;
                 }
 
-                // Generate SVG result
                 let mut result = self.generate_svg_from_solution(
                     &solution,
                     &instance,
-                    &processed_holes,
+                    &item_id_to_holes,
+                    &item_id_to_part_idx,
                     bin_width,
                     bin_height,
-                    amount_of_parts,
+                    total_parts_requested,
                 )?;
 
                 // Handle unplaced parts SVG generation
-                if result.parts_placed < amount_of_parts {
+                if result.parts_placed < total_parts_requested {
                     use jagua_rs::entities::Instance;
                     let mut unplaced_layout = Layout::new(container_template.clone());
-                    let unplaced_count = amount_of_parts - result.parts_placed;
-                    let part_bbox = &item_shape.shape.bbox;
+                    let unplaced_count = total_parts_requested - result.parts_placed;
+
+                    // Use first part's shape for grid sizing (approximate)
+                    let first_shape = &parsed_parts[0].item_shape;
+                    let part_bbox = &first_shape.shape.bbox;
                     let part_width = part_bbox.width();
                     let part_height = part_bbox.height();
                     let cols = ((bin_width - spacing) / (part_width + spacing))
                         .floor()
                         .max(1.0) as usize;
-                    let rows = ((unplaced_count as f32 / cols as f32).ceil()) as usize;
-                    let total_grid_width =
-                        (cols as f32 * part_width) + ((cols.saturating_sub(1)) as f32 * spacing);
-                    let total_grid_height =
-                        (rows as f32 * part_height) + ((rows.saturating_sub(1)) as f32 * spacing);
-                    let offset_x = (bin_width - total_grid_width) / 2.0;
-                    let offset_y = (bin_height - total_grid_height) / 2.0;
-                    let item_template = instance.item(0);
 
-                    // Calculate how many items to show on the last page
-                    // If 298 items fit per page, and we have 2702 unplaced:
-                    // 2702 % 298 = 20 items on the last page
                     let parts_per_page = result.parts_placed.max(1);
                     let remainder = unplaced_count % parts_per_page;
                     let items_to_render = if remainder == 0 && unplaced_count > 0 {
-                        parts_per_page // Full last page
+                        parts_per_page
                     } else {
                         remainder
                     };
@@ -504,6 +549,17 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                             parts_per_page
                         );
                     }
+
+                    let total_grid_width =
+                        (cols as f32 * part_width) + ((cols.saturating_sub(1)) as f32 * spacing);
+                    let offset_x = (bin_width - total_grid_width) / 2.0;
+                    let rows = ((items_to_render as f32 / cols as f32).ceil()) as usize;
+                    let total_grid_height =
+                        (rows as f32 * part_height) + ((rows.saturating_sub(1)) as f32 * spacing);
+                    let offset_y = (bin_height - total_grid_height) / 2.0;
+
+                    // Use item 0 as template for the grid (simplification for unplaced display)
+                    let item_template = instance.item(0);
 
                     for i in 0..items_to_render {
                         let row = i / cols;
@@ -531,49 +587,40 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                         &label,
                     );
                     let unplaced_svg_str = unplaced_svg_doc.to_string();
-                    let processed_unplaced_svg = post_process_svg(&unplaced_svg_str, &processed_holes);
+                    let processed_unplaced_svg =
+                        post_process_svg_multi(&unplaced_svg_str, &item_id_to_holes);
                     result.unplaced_parts_svg = Some(processed_unplaced_svg.into_bytes());
                 }
 
+                let num_pages = result.page_svgs.len();
+
                 log::info!(
-                    "Run {} completed: {} parts placed (utilisation {:.1}%), best result {} in {:.2}s",
+                    "Run {} completed: {} parts placed on {} pages (utilisation {:.1}%), best so far: {} placed on {} pages, in {:.2}s",
                     total_runs,
                     result.parts_placed,
+                    num_pages,
                     result.utilisation * 100.0,
                     best_placed,
+                    best_pages,
                     run_duration.as_secs_f64()
                 );
 
-                // If we've placed all items in this run, we're done (even if it's not an improvement)
-                if result.parts_placed >= amount_of_parts {
-                    log::info!("All parts placed, stopping optimization");
-                    return Ok(result);
-                }
+                // A result is better if it places more parts, or the same parts on fewer pages
+                let is_improvement = result.parts_placed > best_placed
+                    || (result.parts_placed == best_placed && num_pages < best_pages);
 
-                // Check if bin density is high enough (good enough solution)
-                if result.utilisation >= HIGH_DENSITY_THRESHOLD {
-                    log::info!(
-                        "High bin utilisation achieved: {:.1}% (threshold: {:.1}%), stopping optimization",
-                        result.utilisation * 100.0,
-                        HIGH_DENSITY_THRESHOLD * 100.0
-                    );
-                    return Ok(result);
-                }
-
-                // Check if this is an improvement
-                if result.parts_placed > best_placed {
+                if is_improvement {
                     improved_this_batch = true;
-                    let improvement = result.parts_placed - best_placed;
                     best_placed = result.parts_placed;
+                    best_pages = num_pages;
                     best_result = Some(result.clone());
 
                     log::info!(
-                        "New best result: {} parts placed (improvement of {})",
+                        "New best result: {} parts placed on {} pages",
                         best_placed,
-                        improvement
+                        best_pages
                     );
 
-                    // Send improvement via callback
                     if let Some(ref callback) = improvement_callback {
                         if let Err(e) = callback(result.clone()) {
                             log::warn!("Failed to send improvement callback: {}", e);
@@ -581,7 +628,21 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     }
                 }
 
-                // Check cancellation after processing improvements from this run
+                // Stop early if all parts placed AND either:
+                // - only 1 page used (can't reduce further), or
+                // - bins are well-utilized (packing is already dense)
+                if result.parts_placed >= total_parts_requested
+                    && (num_pages <= 1 || result.utilisation >= HIGH_DENSITY_THRESHOLD)
+                {
+                    log::info!(
+                        "All {} parts placed on {} pages (utilisation {:.1}%), stopping optimization",
+                        result.parts_placed,
+                        num_pages,
+                        result.utilisation * 100.0
+                    );
+                    return Ok(best_result.unwrap_or(result));
+                }
+
                 if self.is_cancelled() {
                     log::info!("Cancellation detected after completing run, stopping optimization");
                     cancelled = true;
@@ -589,22 +650,19 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                 }
             }
 
-            // Check cancellation again after batch completes (in case it was set during the batch)
             if cancelled || self.is_cancelled() {
                 log::info!("Cancellation detected after batch completion, stopping optimization");
                 break 'outer;
             }
 
-            // Stop if a run exceeded the time limit
             if should_stop_due_to_timeout {
                 log::info!("Stopping adaptive optimization due to run timeout");
                 break 'outer;
             }
 
-            // If no improvement after 10 runs, increase parameters
             if !improved_this_batch {
                 loops += 1;
-                placements = (placements * 2).min(200000); // Double placements, cap at 200000
+                placements = (placements * 2).min(200000);
                 log::info!(
                     "No improvement after {} runs, increasing parameters: loops={}, placements={}",
                     MAX_RUNS_WITHOUT_IMPROVEMENT,
@@ -614,16 +672,15 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             }
         }
 
-        // Return best result found
         Ok(best_result.unwrap_or_else(|| {
-            // If no result found, return empty result
             NestingResult {
                 combined_svg: Vec::new(),
                 page_svgs: Vec::new(),
                 parts_placed: 0,
-                total_parts_requested: amount_of_parts,
+                total_parts_requested,
                 unplaced_parts_svg: None,
                 utilisation: 0.0,
+                pages: Vec::new(),
             }
         }))
     }
