@@ -65,6 +65,7 @@ fn process_request_direct(
     let part_inputs = vec![PartInput {
         svg_bytes: svg_bytes.clone(),
         count: amount_of_parts,
+        item_id: None,
     }];
 
     let improvements: Arc<Mutex<Vec<SqsNestingResponse>>> = Arc::new(Mutex::new(Vec::new()));
@@ -88,6 +89,7 @@ fn process_request_direct(
             correlation_id: correlation_id.clone(),
             first_page_svg_url: None, // Tests don't use S3
             last_page_svg_url: None, // Tests don't use S3
+            sheets: None,
             page_svg_urls: None,
             pages: None,
             parts_placed: result.parts_placed,
@@ -142,6 +144,7 @@ fn process_request_direct(
         correlation_id: request.correlation_id,
         first_page_svg_url: None, // Tests don't use S3
         last_page_svg_url: None, // Tests don't use S3
+        sheets: None,
         page_svg_urls: None,
         pages: None,
         parts_placed: nesting_result.parts_placed,
@@ -554,6 +557,7 @@ fn process_request_with_cancellation(
     let part_inputs = vec![PartInput {
         svg_bytes: svg_bytes.clone(),
         count: amount_of_parts,
+        item_id: None,
     }];
 
     let improvements: Arc<Mutex<Vec<SqsNestingResponse>>> = Arc::new(Mutex::new(Vec::new()));
@@ -577,6 +581,7 @@ fn process_request_with_cancellation(
             correlation_id: correlation_id.clone(),
             first_page_svg_url: None, // Tests don't use S3
             last_page_svg_url: None, // Tests don't use S3
+            sheets: None,
             page_svg_urls: None,
             pages: None,
             parts_placed: result.parts_placed,
@@ -628,6 +633,7 @@ fn process_request_with_cancellation(
         correlation_id: request.correlation_id,
         first_page_svg_url: None, // Tests don't use S3
         last_page_svg_url: None, // Tests don't use S3
+        sheets: None,
         page_svg_urls: None,
         pages: None,
         parts_placed: nesting_result.parts_placed,
@@ -663,6 +669,7 @@ async fn test_cancellation_request_handling() -> Result<()> {
         "us-east-1".to_string(),
         "test-input-queue".to_string(),
         "test-output-queue".to_string(),
+        None,
     );
 
     // Create a cancellation request (only correlation_id and cancelled are required)
@@ -1196,6 +1203,7 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         correlation_id: request.correlation_id.clone(),
                         first_page_svg_url: final_responses[0].first_page_svg_url.clone(),
                         last_page_svg_url: final_responses[0].last_page_svg_url.clone(),
+                        sheets: final_responses[0].sheets,
                         page_svg_urls: final_responses[0].page_svg_urls.clone(),
                         pages: final_responses[0].pages.clone(),
                         parts_placed: final_responses[0].parts_placed,
@@ -1965,6 +1973,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
     let part_inputs = vec![PartInput {
         svg_bytes: svg_bytes.clone(),
         count: amount_of_parts,
+        item_id: None,
     }];
 
     // Get timeout from env var (same as production code)
@@ -1996,6 +2005,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
             correlation_id: correlation_id.clone(),
             first_page_svg_url: None,
             last_page_svg_url: None,
+            sheets: None,
             page_svg_urls: None,
             pages: None,
             parts_placed: result.parts_placed,
@@ -2027,6 +2037,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
             correlation_id: request.correlation_id,
             first_page_svg_url: None,
             last_page_svg_url: None,
+            sheets: None,
             page_svg_urls: None,
             pages: None,
             parts_placed: 0,
@@ -2046,6 +2057,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
                 correlation_id: request.correlation_id,
                 first_page_svg_url: None,
                 last_page_svg_url: None,
+                sheets: None,
                 page_svg_urls: None,
                 pages: None,
                 parts_placed: result.parts_placed,
@@ -2165,9 +2177,9 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
     // dr.svg is ~1055x771 units, fireman ~83x264, fork ~60x370
     // With a 1500x1200 bin: ~2 dr parts per sheet + small parts → expect 5-10 sheets.
     let parts = vec![
-        PartInput { svg_bytes: dr_svg, count: 12 },
-        PartInput { svg_bytes: fireman_svg, count: 15 },
-        PartInput { svg_bytes: fork_svg, count: 12 },
+        PartInput { svg_bytes: dr_svg, count: 12, item_id: None },
+        PartInput { svg_bytes: fireman_svg, count: 15, item_id: None },
+        PartInput { svg_bytes: fork_svg, count: 12, item_id: None },
     ];
 
     let strategy = AdaptiveNestingStrategy::new();
@@ -2254,9 +2266,9 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
         spacing: Some(5.0),
         amount_of_parts: None,
         parts: Some(vec![
-            SvgPartSpec { svg_url: "https://s3.example.com/svgs/dr.svg".to_string(), amount_of_parts: 12 },
-            SvgPartSpec { svg_url: "https://s3.example.com/svgs/fireman.svg".to_string(), amount_of_parts: 15 },
-            SvgPartSpec { svg_url: "https://s3.example.com/svgs/fork.svg".to_string(), amount_of_parts: 12 },
+            SvgPartSpec { item_id: "dr-part".to_string(), svg_url: "https://s3.example.com/svgs/dr.svg".to_string(), amount_of_parts: 12 },
+            SvgPartSpec { item_id: "fireman-part".to_string(), svg_url: "https://s3.example.com/svgs/fireman.svg".to_string(), amount_of_parts: 15 },
+            SvgPartSpec { item_id: "fork-part".to_string(), svg_url: "https://s3.example.com/svgs/fork.svg".to_string(), amount_of_parts: 12 },
         ]),
         amount_of_rotations: 4,
         output_queue_url: Some("https://sqs.eu-north-1.amazonaws.com/123456789/output-queue".to_string()),
@@ -2280,6 +2292,7 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
         correlation_id: "test-multi-part-real-svgs".to_string(),
         first_page_svg_url: page_svg_urls.first().cloned(),
         last_page_svg_url: page_svg_urls.last().cloned(),
+        sheets: Some(response_pages.len()),
         page_svg_urls: Some(page_svg_urls),
         pages: Some(response_pages),
         parts_placed: nesting_result.parts_placed,

@@ -4,7 +4,7 @@ use crate::svg_nesting::{
     parsing::{
         calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
     },
-    strategy::{NestingStrategy, PartInput},
+    strategy::{NestingStrategy, PartInput, is_single_part_type},
     svg_generation::{PageResult, PlacedPartInfo, combine_svg_documents, NestingResult, post_process_svg_multi},
 };
 use anyhow::Result;
@@ -54,6 +54,7 @@ impl NestingStrategy for SimpleNestingStrategy {
             item_shape: OriginalShape,
             processed_holes: Vec<Vec<jagua_rs::geometry::primitives::Point>>,
             count: usize,
+            item_id: Option<String>,
         }
 
         let cde_config = CDEConfig {
@@ -119,6 +120,7 @@ impl NestingStrategy for SimpleNestingStrategy {
                 item_shape,
                 processed_holes,
                 count: part.count,
+                item_id: part.item_id.clone(),
             });
         }
 
@@ -158,6 +160,7 @@ impl NestingStrategy for SimpleNestingStrategy {
         // Create items with consecutive IDs across all parts
         let mut items = Vec::with_capacity(total_parts_requested);
         let mut item_id_to_part_idx: Vec<usize> = Vec::with_capacity(total_parts_requested);
+        let mut item_id_to_part_id: Vec<Option<String>> = Vec::with_capacity(total_parts_requested);
         let mut item_id = 0;
         for (part_idx, parsed) in parsed_parts.iter().enumerate() {
             for _ in 0..parsed.count {
@@ -170,6 +173,7 @@ impl NestingStrategy for SimpleNestingStrategy {
                 )?;
                 items.push((item, 1));
                 item_id_to_part_idx.push(part_idx);
+                item_id_to_part_id.push(parsed.item_id.clone());
                 item_id += 1;
             }
         }
@@ -240,28 +244,45 @@ impl NestingStrategy for SimpleNestingStrategy {
         let mut layout_entries: Vec<_> = solution.layout_snapshots.iter().collect();
         layout_entries.sort_by_key(|(_, layout_snapshot)| layout_snapshot.container.id);
 
+        let num_pages = layout_entries.len();
+        let skip_middle = is_single_part_type(&item_id_to_part_idx) && num_pages >= 3;
+
         for (page_index, (layout_key, layout_snapshot)) in layout_entries.iter().enumerate() {
-            let svg_doc = s_layout_to_svg(
-                layout_snapshot,
-                &instance,
-                svg_options,
-                &format!("Layout {:?} - {} items", layout_key, total_items_placed),
-            );
-            let svg_str = svg_doc.to_string();
-            let processed_svg = post_process_svg_multi(&svg_str, &item_id_to_holes);
-            page_svg_strings.push(processed_svg.clone());
-            page_svgs.push(processed_svg.into_bytes());
+            let is_first = page_index == 0;
+            let is_last = page_index == num_pages - 1;
+
+            if skip_middle && !is_first && !is_last {
+                // Clone first page's SVG for middle pages (visually identical for single-part)
+                let first_svg_str = page_svg_strings[0].clone();
+                page_svg_strings.push(first_svg_str.clone());
+                page_svgs.push(first_svg_str.into_bytes());
+            } else {
+                let svg_doc = s_layout_to_svg(
+                    layout_snapshot,
+                    &instance,
+                    svg_options,
+                    &format!("Layout {:?} - {} items", layout_key, total_items_placed),
+                );
+                let svg_str = svg_doc.to_string();
+                let processed_svg = post_process_svg_multi(&svg_str, &item_id_to_holes);
+                page_svg_strings.push(processed_svg.clone());
+                page_svgs.push(processed_svg.into_bytes());
+            }
 
             // Compute per-page utilisation using actual polygon area (matches SVG density)
             let page_util = layout_snapshot.density(&instance);
 
-            // Extract placement data from this layout
+            // Always extract real placement data (cheap, and item_id values differ per page)
             let mut page_placements = Vec::new();
             for (_key, placed_item) in layout_snapshot.placed_items.iter() {
                 let (x, y) = placed_item.d_transf.translation();
                 let rotation = placed_item.d_transf.rotation().to_degrees();
-                let item_id = placed_item.item_id;
-                let part_index = item_id_to_part_idx.get(item_id).copied().unwrap_or(0);
+                let internal_id = placed_item.item_id;
+                let part_index = item_id_to_part_idx.get(internal_id).copied().unwrap_or(0);
+                let item_id = item_id_to_part_id.get(internal_id)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| internal_id.to_string());
                 page_placements.push(PlacedPartInfo {
                     item_id,
                     part_index,
@@ -275,6 +296,7 @@ impl NestingStrategy for SimpleNestingStrategy {
                 page_index,
                 utilisation: page_util,
                 svg_url: None,
+                parts_placed: page_placements.len(),
                 placements: page_placements,
             });
         }

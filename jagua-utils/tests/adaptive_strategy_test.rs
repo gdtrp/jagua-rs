@@ -18,7 +18,7 @@ mod tests {
         let strategy = AdaptiveNestingStrategy::new();
 
         // Try to place just 1 part in a large bin (should succeed on first run)
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1 }];
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1, item_id: None }];
         let result = strategy.nest(
             500.0,  // bin_width - large enough to fit the part
             500.0,  // bin_height
@@ -68,7 +68,7 @@ mod tests {
         let strategy = AdaptiveNestingStrategy::new();
 
         // Try to place 4 parts in a large bin
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 4 }];
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 4, item_id: None }];
         let result = strategy.nest(
             500.0,
             500.0,
@@ -171,7 +171,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let start = Instant::now();
 
         // Use parameters from user's scenario: 1200x1200 bin, 2mm spacing, 4 rotations, 6 parts
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 6 }];
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 6, item_id: None }];
         let result = strategy.nest(
             1200.0,  // bin_width
             1200.0,  // bin_height
@@ -239,7 +239,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let strategy = AdaptiveNestingStrategy::new();
 
         // Try to place the part in a bin that's too small (100x100 bin for 500x500 part)
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1 }];
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1, item_id: None }];
         let result = strategy.nest(
             100.0,  // bin_width - smaller than the part
             100.0,  // bin_height - smaller than the part
@@ -313,9 +313,9 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
 </svg>"#;
 
         let parts = vec![
-            PartInput { svg_bytes: svg_circle.as_bytes().to_vec(), count: 10 },
-            PartInput { svg_bytes: svg_square.as_bytes().to_vec(), count: 15 },
-            PartInput { svg_bytes: svg_lshape.as_bytes().to_vec(), count: 12 },
+            PartInput { svg_bytes: svg_circle.as_bytes().to_vec(), count: 10, item_id: None },
+            PartInput { svg_bytes: svg_square.as_bytes().to_vec(), count: 15, item_id: None },
+            PartInput { svg_bytes: svg_lshape.as_bytes().to_vec(), count: 12, item_id: None },
         ];
 
         let strategy = AdaptiveNestingStrategy::new();
@@ -421,7 +421,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let start = Instant::now();
 
         // Try to place 100 parts in a large bin - should stop early when density is high
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 100 }];
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 100, item_id: None }];
         let result = strategy.nest(
             1500.0,  // Large bin
             1500.0,
@@ -456,5 +456,146 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             nesting_result.utilisation * 100.0,
             duration.as_secs_f64()
         );
+    }
+
+    /// Test that single-part requests with 3+ pages skip SVG generation for middle pages,
+    /// producing byte-identical SVGs for first and middle pages.
+    #[test]
+    fn test_single_part_skips_middle_pages() {
+        // Small squares (80x80) in a 300x300 bin with spacing → ~9 per page
+        // 50 parts should force 3+ pages
+        let svg = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80">
+    <path d="M 0,0 L 80,0 L 80,80 L 0,80 Z" fill="black"/>
+</svg>"#;
+
+        let strategy = AdaptiveNestingStrategy::new();
+        let parts = vec![PartInput {
+            svg_bytes: svg.as_bytes().to_vec(),
+            count: 50,
+            item_id: None,
+        }];
+
+        let result = strategy
+            .nest(300.0, 300.0, 5.0, &parts, 4, None)
+            .expect("Nesting should succeed");
+
+        // Should produce 3+ pages
+        assert!(
+            result.pages.len() > 2,
+            "Expected >2 pages, got {}",
+            result.pages.len()
+        );
+
+        // Middle page SVGs should be byte-identical to first page SVG
+        let first_page_svg = &result.page_svgs[0];
+        for (i, page_svg) in result.page_svgs.iter().enumerate().skip(1) {
+            if i < result.page_svgs.len() - 1 {
+                assert_eq!(
+                    page_svg, first_page_svg,
+                    "Middle page {} SVG should be identical to first page SVG",
+                    i
+                );
+            }
+        }
+
+        // First and last pages should be non-empty
+        assert!(
+            !result.page_svgs[0].is_empty(),
+            "First page SVG should be non-empty"
+        );
+        assert!(
+            !result.page_svgs.last().unwrap().is_empty(),
+            "Last page SVG should be non-empty"
+        );
+
+        // parts_placed should match sum of all page placements
+        let total_placements: usize = result.pages.iter().map(|p| p.placements.len()).sum();
+        assert_eq!(
+            total_placements, result.parts_placed,
+            "Sum of page placements ({}) should match parts_placed ({})",
+            total_placements, result.parts_placed
+        );
+
+        // All part_index values should be 0 (single part type)
+        for page in &result.pages {
+            for p in &page.placements {
+                assert_eq!(
+                    p.part_index, 0,
+                    "All part_index values should be 0 for single-part request"
+                );
+            }
+        }
+    }
+
+    /// Test that multi-part requests do not apply the middle-page skip optimization.
+    #[test]
+    fn test_multi_part_does_not_skip_middle_pages() {
+        // Two different part types
+        let svg_square = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80">
+    <path d="M 0,0 L 80,0 L 80,80 L 0,80 Z" fill="black"/>
+</svg>"#;
+
+        let svg_rect = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60">
+    <path d="M 0,0 L 120,0 L 120,60 L 0,60 Z" fill="black"/>
+</svg>"#;
+
+        let strategy = AdaptiveNestingStrategy::new();
+        let parts = vec![
+            PartInput {
+                svg_bytes: svg_square.as_bytes().to_vec(),
+                count: 25,
+                item_id: None,
+            },
+            PartInput {
+                svg_bytes: svg_rect.as_bytes().to_vec(),
+                count: 25,
+                item_id: None,
+            },
+        ];
+
+        let result = strategy
+            .nest(300.0, 300.0, 5.0, &parts, 4, None)
+            .expect("Nesting should succeed");
+
+        assert!(
+            result.parts_placed > 0,
+            "Should place at least some parts"
+        );
+
+        // Verify placement data consistency
+        let total_placements: usize = result.pages.iter().map(|p| p.placements.len()).sum();
+        assert_eq!(
+            total_placements, result.parts_placed,
+            "Sum of page placements should match parts_placed"
+        );
+
+        // Should have both part_index values present across all placements
+        let has_part_0 = result
+            .pages
+            .iter()
+            .flat_map(|p| &p.placements)
+            .any(|p| p.part_index == 0);
+        let has_part_1 = result
+            .pages
+            .iter()
+            .flat_map(|p| &p.placements)
+            .any(|p| p.part_index == 1);
+
+        assert!(has_part_0, "Should have placements with part_index 0");
+        assert!(has_part_1, "Should have placements with part_index 1");
+
+        // All part_index values should be valid (0 or 1)
+        for page in &result.pages {
+            for p in &page.placements {
+                assert!(
+                    p.part_index < 2,
+                    "part_index {} should be < 2",
+                    p.part_index
+                );
+            }
+        }
     }
 }

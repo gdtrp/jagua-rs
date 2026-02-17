@@ -33,6 +33,8 @@ const DEFAULT_EXECUTION_TIMEOUT_SECS: u64 = 600; // 10 minutes
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SvgPartSpec {
+    /// User-provided correlation ID for this part type
+    pub item_id: String,
     /// HTTPS S3 URL to the SVG file
     pub svg_url: String,
     /// Number of copies of this part to nest
@@ -236,6 +238,9 @@ pub struct SqsNestingResponse {
     /// S3 URL to the last page SVG (format: s3://bucket/nesting/{requestId}/last-page.svg)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_page_svg_url: Option<String>,
+    /// Number of sheets/pages used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheets: Option<usize>,
     /// S3 URLs to all page SVGs (ordered by page index)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_svg_urls: Option<Vec<String>>,
@@ -268,6 +273,7 @@ pub struct SqsProcessor {
     aws_region: String,
     input_queue_url: String,
     output_queue_url: String,
+    endpoint_url: Option<String>,
     cancellation_registry: Arc<Mutex<HashMap<String, CancellationEntry>>>,
 }
 
@@ -350,6 +356,7 @@ impl SqsProcessor {
         aws_region: String,
         input_queue_url: String,
         output_queue_url: String,
+        endpoint_url: Option<String>,
     ) -> Self {
         Self {
             sqs_client,
@@ -358,6 +365,7 @@ impl SqsProcessor {
             aws_region,
             input_queue_url,
             output_queue_url,
+            endpoint_url,
             cancellation_registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -514,9 +522,16 @@ async fn upload_svg_to_s3_internal(
     svg_bytes: &[u8],
     request_id: &str,
     filename: &str,
+    endpoint_url: Option<&str>,
 ) -> Result<String> {
     let s3_key = format!("nesting/{}/{}", request_id, filename);
-    let s3_url = format!("https://{}.s3.{}.amazonaws.com/{}", s3_bucket, aws_region, s3_key);
+    let s3_url = if let Some(endpoint) = endpoint_url {
+        // Path-style URL for LocalStack/Minio
+        format!("{}/{}/{}", endpoint.trim_end_matches('/'), s3_bucket, s3_key)
+    } else {
+        // Virtual-hosted style for AWS
+        format!("https://{}.s3.{}.amazonaws.com/{}", s3_bucket, aws_region, s3_key)
+    };
     
     info!("Uploading SVG to S3: bucket={}, key={}, size={} bytes", 
         s3_bucket, s3_key, svg_bytes.len());
@@ -635,6 +650,7 @@ impl SqsProcessor {
                             correlation_id: corr_id.to_string(),
                             first_page_svg_url: None,
                             last_page_svg_url: None,
+                            sheets: None,
                             page_svg_urls: None,
                             pages: None,
                             parts_placed: 0,
@@ -723,6 +739,7 @@ impl SqsProcessor {
                 correlation_id: request.correlation_id.clone(),
                 first_page_svg_url: None,
                 last_page_svg_url: None,
+                sheets: None,
                 page_svg_urls: None,
                 pages: None,
                 parts_placed: 0,
@@ -749,6 +766,7 @@ impl SqsProcessor {
                 correlation_id: request.correlation_id.clone(),
                 first_page_svg_url: None,
                 last_page_svg_url: None,
+                sheets: None,
                 page_svg_urls: None,
                 pages: None,
                 parts_placed: 0,
@@ -780,6 +798,7 @@ impl SqsProcessor {
                     correlation_id: request.correlation_id.clone(),
                     first_page_svg_url: None,
                     last_page_svg_url: None,
+                    sheets: None,
                     page_svg_urls: None,
                     pages: None,
                     parts_placed: 0,
@@ -813,6 +832,7 @@ impl SqsProcessor {
                 correlation_id: request.correlation_id.clone(),
                 first_page_svg_url: None,
                 last_page_svg_url: None,
+                sheets: None,
                 page_svg_urls: None,
                 pages: None,
                 parts_placed: 0,
@@ -868,6 +888,7 @@ impl SqsProcessor {
                         inputs.push(PartInput {
                             svg_bytes,
                             count: spec.amount_of_parts,
+                            item_id: Some(spec.item_id.clone()),
                         });
                     }
                     inputs
@@ -888,6 +909,7 @@ impl SqsProcessor {
                 vec![PartInput {
                     svg_bytes,
                     count: amount_of_parts,
+                    item_id: None,
                 }]
             };
 
@@ -932,6 +954,7 @@ impl SqsProcessor {
             let s3_client_for_task = self.s3_client.clone();
             let s3_bucket_for_task = self.s3_bucket.clone();
             let aws_region_for_task = self.aws_region.clone();
+            let endpoint_url_for_task = self.endpoint_url.clone();
             let output_queue_url_for_task = output_queue_url.to_string();
             let correlation_id_for_task = request.correlation_id.clone();
             let bin_width_for_task = bin_width;
@@ -950,11 +973,12 @@ impl SqsProcessor {
                             let client = s3_client_for_task.clone();
                             let bucket = s3_bucket_for_task.clone();
                             let region = aws_region_for_task.clone();
+                            let endpoint = endpoint_url_for_task.clone();
                             let bytes = page_bytes.clone();
                             let corr_id = correlation_id_for_task.clone();
                             let fname = filename.clone();
                             async move {
-                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, &fname).await
+                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, &fname, endpoint.as_deref()).await
                             }
                         }).await {
                             Ok(url) => {
@@ -980,10 +1004,11 @@ impl SqsProcessor {
                         let client = s3_client_for_task.clone();
                         let bucket = s3_bucket_for_task.clone();
                         let region = aws_region_for_task.clone();
+                        let endpoint = endpoint_url_for_task.clone();
                         let bytes = last_page_bytes.clone();
                         let corr_id = correlation_id_for_task.clone();
                         async move {
-                            upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "last-page.svg").await
+                            upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
                         }
                     }).await {
                         Ok(url) => {
@@ -1005,11 +1030,14 @@ impl SqsProcessor {
                         page
                     }).collect();
 
+                    let sheets = Some(response_pages.len());
+
                     // Create improvement response with S3 URLs
                     let response = SqsNestingResponse {
                         correlation_id: correlation_id_for_task.clone(),
                         first_page_svg_url,
                         last_page_svg_url,
+                        sheets,
                         page_svg_urls: Some(page_svg_urls),
                         pages: Some(response_pages),
                         parts_placed: result.parts_placed,
@@ -1145,11 +1173,12 @@ impl SqsProcessor {
                     let s3_client = self.s3_client.clone();
                     let bucket = self.s3_bucket.clone();
                     let region = self.aws_region.clone();
+                    let endpoint = self.endpoint_url.clone();
                     let bytes = page_bytes.clone();
                     let corr_id = request.correlation_id.clone();
                     let fname = filename.clone();
                     async move {
-                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, &fname).await
+                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, &fname, endpoint.as_deref()).await
                     }
                 }).await {
                     Ok(url) => {
@@ -1175,10 +1204,11 @@ impl SqsProcessor {
                 let s3_client = self.s3_client.clone();
                 let bucket = self.s3_bucket.clone();
                 let region = self.aws_region.clone();
+                let endpoint = self.endpoint_url.clone();
                 let bytes = last_page_bytes.clone();
                 let corr_id = request.correlation_id.clone();
                 async move {
-                    upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "last-page.svg").await
+                    upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
                 }
             }).await {
                 Ok(url) => {
@@ -1200,11 +1230,14 @@ impl SqsProcessor {
                 page
             }).collect();
 
+            let sheets = Some(response_pages.len());
+
             // Send final result to queue (with S3 URLs)
             let response = SqsNestingResponse {
                 correlation_id: request.correlation_id.clone(),
                 first_page_svg_url,
                 last_page_svg_url,
+                sheets,
                 page_svg_urls: Some(page_svg_urls),
                 pages: Some(response_pages),
                 parts_placed: nesting_result.parts_placed,
@@ -1668,6 +1701,7 @@ mod tests {
             "us-east-1".to_string(),
             "test-input-queue".to_string(),
             "test-output-queue".to_string(),
+            None,
         );
 
         let correlation_id = "parallel-cancelled".to_string();
@@ -1738,6 +1772,7 @@ mod tests {
             "us-east-1".to_string(),
             "test-input-queue".to_string(),
             "test-output-queue".to_string(),
+            None,
         );
 
         // Register a correlation_id

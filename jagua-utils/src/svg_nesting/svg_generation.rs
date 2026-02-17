@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlacedPartInfo {
-    /// Internal item ID assigned by the optimizer.
-    pub item_id: usize,
+    /// User-provided itemId from the request (echoed back for correlation).
+    /// Falls back to the internal optimizer item ID as a string if no user-provided ID.
+    pub item_id: String,
     /// Which PartInput this came from (0-based index into the parts array).
     pub part_index: usize,
     /// Translation X in bin coordinates.
@@ -34,6 +35,8 @@ pub struct PageResult {
     /// S3 URL to the SVG for this page (populated by the SQS processor).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub svg_url: Option<String>,
+    /// Number of parts placed on this page.
+    pub parts_placed: usize,
     /// Placements on this page.
     pub placements: Vec<PlacedPartInfo>,
 }

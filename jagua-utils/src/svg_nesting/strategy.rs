@@ -16,11 +16,22 @@ pub struct PartInput {
     pub svg_bytes: Vec<u8>,
     /// Number of copies of this part to nest
     pub count: usize,
+    /// Optional user-provided correlation ID for this part type
+    pub item_id: Option<String>,
 }
 
 /// Callback function type for sending intermediate improvements
 /// Called when a better result is found during optimization
 pub type ImprovementCallback = Box<dyn Fn(NestingResult) -> Result<()> + Send + Sync>;
+
+/// Returns true when all items map to the same part index (single part type request).
+/// Used to skip redundant SVG generation for middle pages that are visually identical.
+pub(crate) fn is_single_part_type(item_id_to_part_idx: &[usize]) -> bool {
+    match item_id_to_part_idx.first() {
+        Some(&first) => item_id_to_part_idx.iter().all(|&idx| idx == first),
+        None => true,
+    }
+}
 
 /// Trait for nesting strategies that can be plugged into the nesting system
 pub trait NestingStrategy: Send + Sync {

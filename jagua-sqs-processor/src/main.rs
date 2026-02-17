@@ -73,8 +73,11 @@ async fn main() -> Result<()> {
         S3Client::new(&config)
     };
 
+    // Detect custom endpoint URL for S3 URL generation (LocalStack/Minio)
+    let endpoint_url = env::var("AWS_ENDPOINT_URL").ok();
+
     // Create processor
-    let processor = SqsProcessor::new(sqs_client, s3_client, s3_bucket, aws_region, input_queue_url, output_queue_url);
+    let processor = SqsProcessor::new(sqs_client, s3_client, s3_bucket, aws_region, input_queue_url, output_queue_url, endpoint_url);
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);

@@ -38,6 +38,7 @@ pub fn nest_svg_parts(
     let parts = vec![PartInput {
         svg_bytes: svg_part_bytes.to_vec(),
         count: amount_of_parts,
+        item_id: None,
     }];
     strategy.nest(
         bin_width,
