@@ -4,29 +4,6 @@ use jagua_sqs_processor::{SqsNestingRequest, SqsNestingResponse};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Generate an empty page SVG (used when all parts are placed)
-fn generate_empty_page_svg(bin_width: f32, bin_height: f32) -> Vec<u8> {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}">
-  <g id="container_0">
-    <path d="M 0,0 L {},0 L {},{} L 0,{} z" fill="transparent" stroke="gray" stroke-width="1"/>
-  </g>
-  <text x="{}" y="{}" font-size="{}" font-family="monospace">Unplaced parts: 0</text>
-</svg>"#,
-        bin_width,
-        bin_height,
-        bin_width,
-        bin_width,
-        bin_height,
-        bin_height,
-        bin_width * 0.02,
-        bin_height * 0.05,
-        bin_width * 0.02
-    )
-    .into_bytes()
-}
-
 /// Process a request directly (bypassing AWS SDK) and capture responses
 /// If shared_responses is provided, intermediate responses will be written there as they arrive
 /// If shared_intermediate_results is provided, intermediate NestingResults (with SVG data) will be stored there
@@ -36,12 +13,11 @@ fn process_request_direct(
     shared_responses: Option<Arc<Mutex<Vec<SqsNestingResponse>>>>,
     shared_intermediate_results: Option<Arc<Mutex<Vec<jagua_utils::svg_nesting::NestingResult>>>>,
 ) -> Result<(Vec<SqsNestingResponse>, jagua_utils::svg_nesting::NestingResult)> {
-    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy};
+    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput};
 
     let request: SqsNestingRequest = serde_json::from_str(request_json)?;
 
     // Validate required fields for non-cancellation requests
-    // Either svg_base64 or svg_s3_url must be provided
     let svg_base64 = request
         .svg_base64
         .as_ref()
@@ -62,6 +38,12 @@ fn process_request_direct(
     let svg_bytes = general_purpose::STANDARD
         .decode(svg_base64)
         .map_err(|e| anyhow::anyhow!("Failed to decode svg_base64: {}", e))?;
+
+    let part_inputs = vec![PartInput {
+        svg_bytes: svg_bytes.clone(),
+        count: amount_of_parts,
+        item_id: None,
+    }];
 
     let improvements: Arc<Mutex<Vec<SqsNestingResponse>>> = Arc::new(Mutex::new(Vec::new()));
     let improvements_clone = improvements.clone();
@@ -84,6 +66,9 @@ fn process_request_direct(
             correlation_id: correlation_id.clone(),
             first_page_svg_url: None, // Tests don't use S3
             last_page_svg_url: None, // Tests don't use S3
+            sheets: None,
+            page_svg_urls: None,
+            pages: None,
             parts_placed: result.parts_placed,
             utilisation: result.utilisation,
             is_improvement: true,
@@ -104,39 +89,20 @@ fn process_request_direct(
         bin_width,
         bin_height,
         spacing,
-        &svg_bytes,
-        amount_of_parts,
+        &part_inputs,
         request.amount_of_rotations,
         Some(Box::new(callback)),
     )?;
 
     let mut responses = improvements.lock().unwrap().clone();
 
-    let first_page_bytes = nesting_result
-        .page_svgs
-        .first()
-        .unwrap_or(&nesting_result.combined_svg);
-    
-    // If all parts are placed, generate empty page for last page
-    // Otherwise, use unplaced parts SVG if available, or last filled page
-    let last_page_bytes: Vec<u8> = if nesting_result.parts_placed == nesting_result.total_parts_requested {
-        // All parts placed - generate empty page
-        log::info!("process_request_direct: Hit branch - all parts placed ({}), generating empty page", nesting_result.parts_placed);
-        generate_empty_page_svg(bin_width, bin_height)
-    } else if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
-        // Some parts unplaced - use unplaced parts SVG
-        log::info!("process_request_direct: Hit branch - some parts unplaced ({} of {}), using unplaced parts SVG", nesting_result.parts_placed, nesting_result.total_parts_requested);
-        unplaced_svg.clone()
-    } else {
-        // No unplaced parts SVG - use last filled page or first page
-        log::info!("process_request_direct: Hit branch - no unplaced parts SVG available, using last filled page or first page (parts_placed: {} of {})", nesting_result.parts_placed, nesting_result.total_parts_requested);
-        nesting_result.page_svgs.last().unwrap_or(first_page_bytes).clone()
-    };
-    
     responses.push(SqsNestingResponse {
         correlation_id: request.correlation_id,
         first_page_svg_url: None, // Tests don't use S3
         last_page_svg_url: None, // Tests don't use S3
+        sheets: None,
+        page_svg_urls: None,
+        pages: None,
         parts_placed: nesting_result.parts_placed,
         utilisation: nesting_result.utilisation,
         is_improvement: false,
@@ -175,6 +141,7 @@ async fn test_e2e_processing() -> Result<()> {
         spacing: Some(50.0),
         amount_of_parts: Some(2),
         amount_of_rotations: 4,
+        parts: None,
         output_queue_url: Some("test-output-queue".to_string()),
         cancelled: false,
     };
@@ -236,6 +203,7 @@ async fn test_single_page_last_page_matches_first() -> Result<()> {
         spacing: Some(2.0),
         amount_of_parts: Some(1), // Only 1 part, should fit on single page
         amount_of_rotations: 8,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -300,6 +268,7 @@ async fn test_multiple_pages_last_page_is_set() -> Result<()> {
         spacing: Some(50.0),
         amount_of_parts: Some(10), // Many parts to require multiple pages
         amount_of_rotations: 4,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -382,6 +351,7 @@ async fn test_svg_with_circles() -> Result<()> {
         spacing: Some(50.0),
         amount_of_parts: Some(15),
         amount_of_rotations: 8,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -464,6 +434,7 @@ async fn test_all_parts_fit_last_page_empty() -> Result<()> {
         spacing: Some(50.0),
         amount_of_parts: Some(11), // Exactly 11 parts
         amount_of_rotations: 4,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -512,7 +483,7 @@ fn process_request_with_cancellation(
     request_json: &str,
     cancellation_registry: Arc<Mutex<std::collections::HashMap<String, bool>>>,
 ) -> Result<Vec<SqsNestingResponse>> {
-    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy};
+    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput};
 
     let request: SqsNestingRequest = serde_json::from_str(request_json)?;
 
@@ -539,6 +510,12 @@ fn process_request_with_cancellation(
         .decode(svg_base64)
         .map_err(|e| anyhow::anyhow!("Failed to decode svg_base64: {}", e))?;
 
+    let part_inputs = vec![PartInput {
+        svg_bytes: svg_bytes.clone(),
+        count: amount_of_parts,
+        item_id: None,
+    }];
+
     let improvements: Arc<Mutex<Vec<SqsNestingResponse>>> = Arc::new(Mutex::new(Vec::new()));
     let improvements_clone = improvements.clone();
     let correlation_id = request.correlation_id.clone();
@@ -560,6 +537,9 @@ fn process_request_with_cancellation(
             correlation_id: correlation_id.clone(),
             first_page_svg_url: None, // Tests don't use S3
             last_page_svg_url: None, // Tests don't use S3
+            sheets: None,
+            page_svg_urls: None,
+            pages: None,
             parts_placed: result.parts_placed,
             utilisation: result.utilisation,
             is_improvement: true,
@@ -576,40 +556,20 @@ fn process_request_with_cancellation(
         bin_width,
         bin_height,
         spacing,
-        &svg_bytes,
-        amount_of_parts,
+        &part_inputs,
         request.amount_of_rotations,
         Some(Box::new(callback)),
     )?;
 
     let mut responses = improvements.lock().unwrap().clone();
 
-    let first_page_bytes = nesting_result
-        .page_svgs
-        .first()
-        .unwrap_or(&nesting_result.combined_svg);
-    
-    // If all parts are placed, generate empty page for last page
-    // Otherwise, use unplaced parts SVG if available, or last filled page
-    // Note: We don't actually use this in tests since we don't upload to S3
-    let _last_page_bytes: Vec<u8> = if nesting_result.parts_placed == nesting_result.total_parts_requested {
-        // All parts placed - generate empty page
-        log::info!("process_request_with_cancellation: Hit branch - all parts placed ({}), generating empty page", nesting_result.parts_placed);
-        generate_empty_page_svg(bin_width, bin_height)
-    } else if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
-        // Some parts unplaced - use unplaced parts SVG
-        log::info!("process_request_with_cancellation: Hit branch - some parts unplaced ({} of {}), using unplaced parts SVG", nesting_result.parts_placed, nesting_result.total_parts_requested);
-        unplaced_svg.clone()
-    } else {
-        // No unplaced parts SVG - use last filled page or first page
-        log::info!("process_request_with_cancellation: Hit branch - no unplaced parts SVG available, using last filled page or first page (parts_placed: {} of {})", nesting_result.parts_placed, nesting_result.total_parts_requested);
-        nesting_result.page_svgs.last().unwrap_or(first_page_bytes).clone()
-    };
-    
     responses.push(SqsNestingResponse {
         correlation_id: request.correlation_id,
         first_page_svg_url: None, // Tests don't use S3
         last_page_svg_url: None, // Tests don't use S3
+        sheets: None,
+        page_svg_urls: None,
+        pages: None,
         parts_placed: nesting_result.parts_placed,
         utilisation: nesting_result.utilisation,
         is_improvement: false,
@@ -643,6 +603,7 @@ async fn test_cancellation_request_handling() -> Result<()> {
         "us-east-1".to_string(),
         "test-input-queue".to_string(),
         "test-output-queue".to_string(),
+        None,
     );
 
     // Create a cancellation request (only correlation_id and cancelled are required)
@@ -655,6 +616,7 @@ async fn test_cancellation_request_handling() -> Result<()> {
         spacing: None,
         amount_of_parts: None,
         amount_of_rotations: 8,
+        parts: None,
         output_queue_url: None,
         cancelled: true,
     };
@@ -712,6 +674,7 @@ async fn test_optimization_cancellation_during_execution() -> Result<()> {
         spacing: Some(50.0),
         amount_of_parts: Some(10), // Many parts to make it run longer
         amount_of_rotations: 8,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -800,6 +763,7 @@ async fn test_cancellation_before_optimization_starts() -> Result<()> {
         spacing: Some(50.0),
         amount_of_parts: Some(5),
         amount_of_rotations: 8,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -863,6 +827,7 @@ async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> 
         spacing: Some(25.0),
         amount_of_parts: Some(2),
         amount_of_rotations: 4,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -876,6 +841,7 @@ async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> 
         spacing: Some(35.0),
         amount_of_parts: Some(8),
         amount_of_rotations: 8,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -978,6 +944,7 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
         spacing: Some(20.0),
         amount_of_parts: Some(3),
         amount_of_rotations: 4,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -991,6 +958,7 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
         spacing: Some(30.0),
         amount_of_parts: Some(6),
         amount_of_rotations: 8,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -1075,6 +1043,7 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
         spacing: Some(50.0),
         amount_of_parts: Some(5),
         amount_of_rotations: 4,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -1168,6 +1137,9 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         correlation_id: request.correlation_id.clone(),
                         first_page_svg_url: final_responses[0].first_page_svg_url.clone(),
                         last_page_svg_url: final_responses[0].last_page_svg_url.clone(),
+                        sheets: final_responses[0].sheets,
+                        page_svg_urls: final_responses[0].page_svg_urls.clone(),
+                        pages: final_responses[0].pages.clone(),
                         parts_placed: final_responses[0].parts_placed,
                         utilisation: final_responses[0].utilisation,
                         is_improvement: false,
@@ -1184,6 +1156,7 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         combined_svg: vec![],
                         unplaced_parts_svg: None,
                         utilisation: final_responses[0].utilisation,
+                        pages: vec![],
                     };
                     break (final_responses, nr.unwrap_or(dummy_result));
                 }
@@ -1444,6 +1417,7 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
         spacing: Some(2.0),
         amount_of_parts: Some(1),
         amount_of_rotations: 4,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -1845,6 +1819,7 @@ async fn test_execution_timeout() -> Result<()> {
         spacing: Some(10.0),
         amount_of_parts: Some(1000), // Large number of parts to ensure timeout
         amount_of_rotations: 16, // More rotations to make it slower
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -1902,7 +1877,7 @@ async fn test_execution_timeout() -> Result<()> {
 
 /// Process a request with timeout support (reads EXECUTION_TIMEOUT_SECS env var)
 fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResponse>> {
-    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy};
+    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1928,6 +1903,12 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
     let svg_bytes = general_purpose::STANDARD
         .decode(svg_base64)
         .map_err(|e| anyhow::anyhow!("Failed to decode svg_base64: {}", e))?;
+
+    let part_inputs = vec![PartInput {
+        svg_bytes: svg_bytes.clone(),
+        count: amount_of_parts,
+        item_id: None,
+    }];
 
     // Get timeout from env var (same as production code)
     let timeout_secs: u64 = std::env::var("EXECUTION_TIMEOUT_SECS")
@@ -1958,6 +1939,9 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
             correlation_id: correlation_id.clone(),
             first_page_svg_url: None,
             last_page_svg_url: None,
+            sheets: None,
+            page_svg_urls: None,
+            pages: None,
             parts_placed: result.parts_placed,
             utilisation: result.utilisation,
             is_improvement: true,
@@ -1974,8 +1958,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
         bin_width,
         bin_height,
         spacing,
-        &svg_bytes,
-        amount_of_parts,
+        &part_inputs,
         request.amount_of_rotations,
         Some(Box::new(callback)),
     );
@@ -1988,6 +1971,9 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
             correlation_id: request.correlation_id,
             first_page_svg_url: None,
             last_page_svg_url: None,
+            sheets: None,
+            page_svg_urls: None,
+            pages: None,
             parts_placed: 0,
             utilisation: 0.0,
             is_improvement: false,
@@ -2005,6 +1991,9 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
                 correlation_id: request.correlation_id,
                 first_page_svg_url: None,
                 last_page_svg_url: None,
+                sheets: None,
+                page_svg_urls: None,
+                pages: None,
                 parts_placed: result.parts_placed,
                 utilisation: result.utilisation,
                 is_improvement: false,
@@ -2050,6 +2039,7 @@ async fn test_complex_svg_timeout() -> Result<()> {
         spacing: Some(2.0),
         amount_of_parts: Some(3000),
         amount_of_rotations: 4,
+        parts: None,
         output_queue_url: None,
         cancelled: false,
     };
@@ -2091,6 +2081,189 @@ async fn test_complex_svg_timeout() -> Result<()> {
         Err(e) => {
             println!("Got error: {}", e);
         }
+    }
+
+    Ok(())
+}
+
+/// Multi-part placement test using 3 real SVGs (dr.svg, fireman.svg, fork.svg).
+/// Nests them together with a bin size tuned for 5-10 sheets, then writes
+/// page SVGs and placements JSON to disk for visual validation.
+#[test]
+fn test_multi_part_placements_real_svgs() -> Result<()> {
+    use jagua_utils::svg_nesting::{
+        AdaptiveNestingStrategy, NestingStrategy, PartInput,
+    };
+    use jagua_sqs_processor::{SqsNestingRequest, SqsNestingResponse, SvgPartSpec};
+    use std::fs;
+    use std::path::PathBuf;
+
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .try_init();
+
+    // Load SVGs from testdata/
+    let dr_svg = include_bytes!("testdata/dr.svg").to_vec();
+    let fireman_svg = include_bytes!("testdata/fireman.svg").to_vec();
+    let fork_svg = include_bytes!("testdata/fork.svg").to_vec();
+
+    // Part counts: dr=12, fireman=15, fork=12 → 39 total
+    // dr.svg is ~1055x771 units, fireman ~83x264, fork ~60x370
+    // With a 1500x1200 bin: ~2 dr parts per sheet + small parts → expect 5-10 sheets.
+    let parts = vec![
+        PartInput { svg_bytes: dr_svg, count: 12, item_id: None },
+        PartInput { svg_bytes: fireman_svg, count: 15, item_id: None },
+        PartInput { svg_bytes: fork_svg, count: 12, item_id: None },
+    ];
+
+    let strategy = AdaptiveNestingStrategy::new();
+    let result = strategy.nest(
+        1500.0, // bin_width
+        1200.0, // bin_height
+        5.0,    // spacing
+        &parts,
+        4,      // amount_of_rotations
+        None,   // no callback
+    );
+
+    assert!(result.is_ok(), "Multi-part nesting should succeed: {:?}", result.err());
+    let nesting_result = result.unwrap();
+
+    assert!(nesting_result.parts_placed > 0, "Should place at least some parts");
+    assert!(
+        !nesting_result.pages.is_empty(),
+        "Pages should not be empty"
+    );
+    let total_placements: usize = nesting_result.pages.iter().map(|p| p.placements.len()).sum();
+    assert_eq!(
+        total_placements,
+        nesting_result.parts_placed,
+        "Number of placements should match parts_placed"
+    );
+
+    // Verify all part_index values are in range [0, 3)
+    for page in &nesting_result.pages {
+        for p in &page.placements {
+            assert!(
+                p.part_index < 3,
+                "part_index {} should be < 3 (num part types)",
+                p.part_index
+            );
+        }
+    }
+
+    // Write output files for visual validation
+    let output_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test_output")
+        .join("multi_part_placements");
+    // Clean stale files from previous runs
+    if output_dir.exists() {
+        fs::remove_dir_all(&output_dir).context("clean output dir")?;
+    }
+    fs::create_dir_all(&output_dir).context("create output dir")?;
+
+    // Write each page SVG
+    for (i, page_svg) in nesting_result.page_svgs.iter().enumerate() {
+        let path = output_dir.join(format!("page-{}.svg", i));
+        fs::write(&path, page_svg).context(format!("write page-{}.svg", i))?;
+        println!("Wrote page SVG: {}", path.display());
+    }
+
+    // Write combined SVG
+    if !nesting_result.combined_svg.is_empty() {
+        let combined_path = output_dir.join("combined.svg");
+        fs::write(&combined_path, &nesting_result.combined_svg).context("write combined.svg")?;
+        println!("Wrote combined SVG: {}", combined_path.display());
+    }
+
+    // Write unplaced parts SVG if present
+    if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
+        let unplaced_path = output_dir.join("unplaced.svg");
+        fs::write(&unplaced_path, unplaced_svg).context("write unplaced.svg")?;
+        println!("Wrote unplaced SVG: {}", unplaced_path.display());
+    }
+
+    // Write pages JSON (grouped placements by page)
+    let pages_json =
+        serde_json::to_string_pretty(&nesting_result.pages).context("serialize pages")?;
+    let pages_path = output_dir.join("pages.json");
+    fs::write(&pages_path, &pages_json).context("write pages.json")?;
+    println!("Wrote pages JSON: {}", pages_path.display());
+
+    // Build and write a sample SQS request JSON for integration testing
+    let sqs_request = SqsNestingRequest {
+        correlation_id: "test-multi-part-real-svgs".to_string(),
+        svg_base64: None,
+        svg_url: None,
+        bin_width: Some(1500.0),
+        bin_height: Some(1200.0),
+        spacing: Some(5.0),
+        amount_of_parts: None,
+        parts: Some(vec![
+            SvgPartSpec { item_id: "dr-part".to_string(), svg_url: "https://s3.example.com/svgs/dr.svg".to_string(), amount_of_parts: 12 },
+            SvgPartSpec { item_id: "fireman-part".to_string(), svg_url: "https://s3.example.com/svgs/fireman.svg".to_string(), amount_of_parts: 15 },
+            SvgPartSpec { item_id: "fork-part".to_string(), svg_url: "https://s3.example.com/svgs/fork.svg".to_string(), amount_of_parts: 12 },
+        ]),
+        amount_of_rotations: 4,
+        output_queue_url: Some("https://sqs.eu-north-1.amazonaws.com/123456789/output-queue".to_string()),
+        cancelled: false,
+    };
+    let request_json =
+        serde_json::to_string_pretty(&sqs_request).context("serialize SQS request")?;
+    let request_path = output_dir.join("request.json");
+    fs::write(&request_path, &request_json).context("write request.json")?;
+    println!("Wrote SQS request JSON: {}", request_path.display());
+
+    // Build and write a full SQS response JSON for integration testing
+    let page_svg_urls: Vec<String> = (0..nesting_result.page_svgs.len())
+        .map(|i| format!("https://s3.example.com/nesting/page-{}.svg", i))
+        .collect();
+    let mut response_pages = nesting_result.pages.clone();
+    for (i, page) in response_pages.iter_mut().enumerate() {
+        page.svg_url = Some(page_svg_urls[i].clone());
+    }
+    let sqs_response = SqsNestingResponse {
+        correlation_id: "test-multi-part-real-svgs".to_string(),
+        first_page_svg_url: page_svg_urls.first().cloned(),
+        last_page_svg_url: page_svg_urls.last().cloned(),
+        sheets: Some(response_pages.len()),
+        page_svg_urls: Some(page_svg_urls),
+        pages: Some(response_pages),
+        parts_placed: nesting_result.parts_placed,
+        utilisation: nesting_result.utilisation,
+        is_improvement: false,
+        is_final: true,
+        timestamp: 1700000000,
+        error_message: None,
+    };
+    let response_json =
+        serde_json::to_string_pretty(&sqs_response).context("serialize SQS response")?;
+    let response_path = output_dir.join("response.json");
+    fs::write(&response_path, &response_json).context("write response.json")?;
+    println!("Wrote SQS response JSON: {}", response_path.display());
+
+    // Summary
+    println!("\nMulti-part placement test (real SVGs) summary:");
+    println!(
+        "  Parts requested: {} (dr: 12, fireman: 15, fork: 12)",
+        nesting_result.total_parts_requested
+    );
+    println!("  Parts placed: {}", nesting_result.parts_placed);
+    println!("  Pages: {}", nesting_result.pages.len());
+    println!(
+        "  Utilisation: {:.1}%",
+        nesting_result.utilisation * 100.0
+    );
+    println!("  Output dir: {}", output_dir.display());
+
+    // Per-page breakdown
+    for page in &nesting_result.pages {
+        println!(
+            "  Page {}: {} items, utilisation {:.1}%",
+            page.page_index,
+            page.placements.len(),
+            page.utilisation * 100.0
+        );
     }
 
     Ok(())

@@ -314,16 +314,12 @@ M 364.5,333.381 L 362.619,333.049 L 360.965,332.094 L 359.737,330.631 L 359.084,
             result.parts_placed
         );
 
+        // With multi-bin support, the optimizer can place all 15 parts across multiple bins.
+        // On a single 1200x1200 bin with spacing 50, only 12-13 fit, so expect >=12.
         assert!(
-            result.parts_placed == 12 || result.parts_placed == 13,
-            "Expected 12 or 13 parts to be placed with bin 1200x1200, spacing 50, and 15 parts, but got {} (15 is impossible)",
+            result.parts_placed >= 12,
+            "Expected at least 12 parts to be placed with bin 1200x1200, spacing 50, and 15 parts, but got {}",
             result.parts_placed
-        );
-        
-        assert_ne!(
-            result.parts_placed,
-            15,
-            "Got 15 parts placed, but this is impossible - optimizer may be incorrectly reporting placements"
         );
 
         // Verify the combined SVG contains all placed items

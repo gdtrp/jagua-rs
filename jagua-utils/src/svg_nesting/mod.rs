@@ -5,8 +5,8 @@ mod strategy;
 mod svg_generation;
 
 pub use parsing::*;
-pub use strategy::{NestingStrategy, SimpleNestingStrategy, AdaptiveNestingStrategy, ImprovementCallback};
-pub use svg_generation::NestingResult;
+pub use strategy::{NestingStrategy, SimpleNestingStrategy, AdaptiveNestingStrategy, ImprovementCallback, PartInput};
+pub use svg_generation::{NestingResult, PageResult, PlacedPartInfo};
 
 use anyhow::Result;
 
@@ -35,12 +35,16 @@ pub fn nest_svg_parts(
     _placements: usize,
 ) -> Result<NestingResult> {
     let strategy = SimpleNestingStrategy::new();
+    let parts = vec![PartInput {
+        svg_bytes: svg_part_bytes.to_vec(),
+        count: amount_of_parts,
+        item_id: None,
+    }];
     strategy.nest(
         bin_width,
         bin_height,
         spacing,
-        svg_part_bytes,
-        amount_of_parts,
+        &parts,
         amount_of_rotations,
         None,
     )

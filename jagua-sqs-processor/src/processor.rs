@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_s3::Client as S3Client;
 use base64::{engine::general_purpose, Engine as _};
-use jagua_utils::svg_nesting::{NestingStrategy, AdaptiveNestingStrategy, NestingResult};
+use jagua_utils::svg_nesting::{NestingStrategy, AdaptiveNestingStrategy, NestingResult, PartInput, PlacedPartInfo, PageResult};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -29,6 +29,26 @@ const CANCELLATION_REGISTRY_TTL_SECS: u64 = 300; // 5 minutes
 /// Default execution timeout for nesting operations (in seconds)
 const DEFAULT_EXECUTION_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
+/// A single part specification in a multi-part nesting request
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SvgPartSpec {
+    /// User-provided correlation ID for this part type
+    pub item_id: String,
+    /// HTTPS S3 URL to the SVG file
+    pub svg_url: String,
+    /// Number of copies of this part to nest
+    pub amount_of_parts: usize,
+}
+
+/// Trait for downloading SVG bytes from a URL.
+/// Abstracts S3 access so strategies and tests stay S3-agnostic.
+#[async_trait::async_trait]
+pub trait SvgDownloader: Send + Sync {
+    /// Download SVG bytes from the given URL
+    async fn download(&self, url: &str) -> Result<Vec<u8>>;
+}
+
 /// Request message structure for SQS queue
 /// For cancellation requests, only `correlation_id` and `cancelled: true` are required.
 /// All other fields are required only when `cancelled` is false or not present.
@@ -52,9 +72,13 @@ pub struct SqsNestingRequest {
     /// Spacing between parts (required if not cancelled)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacing: Option<f32>,
-    /// Number of parts to nest (required if not cancelled)
+    /// Number of parts to nest (required for legacy single-part format, ignored if `parts` is set)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount_of_parts: Option<usize>,
+    /// Multi-part specification: array of different SVG parts with counts.
+    /// When present and non-empty, takes precedence over legacy svg_url/svg_base64 + amount_of_parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<SvgPartSpec>>,
     /// Number of rotations to try (default: 8)
     #[serde(default = "default_rotations")]
     pub amount_of_rotations: usize,
@@ -67,28 +91,6 @@ pub struct SqsNestingRequest {
 }
 
 /// Generate an empty page SVG (used when all parts are placed)
-fn generate_empty_page_svg(bin_width: f32, bin_height: f32) -> Vec<u8> {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}">
-  <g id="container_0">
-    <path d="M 0,0 L {},0 L {},{} L 0,{} z" fill="transparent" stroke="gray" stroke-width="1"/>
-  </g>
-  <text x="{}" y="{}" font-size="{}" font-family="monospace">Unplaced parts: 0</text>
-</svg>"#,
-        bin_width,
-        bin_height,
-        bin_width,
-        bin_width,
-        bin_height,
-        bin_height,
-        bin_width * 0.02,
-        bin_height * 0.05,
-        bin_width * 0.02
-    )
-    .into_bytes()
-}
-
 fn decode_svg(encoded: &str) -> Result<Vec<u8>> {
     general_purpose::STANDARD
         .decode(encoded)
@@ -146,35 +148,33 @@ where
 }
 
 /// Determine the last page SVG bytes based on nesting result
-/// Returns empty page SVG if all parts placed, unplaced parts SVG if available,
-/// otherwise the last filled page
+/// Returns None if all parts placed (no unplaced sheet needed),
+/// unplaced parts SVG if available, otherwise the last filled page
 fn determine_last_page_svg(
     result: &NestingResult,
     first_page_bytes: &[u8],
-    bin_width: f32,
-    bin_height: f32,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     if result.parts_placed == result.total_parts_requested {
-        // All parts placed - generate empty page
+        // All parts placed - no last page needed
         info!(
-            "All parts placed ({}), generating empty page",
+            "All parts placed ({}), no unplaced parts sheet needed",
             result.parts_placed
         );
-        generate_empty_page_svg(bin_width, bin_height)
+        None
     } else if let Some(ref unplaced_svg) = result.unplaced_parts_svg {
         // Some parts unplaced - use unplaced parts SVG
         info!(
             "Some parts unplaced ({} of {}), using unplaced parts SVG",
             result.parts_placed, result.total_parts_requested
         );
-        unplaced_svg.clone()
+        Some(unplaced_svg.clone())
     } else {
         // No unplaced parts SVG - use last filled page or first page
         info!(
             "No unplaced parts SVG available, using last filled page (parts_placed: {} of {})",
             result.parts_placed, result.total_parts_requested
         );
-        result.page_svgs.last().unwrap_or(&first_page_bytes.to_vec()).clone()
+        Some(result.page_svgs.last().unwrap_or(&first_page_bytes.to_vec()).clone())
     }
 }
 
@@ -214,9 +214,18 @@ pub struct SqsNestingResponse {
     /// S3 URL to the last page SVG (format: s3://bucket/nesting/{requestId}/last-page.svg)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_page_svg_url: Option<String>,
+    /// Number of sheets/pages used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheets: Option<usize>,
+    /// S3 URLs to all page SVGs (ordered by page index)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_svg_urls: Option<Vec<String>>,
+    /// Per-page results: utilisation and placements grouped by page
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages: Option<Vec<PageResult>>,
     /// Number of parts placed
     pub parts_placed: usize,
-    /// Bin utilisation ratio (0.0 to 1.0) representing percentage of bin area occupied
+    /// Average bin utilisation ratio (0.0 to 1.0) across all pages
     pub utilisation: f32,
     /// Whether this is an intermediate improvement (always false for simple strategy)
     #[serde(rename = "improvement")]
@@ -240,6 +249,7 @@ pub struct SqsProcessor {
     aws_region: String,
     input_queue_url: String,
     output_queue_url: String,
+    endpoint_url: Option<String>,
     cancellation_registry: Arc<Mutex<HashMap<String, CancellationEntry>>>,
 }
 
@@ -322,6 +332,7 @@ impl SqsProcessor {
         aws_region: String,
         input_queue_url: String,
         output_queue_url: String,
+        endpoint_url: Option<String>,
     ) -> Self {
         Self {
             sqs_client,
@@ -330,6 +341,7 @@ impl SqsProcessor {
             aws_region,
             input_queue_url,
             output_queue_url,
+            endpoint_url,
             cancellation_registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -338,7 +350,7 @@ impl SqsProcessor {
     async fn download_svg_from_s3(&self, s3_url: &str) -> Result<Vec<u8>> {
         // Parse S3 URL (supports both s3://bucket/key and https://bucket.s3.region.amazonaws.com/key)
         let (bucket, key) = parse_s3_url(s3_url)?;
-        
+
         info!("Downloading SVG from S3: url={}, bucket={}, key={}", s3_url, bucket, key);
 
         let response = match self.s3_client
@@ -353,7 +365,7 @@ impl SqsProcessor {
                 // Log detailed error information
                 error!("S3 GetObject failed: {}", e);
                 error!("S3 URL: {}, bucket: {}, key: {}", s3_url, bucket, key);
-                
+
                 // Try to extract more error details
                 use aws_sdk_s3::error::ProvideErrorMetadata;
                 if let Some(code) = e.code() {
@@ -362,10 +374,10 @@ impl SqsProcessor {
                 if let Some(message) = e.message() {
                     error!("S3 error message: {}", message);
                 }
-                
+
                 // Log the full error
                 error!("Full error details: {}", e);
-                
+
                 return Err(anyhow::anyhow!(
                     "Failed to download SVG from S3: bucket={}, key={}, error={}",
                     bucket, key, e
@@ -383,6 +395,13 @@ impl SqsProcessor {
             .to_vec();
         info!("Downloaded SVG from S3: {} bytes", svg_bytes.len());
         Ok(svg_bytes)
+    }
+}
+
+#[async_trait::async_trait]
+impl SvgDownloader for SqsProcessor {
+    async fn download(&self, url: &str) -> Result<Vec<u8>> {
+        self.download_svg_from_s3(url).await
     }
 }
 
@@ -479,9 +498,16 @@ async fn upload_svg_to_s3_internal(
     svg_bytes: &[u8],
     request_id: &str,
     filename: &str,
+    endpoint_url: Option<&str>,
 ) -> Result<String> {
     let s3_key = format!("nesting/{}/{}", request_id, filename);
-    let s3_url = format!("https://{}.s3.{}.amazonaws.com/{}", s3_bucket, aws_region, s3_key);
+    let s3_url = if let Some(endpoint) = endpoint_url {
+        // Path-style URL for LocalStack/Minio
+        format!("{}/{}/{}", endpoint.trim_end_matches('/'), s3_bucket, s3_key)
+    } else {
+        // Virtual-hosted style for AWS
+        format!("https://{}.s3.{}.amazonaws.com/{}", s3_bucket, aws_region, s3_key)
+    };
     
     info!("Uploading SVG to S3: bucket={}, key={}, size={} bytes", 
         s3_bucket, s3_key, svg_bytes.len());
@@ -600,6 +626,9 @@ impl SqsProcessor {
                             correlation_id: corr_id.to_string(),
                             first_page_svg_url: None,
                             last_page_svg_url: None,
+                            sheets: None,
+                            page_svg_urls: None,
+                            pages: None,
                             parts_placed: 0,
                             utilisation: 0.0,
                             is_improvement: false,
@@ -675,14 +704,20 @@ impl SqsProcessor {
             .unwrap_or_else(|| self.output_queue_url.clone());
 
         // Validate required fields for non-cancellation requests
-        // Either svg_base64 or svg_url must be provided
-        if request.svg_base64.is_none() && request.svg_url.is_none() {
-            let error_msg = "Missing required field: either svg_base64 or svg_url must be provided";
+        let has_multi_parts = request.parts.as_ref().map_or(false, |p| !p.is_empty());
+        let has_legacy_svg = request.svg_base64.is_some() || request.svg_url.is_some();
+
+        // Must have either multi-part or legacy SVG source
+        if !has_multi_parts && !has_legacy_svg {
+            let error_msg = "Missing required field: either 'parts' array or 'svgBase64'/'svgUrl' must be provided";
             error!("{}", error_msg);
             let error_response = SqsNestingResponse {
                 correlation_id: request.correlation_id.clone(),
                 first_page_svg_url: None,
                 last_page_svg_url: None,
+                sheets: None,
+                page_svg_urls: None,
+                pages: None,
                 parts_placed: 0,
                 utilisation: 0.0,
                 is_improvement: false,
@@ -698,13 +733,18 @@ impl SqsProcessor {
             }
             return Ok(());
         }
-        if request.bin_width.is_none() {
-            let error_msg = "Missing required field: bin_width";
+
+        // Legacy format requires amount_of_parts
+        if !has_multi_parts && request.amount_of_parts.is_none() {
+            let error_msg = "Missing required field: amount_of_parts (required for legacy single-part format)";
             error!("{}", error_msg);
             let error_response = SqsNestingResponse {
                 correlation_id: request.correlation_id.clone(),
                 first_page_svg_url: None,
                 last_page_svg_url: None,
+                sheets: None,
+                page_svg_urls: None,
+                pages: None,
                 parts_placed: 0,
                 utilisation: 0.0,
                 is_improvement: false,
@@ -720,71 +760,38 @@ impl SqsProcessor {
             }
             return Ok(());
         }
-        if request.bin_height.is_none() {
-            let error_msg = "Missing required field: bin_height";
-            error!("{}", error_msg);
-            let error_response = SqsNestingResponse {
-                correlation_id: request.correlation_id.clone(),
-                first_page_svg_url: None,
-                last_page_svg_url: None,
-                parts_placed: 0,
-                utilisation: 0.0,
-                is_improvement: false,
-                is_final: true,
-                timestamp: current_timestamp(),
-                error_message: Some(error_msg.to_string()),
-            };
-            if let Err(send_err) = self
-                .send_to_output_queue(&output_queue_url, &error_response)
-                .await
-            {
-                error!("Failed to send error response: {}", send_err);
+
+        // Validate bin dimensions and spacing
+        for (field_name, field_value) in [
+            ("bin_width", &request.bin_width),
+            ("bin_height", &request.bin_height),
+            ("spacing", &request.spacing),
+        ] {
+            if field_value.is_none() {
+                let error_msg = format!("Missing required field: {}", field_name);
+                error!("{}", error_msg);
+                let error_response = SqsNestingResponse {
+                    correlation_id: request.correlation_id.clone(),
+                    first_page_svg_url: None,
+                    last_page_svg_url: None,
+                    sheets: None,
+                    page_svg_urls: None,
+                    pages: None,
+                    parts_placed: 0,
+                    utilisation: 0.0,
+                    is_improvement: false,
+                    is_final: true,
+                    timestamp: current_timestamp(),
+                    error_message: Some(error_msg),
+                };
+                if let Err(send_err) = self
+                    .send_to_output_queue(&output_queue_url, &error_response)
+                    .await
+                {
+                    error!("Failed to send error response: {}", send_err);
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        if request.spacing.is_none() {
-            let error_msg = "Missing required field: spacing";
-            error!("{}", error_msg);
-            let error_response = SqsNestingResponse {
-                correlation_id: request.correlation_id.clone(),
-                first_page_svg_url: None,
-                last_page_svg_url: None,
-                parts_placed: 0,
-                utilisation: 0.0,
-                is_improvement: false,
-                is_final: true,
-                timestamp: current_timestamp(),
-                error_message: Some(error_msg.to_string()),
-            };
-            if let Err(send_err) = self
-                .send_to_output_queue(&output_queue_url, &error_response)
-                .await
-            {
-                error!("Failed to send error response: {}", send_err);
-            }
-            return Ok(());
-        }
-        if request.amount_of_parts.is_none() {
-            let error_msg = "Missing required field: amount_of_parts";
-            error!("{}", error_msg);
-            let error_response = SqsNestingResponse {
-                correlation_id: request.correlation_id.clone(),
-                first_page_svg_url: None,
-                last_page_svg_url: None,
-                parts_placed: 0,
-                utilisation: 0.0,
-                is_improvement: false,
-                is_final: true,
-                timestamp: current_timestamp(),
-                error_message: Some(error_msg.to_string()),
-            };
-            if let Err(send_err) = self
-                .send_to_output_queue(&output_queue_url, &error_response)
-                .await
-            {
-                error!("Failed to send error response: {}", send_err);
-            }
-            return Ok(());
         }
 
         // Process the request and handle errors by sending error response
@@ -801,6 +808,9 @@ impl SqsProcessor {
                 correlation_id: request.correlation_id.clone(),
                 first_page_svg_url: None,
                 last_page_svg_url: None,
+                sheets: None,
+                page_svg_urls: None,
+                pages: None,
                 parts_placed: 0,
                 utilisation: 0.0,
                 is_improvement: false,
@@ -841,21 +851,51 @@ impl SqsProcessor {
             let bin_width = request.bin_width.unwrap();
             let bin_height = request.bin_height.unwrap();
             let spacing = request.spacing.unwrap();
-            let amount_of_parts = request.amount_of_parts.unwrap();
 
-            // Get SVG bytes - either from S3 or from base64
+            // Normalize into Vec<PartInput>
             let decode_start = Instant::now();
-            let svg_bytes = if let Some(ref svg_url) = request.svg_url {
-                // Download from S3
-                info!("Downloading SVG from S3: {}", svg_url);
-                self.download_svg_from_s3(svg_url).await?
-            } else if let Some(ref svg_base64) = request.svg_base64 {
-                // Decode from base64
-                decode_svg(svg_base64)?
+            let part_inputs: Vec<PartInput> = if let Some(ref parts) = request.parts {
+                if !parts.is_empty() {
+                    // Multi-part format: download each SVG from its URL
+                    let mut inputs = Vec::with_capacity(parts.len());
+                    for spec in parts {
+                        info!("Downloading SVG for multi-part from: {}", spec.svg_url);
+                        let svg_bytes = self.download_svg_from_s3(&spec.svg_url).await?;
+                        inputs.push(PartInput {
+                            svg_bytes,
+                            count: spec.amount_of_parts,
+                            item_id: Some(spec.item_id.clone()),
+                        });
+                    }
+                    inputs
+                } else {
+                    return Err(anyhow!("'parts' array is empty"));
+                }
             } else {
-                return Err(anyhow!("Neither svg_url nor svg_base64 provided"));
+                // Legacy single-part format
+                let amount_of_parts = request.amount_of_parts.unwrap();
+                let svg_bytes = if let Some(ref svg_url) = request.svg_url {
+                    info!("Downloading SVG from S3: {}", svg_url);
+                    self.download_svg_from_s3(svg_url).await?
+                } else if let Some(ref svg_base64) = request.svg_base64 {
+                    decode_svg(svg_base64)?
+                } else {
+                    return Err(anyhow!("Neither svg_url nor svg_base64 provided"));
+                };
+                vec![PartInput {
+                    svg_bytes,
+                    count: amount_of_parts,
+                    item_id: None,
+                }]
             };
-            info!("SVG payload ready: {} bytes (took {:?})", svg_bytes.len(), decode_start.elapsed());
+
+            let total_parts: usize = part_inputs.iter().map(|p| p.count).sum();
+            info!(
+                "SVG payload ready: {} part type(s), {} total parts (took {:?})",
+                part_inputs.len(),
+                total_parts,
+                decode_start.elapsed()
+            );
 
             // Create cancellation checker closure using the helper method
             // The checker also monitors for execution timeout
@@ -890,75 +930,91 @@ impl SqsProcessor {
             let s3_client_for_task = self.s3_client.clone();
             let s3_bucket_for_task = self.s3_bucket.clone();
             let aws_region_for_task = self.aws_region.clone();
+            let endpoint_url_for_task = self.endpoint_url.clone();
             let output_queue_url_for_task = output_queue_url.to_string();
             let correlation_id_for_task = request.correlation_id.clone();
-            let bin_width_for_task = bin_width;
-            let bin_height_for_task = bin_height;
 
             let improvement_task_handle = tokio::spawn(async move {
                 info!("Improvement task started, waiting for messages...");
                 while let Some(result) = rx.recv().await {
                     info!("Improvement task received message: {} parts placed, {} pages", result.parts_placed, result.page_svgs.len());
 
-                    // Get the first and last page SVGs for uploading to S3
+                    // Upload all page SVGs to S3
+                    let mut page_svg_urls: Vec<String> = Vec::new();
+                    for (page_idx, page_bytes) in result.page_svgs.iter().enumerate() {
+                        let filename = format!("page-{}.svg", page_idx);
+                        match retry_with_backoff(&format!("upload improvement page {}", page_idx), || {
+                            let client = s3_client_for_task.clone();
+                            let bucket = s3_bucket_for_task.clone();
+                            let region = aws_region_for_task.clone();
+                            let endpoint = endpoint_url_for_task.clone();
+                            let bytes = page_bytes.clone();
+                            let corr_id = correlation_id_for_task.clone();
+                            let fname = filename.clone();
+                            async move {
+                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, &fname, endpoint.as_deref()).await
+                            }
+                        }).await {
+                            Ok(url) => {
+                                info!("Uploaded improvement page {} SVG to S3: {}", page_idx, url);
+                                page_svg_urls.push(url);
+                            }
+                            Err(e) => {
+                                error!("Failed to upload improvement page {} SVG to S3 after retries: {}", page_idx, e);
+                            }
+                        }
+                    }
+
+                    // Upload last page (unplaced parts) only if there are unplaced parts
                     let first_page_bytes = result.page_svgs.first()
                         .unwrap_or(&result.combined_svg);
-
-                    // Use shared helper function to determine last page
-                    let last_page_bytes = determine_last_page_svg(
+                    let last_page_svg_url = if let Some(last_page_bytes) = determine_last_page_svg(
                         &result,
                         first_page_bytes,
-                        bin_width_for_task,
-                        bin_height_for_task,
-                    );
-
-                    // Upload first page SVG to S3 with retry
-                    let first_page_svg_url = match retry_with_backoff("upload improvement first page", || {
-                        let client = s3_client_for_task.clone();
-                        let bucket = s3_bucket_for_task.clone();
-                        let region = aws_region_for_task.clone();
-                        let bytes = first_page_bytes.clone();
-                        let corr_id = correlation_id_for_task.clone();
-                        async move {
-                            upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "first-page.svg").await
+                    ) {
+                        match retry_with_backoff("upload improvement last page", || {
+                            let client = s3_client_for_task.clone();
+                            let bucket = s3_bucket_for_task.clone();
+                            let region = aws_region_for_task.clone();
+                            let endpoint = endpoint_url_for_task.clone();
+                            let bytes = last_page_bytes.clone();
+                            let corr_id = correlation_id_for_task.clone();
+                            async move {
+                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
+                            }
+                        }).await {
+                            Ok(url) => {
+                                info!("Uploaded improvement last page SVG to S3: {}", url);
+                                Some(url)
+                            }
+                            Err(e) => {
+                                error!("Failed to upload improvement last page SVG to S3 after retries: {}", e);
+                                None
+                            }
                         }
-                    }).await {
-                        Ok(url) => {
-                            info!("Uploaded improvement first page SVG to S3: {}", url);
-                            Some(url)
-                        }
-                        Err(e) => {
-                            error!("Failed to upload improvement first page SVG to S3 after retries: {}", e);
-                            None
-                        }
+                    } else {
+                        None
                     };
 
-                    // Upload last page SVG to S3 with retry
-                    let last_page_svg_url = match retry_with_backoff("upload improvement last page", || {
-                        let client = s3_client_for_task.clone();
-                        let bucket = s3_bucket_for_task.clone();
-                        let region = aws_region_for_task.clone();
-                        let bytes = last_page_bytes.clone();
-                        let corr_id = correlation_id_for_task.clone();
-                        async move {
-                            upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "last-page.svg").await
-                        }
-                    }).await {
-                        Ok(url) => {
-                            info!("Uploaded improvement last page SVG to S3: {}", url);
-                            Some(url)
-                        }
-                        Err(e) => {
-                            error!("Failed to upload improvement last page SVG to S3 after retries: {}", e);
-                            None
-                        }
-                    };
+                    let first_page_svg_url = page_svg_urls.first().cloned();
+
+                    // Build pages with S3 URLs populated
+                    let response_pages: Vec<PageResult> = result.pages.iter().map(|p| {
+                        let mut page = p.clone();
+                        page.svg_url = page_svg_urls.get(p.page_index).cloned();
+                        page
+                    }).collect();
+
+                    let sheets = Some(response_pages.len());
 
                     // Create improvement response with S3 URLs
                     let response = SqsNestingResponse {
                         correlation_id: correlation_id_for_task.clone(),
                         first_page_svg_url,
                         last_page_svg_url,
+                        sheets,
+                        page_svg_urls: Some(page_svg_urls),
+                        pages: Some(response_pages),
                         parts_placed: result.parts_placed,
                         utilisation: result.utilisation,
                         is_improvement: true,
@@ -1009,7 +1065,7 @@ impl SqsProcessor {
             // The cancellation checker handles timeout detection cooperatively
             info!("Starting nesting optimization in spawn_blocking task (timeout: {:?})", execution_timeout);
             let nest_start = Instant::now();
-            let svg_bytes_for_nest = svg_bytes.clone();
+            let part_inputs_for_nest = part_inputs.clone();
             let amount_of_rotations = request.amount_of_rotations;
             let correlation_id_for_error = request.correlation_id.clone();
             let correlation_id_for_timeout = request.correlation_id.clone();
@@ -1024,8 +1080,7 @@ impl SqsProcessor {
                     bin_width,
                     bin_height,
                     spacing,
-                    &svg_bytes_for_nest,
-                    amount_of_parts,
+                    &part_inputs_for_nest,
                     amount_of_rotations,
                     improvement_callback,
                 );
@@ -1085,64 +1140,82 @@ impl SqsProcessor {
                 nesting_result.page_svgs.len()
             );
 
-            // Prepare final response images using shared helper
+            // Upload all page SVGs to S3
+            let mut page_svg_urls: Vec<String> = Vec::new();
+            for (page_idx, page_bytes) in nesting_result.page_svgs.iter().enumerate() {
+                let filename = format!("page-{}.svg", page_idx);
+                match retry_with_backoff(&format!("upload final page {}", page_idx), || {
+                    let s3_client = self.s3_client.clone();
+                    let bucket = self.s3_bucket.clone();
+                    let region = self.aws_region.clone();
+                    let endpoint = self.endpoint_url.clone();
+                    let bytes = page_bytes.clone();
+                    let corr_id = request.correlation_id.clone();
+                    let fname = filename.clone();
+                    async move {
+                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, &fname, endpoint.as_deref()).await
+                    }
+                }).await {
+                    Ok(url) => {
+                        info!("Uploaded final page {} SVG to S3: {}", page_idx, url);
+                        page_svg_urls.push(url);
+                    }
+                    Err(e) => {
+                        error!("Failed to upload final page {} SVG to S3 after retries: {}", page_idx, e);
+                    }
+                }
+            }
+
+            // Upload last page (unplaced parts) only if there are unplaced parts
             let first_page_bytes = nesting_result.page_svgs.first()
                 .unwrap_or(&nesting_result.combined_svg);
-
-            let last_page_bytes = determine_last_page_svg(
+            let last_page_svg_url = if let Some(last_page_bytes) = determine_last_page_svg(
                 &nesting_result,
                 first_page_bytes,
-                bin_width,
-                bin_height,
-            );
-
-            // Upload first page SVG to S3 with retry
-            let first_page_svg_url = match retry_with_backoff("upload final first page", || {
-                let s3_client = self.s3_client.clone();
-                let bucket = self.s3_bucket.clone();
-                let region = self.aws_region.clone();
-                let bytes = first_page_bytes.clone();
-                let corr_id = request.correlation_id.clone();
-                async move {
-                    upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "first-page.svg").await
+            ) {
+                match retry_with_backoff("upload final last page", || {
+                    let s3_client = self.s3_client.clone();
+                    let bucket = self.s3_bucket.clone();
+                    let region = self.aws_region.clone();
+                    let endpoint = self.endpoint_url.clone();
+                    let bytes = last_page_bytes.clone();
+                    let corr_id = request.correlation_id.clone();
+                    async move {
+                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
+                    }
+                }).await {
+                    Ok(url) => {
+                        info!("Uploaded final result last page SVG to S3: {}", url);
+                        Some(url)
+                    }
+                    Err(e) => {
+                        error!("Failed to upload final result last page SVG to S3 after retries: {}", e);
+                        None
+                    }
                 }
-            }).await {
-                Ok(url) => {
-                    info!("Uploaded final result first page SVG to S3: {}", url);
-                    Some(url)
-                }
-                Err(e) => {
-                    error!("Failed to upload final result first page SVG to S3 after retries: {}", e);
-                    None
-                }
+            } else {
+                None
             };
 
-            // Upload last page SVG to S3 with retry
-            let last_page_svg_url = match retry_with_backoff("upload final last page", || {
-                let s3_client = self.s3_client.clone();
-                let bucket = self.s3_bucket.clone();
-                let region = self.aws_region.clone();
-                let bytes = last_page_bytes.clone();
-                let corr_id = request.correlation_id.clone();
-                async move {
-                    upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "last-page.svg").await
-                }
-            }).await {
-                Ok(url) => {
-                    info!("Uploaded final result last page SVG to S3: {}", url);
-                    Some(url)
-                }
-                Err(e) => {
-                    error!("Failed to upload final result last page SVG to S3 after retries: {}", e);
-                    None
-                }
-            };
+            let first_page_svg_url = page_svg_urls.first().cloned();
+
+            // Build pages with S3 URLs populated
+            let response_pages: Vec<PageResult> = nesting_result.pages.iter().map(|p| {
+                let mut page = p.clone();
+                page.svg_url = page_svg_urls.get(p.page_index).cloned();
+                page
+            }).collect();
+
+            let sheets = Some(response_pages.len());
 
             // Send final result to queue (with S3 URLs)
             let response = SqsNestingResponse {
                 correlation_id: request.correlation_id.clone(),
                 first_page_svg_url,
                 last_page_svg_url,
+                sheets,
+                page_svg_urls: Some(page_svg_urls),
+                pages: Some(response_pages),
                 parts_placed: nesting_result.parts_placed,
                 utilisation: nesting_result.utilisation,
                 is_improvement: false,
@@ -1604,6 +1677,7 @@ mod tests {
             "us-east-1".to_string(),
             "test-input-queue".to_string(),
             "test-output-queue".to_string(),
+            None,
         );
 
         let correlation_id = "parallel-cancelled".to_string();
@@ -1620,6 +1694,7 @@ mod tests {
             bin_height: None,
             spacing: None,
             amount_of_parts: None,
+            parts: None,
             amount_of_rotations: 8,
             output_queue_url: None,
             cancelled: true,
@@ -1673,6 +1748,7 @@ mod tests {
             "us-east-1".to_string(),
             "test-input-queue".to_string(),
             "test-output-queue".to_string(),
+            None,
         );
 
         // Register a correlation_id

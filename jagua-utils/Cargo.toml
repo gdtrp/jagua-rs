@@ -14,8 +14,10 @@ lbf = { path = "../lbf" }
 rand = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
+serde = { workspace = true }
 regex = "1"
 
 [dev-dependencies]
 env_logger = { workspace = true }
+serde_json = { workspace = true }
 
