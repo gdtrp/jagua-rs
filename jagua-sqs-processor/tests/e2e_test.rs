@@ -4,29 +4,6 @@ use jagua_sqs_processor::{SqsNestingRequest, SqsNestingResponse};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Generate an empty page SVG (used when all parts are placed)
-fn generate_empty_page_svg(bin_width: f32, bin_height: f32) -> Vec<u8> {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}">
-  <g id="container_0">
-    <path d="M 0,0 L {},0 L {},{} L 0,{} z" fill="transparent" stroke="gray" stroke-width="1"/>
-  </g>
-  <text x="{}" y="{}" font-size="{}" font-family="monospace">Unplaced parts: 0</text>
-</svg>"#,
-        bin_width,
-        bin_height,
-        bin_width,
-        bin_width,
-        bin_height,
-        bin_height,
-        bin_width * 0.02,
-        bin_height * 0.05,
-        bin_width * 0.02
-    )
-    .into_bytes()
-}
-
 /// Process a request directly (bypassing AWS SDK) and capture responses
 /// If shared_responses is provided, intermediate responses will be written there as they arrive
 /// If shared_intermediate_results is provided, intermediate NestingResults (with SVG data) will be stored there
@@ -119,27 +96,6 @@ fn process_request_direct(
 
     let mut responses = improvements.lock().unwrap().clone();
 
-    let first_page_bytes = nesting_result
-        .page_svgs
-        .first()
-        .unwrap_or(&nesting_result.combined_svg);
-    
-    // If all parts are placed, generate empty page for last page
-    // Otherwise, use unplaced parts SVG if available, or last filled page
-    let last_page_bytes: Vec<u8> = if nesting_result.parts_placed == nesting_result.total_parts_requested {
-        // All parts placed - generate empty page
-        log::info!("process_request_direct: Hit branch - all parts placed ({}), generating empty page", nesting_result.parts_placed);
-        generate_empty_page_svg(bin_width, bin_height)
-    } else if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
-        // Some parts unplaced - use unplaced parts SVG
-        log::info!("process_request_direct: Hit branch - some parts unplaced ({} of {}), using unplaced parts SVG", nesting_result.parts_placed, nesting_result.total_parts_requested);
-        unplaced_svg.clone()
-    } else {
-        // No unplaced parts SVG - use last filled page or first page
-        log::info!("process_request_direct: Hit branch - no unplaced parts SVG available, using last filled page or first page (parts_placed: {} of {})", nesting_result.parts_placed, nesting_result.total_parts_requested);
-        nesting_result.page_svgs.last().unwrap_or(first_page_bytes).clone()
-    };
-    
     responses.push(SqsNestingResponse {
         correlation_id: request.correlation_id,
         first_page_svg_url: None, // Tests don't use S3
@@ -607,28 +563,6 @@ fn process_request_with_cancellation(
 
     let mut responses = improvements.lock().unwrap().clone();
 
-    let first_page_bytes = nesting_result
-        .page_svgs
-        .first()
-        .unwrap_or(&nesting_result.combined_svg);
-    
-    // If all parts are placed, generate empty page for last page
-    // Otherwise, use unplaced parts SVG if available, or last filled page
-    // Note: We don't actually use this in tests since we don't upload to S3
-    let _last_page_bytes: Vec<u8> = if nesting_result.parts_placed == nesting_result.total_parts_requested {
-        // All parts placed - generate empty page
-        log::info!("process_request_with_cancellation: Hit branch - all parts placed ({}), generating empty page", nesting_result.parts_placed);
-        generate_empty_page_svg(bin_width, bin_height)
-    } else if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
-        // Some parts unplaced - use unplaced parts SVG
-        log::info!("process_request_with_cancellation: Hit branch - some parts unplaced ({} of {}), using unplaced parts SVG", nesting_result.parts_placed, nesting_result.total_parts_requested);
-        unplaced_svg.clone()
-    } else {
-        // No unplaced parts SVG - use last filled page or first page
-        log::info!("process_request_with_cancellation: Hit branch - no unplaced parts SVG available, using last filled page or first page (parts_placed: {} of {})", nesting_result.parts_placed, nesting_result.total_parts_requested);
-        nesting_result.page_svgs.last().unwrap_or(first_page_bytes).clone()
-    };
-    
     responses.push(SqsNestingResponse {
         correlation_id: request.correlation_id,
         first_page_svg_url: None, // Tests don't use S3

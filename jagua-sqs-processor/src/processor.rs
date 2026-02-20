@@ -91,28 +91,6 @@ pub struct SqsNestingRequest {
 }
 
 /// Generate an empty page SVG (used when all parts are placed)
-fn generate_empty_page_svg(bin_width: f32, bin_height: f32) -> Vec<u8> {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}">
-  <g id="container_0">
-    <path d="M 0,0 L {},0 L {},{} L 0,{} z" fill="transparent" stroke="gray" stroke-width="1"/>
-  </g>
-  <text x="{}" y="{}" font-size="{}" font-family="monospace">Unplaced parts: 0</text>
-</svg>"#,
-        bin_width,
-        bin_height,
-        bin_width,
-        bin_width,
-        bin_height,
-        bin_height,
-        bin_width * 0.02,
-        bin_height * 0.05,
-        bin_width * 0.02
-    )
-    .into_bytes()
-}
-
 fn decode_svg(encoded: &str) -> Result<Vec<u8>> {
     general_purpose::STANDARD
         .decode(encoded)
@@ -170,35 +148,33 @@ where
 }
 
 /// Determine the last page SVG bytes based on nesting result
-/// Returns empty page SVG if all parts placed, unplaced parts SVG if available,
-/// otherwise the last filled page
+/// Returns None if all parts placed (no unplaced sheet needed),
+/// unplaced parts SVG if available, otherwise the last filled page
 fn determine_last_page_svg(
     result: &NestingResult,
     first_page_bytes: &[u8],
-    bin_width: f32,
-    bin_height: f32,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     if result.parts_placed == result.total_parts_requested {
-        // All parts placed - generate empty page
+        // All parts placed - no last page needed
         info!(
-            "All parts placed ({}), generating empty page",
+            "All parts placed ({}), no unplaced parts sheet needed",
             result.parts_placed
         );
-        generate_empty_page_svg(bin_width, bin_height)
+        None
     } else if let Some(ref unplaced_svg) = result.unplaced_parts_svg {
         // Some parts unplaced - use unplaced parts SVG
         info!(
             "Some parts unplaced ({} of {}), using unplaced parts SVG",
             result.parts_placed, result.total_parts_requested
         );
-        unplaced_svg.clone()
+        Some(unplaced_svg.clone())
     } else {
         // No unplaced parts SVG - use last filled page or first page
         info!(
             "No unplaced parts SVG available, using last filled page (parts_placed: {} of {})",
             result.parts_placed, result.total_parts_requested
         );
-        result.page_svgs.last().unwrap_or(&first_page_bytes.to_vec()).clone()
+        Some(result.page_svgs.last().unwrap_or(&first_page_bytes.to_vec()).clone())
     }
 }
 
@@ -957,8 +933,6 @@ impl SqsProcessor {
             let endpoint_url_for_task = self.endpoint_url.clone();
             let output_queue_url_for_task = output_queue_url.to_string();
             let correlation_id_for_task = request.correlation_id.clone();
-            let bin_width_for_task = bin_width;
-            let bin_height_for_task = bin_height;
 
             let improvement_task_handle = tokio::spawn(async move {
                 info!("Improvement task started, waiting for messages...");
@@ -991,34 +965,35 @@ impl SqsProcessor {
                         }
                     }
 
-                    // Upload last page (unplaced/empty) for backward compatibility
+                    // Upload last page (unplaced parts) only if there are unplaced parts
                     let first_page_bytes = result.page_svgs.first()
                         .unwrap_or(&result.combined_svg);
-                    let last_page_bytes = determine_last_page_svg(
+                    let last_page_svg_url = if let Some(last_page_bytes) = determine_last_page_svg(
                         &result,
                         first_page_bytes,
-                        bin_width_for_task,
-                        bin_height_for_task,
-                    );
-                    let last_page_svg_url = match retry_with_backoff("upload improvement last page", || {
-                        let client = s3_client_for_task.clone();
-                        let bucket = s3_bucket_for_task.clone();
-                        let region = aws_region_for_task.clone();
-                        let endpoint = endpoint_url_for_task.clone();
-                        let bytes = last_page_bytes.clone();
-                        let corr_id = correlation_id_for_task.clone();
-                        async move {
-                            upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
+                    ) {
+                        match retry_with_backoff("upload improvement last page", || {
+                            let client = s3_client_for_task.clone();
+                            let bucket = s3_bucket_for_task.clone();
+                            let region = aws_region_for_task.clone();
+                            let endpoint = endpoint_url_for_task.clone();
+                            let bytes = last_page_bytes.clone();
+                            let corr_id = correlation_id_for_task.clone();
+                            async move {
+                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
+                            }
+                        }).await {
+                            Ok(url) => {
+                                info!("Uploaded improvement last page SVG to S3: {}", url);
+                                Some(url)
+                            }
+                            Err(e) => {
+                                error!("Failed to upload improvement last page SVG to S3 after retries: {}", e);
+                                None
+                            }
                         }
-                    }).await {
-                        Ok(url) => {
-                            info!("Uploaded improvement last page SVG to S3: {}", url);
-                            Some(url)
-                        }
-                        Err(e) => {
-                            error!("Failed to upload improvement last page SVG to S3 after retries: {}", e);
-                            None
-                        }
+                    } else {
+                        None
                     };
 
                     let first_page_svg_url = page_svg_urls.first().cloned();
@@ -1191,34 +1166,35 @@ impl SqsProcessor {
                 }
             }
 
-            // Upload last page (unplaced/empty) for backward compatibility
+            // Upload last page (unplaced parts) only if there are unplaced parts
             let first_page_bytes = nesting_result.page_svgs.first()
                 .unwrap_or(&nesting_result.combined_svg);
-            let last_page_bytes = determine_last_page_svg(
+            let last_page_svg_url = if let Some(last_page_bytes) = determine_last_page_svg(
                 &nesting_result,
                 first_page_bytes,
-                bin_width,
-                bin_height,
-            );
-            let last_page_svg_url = match retry_with_backoff("upload final last page", || {
-                let s3_client = self.s3_client.clone();
-                let bucket = self.s3_bucket.clone();
-                let region = self.aws_region.clone();
-                let endpoint = self.endpoint_url.clone();
-                let bytes = last_page_bytes.clone();
-                let corr_id = request.correlation_id.clone();
-                async move {
-                    upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
+            ) {
+                match retry_with_backoff("upload final last page", || {
+                    let s3_client = self.s3_client.clone();
+                    let bucket = self.s3_bucket.clone();
+                    let region = self.aws_region.clone();
+                    let endpoint = self.endpoint_url.clone();
+                    let bytes = last_page_bytes.clone();
+                    let corr_id = request.correlation_id.clone();
+                    async move {
+                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
+                    }
+                }).await {
+                    Ok(url) => {
+                        info!("Uploaded final result last page SVG to S3: {}", url);
+                        Some(url)
+                    }
+                    Err(e) => {
+                        error!("Failed to upload final result last page SVG to S3 after retries: {}", e);
+                        None
+                    }
                 }
-            }).await {
-                Ok(url) => {
-                    info!("Uploaded final result last page SVG to S3: {}", url);
-                    Some(url)
-                }
-                Err(e) => {
-                    error!("Failed to upload final result last page SVG to S3 after retries: {}", e);
-                    None
-                }
+            } else {
+                None
             };
 
             let first_page_svg_url = page_svg_urls.first().cloned();
