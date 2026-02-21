@@ -5,7 +5,7 @@ on:
     tags:
       - 'live-v[0-9]+.[0-9]+.[0-9]+'
     branches:
-      - claude-fixes
+      - array
       - main
   workflow_dispatch:
 
@@ -52,7 +52,7 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
       - name: Push staging tag for staging branch
-        if: github.ref == 'refs/heads/claude-fixes'
+        if: github.ref == 'refs/heads/array'
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    if: github.ref == 'refs/heads/claude-fixes'
+    if: github.ref == 'refs/heads/array'
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
