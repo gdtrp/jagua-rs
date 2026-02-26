@@ -80,7 +80,7 @@ pub struct SqsNestingRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parts: Option<Vec<SvgPartSpec>>,
     /// Number of rotations to try (default: 8)
-    #[serde(default = "default_rotations")]
+    #[serde(default = "default_rotations", deserialize_with = "deserialize_rotations_or_default")]
     pub amount_of_rotations: usize,
     /// Output queue URL for results (falls back to default if omitted)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,6 +106,15 @@ fn current_timestamp() -> u64 {
 
 fn default_rotations() -> usize {
     8
+}
+
+/// Deserializes `amount_of_rotations` treating both absent and explicit `null` as the default (8).
+/// Needed because cancellation requests send `"amountOfRotations": null` rather than omitting the field.
+fn deserialize_rotations_or_default<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<usize>::deserialize(deserializer).map(|opt| opt.unwrap_or_else(default_rotations))
 }
 
 /// Helper to safely lock a mutex, recovering from poison errors
@@ -1663,6 +1672,22 @@ mod tests {
 
         let request: SqsNestingRequest = serde_json::from_str(request_json).unwrap();
         assert_eq!(request.cancelled, true, "cancelled should be true when set");
+    }
+
+    #[test]
+    fn test_sqs_nesting_request_cancelled_with_null_fields() {
+        // Reproduces the production error: cancellation requests arrive with all fields
+        // set to null rather than omitted. The deserializer must handle explicit nulls.
+        let request_json = r#"{"correlationId":"9abdb358-35fd-4dbf-ba06-1ae9023a4512","binWidth":null,"binHeight":null,"spacing":null,"amountOfRotations":null,"cancelled":true,"parts":null}"#;
+
+        let request: SqsNestingRequest = serde_json::from_str(request_json).unwrap();
+        assert!(request.cancelled);
+        assert_eq!(request.correlation_id, "9abdb358-35fd-4dbf-ba06-1ae9023a4512");
+        assert_eq!(request.amount_of_rotations, 8, "null amountOfRotations should default to 8");
+        assert!(request.bin_width.is_none());
+        assert!(request.bin_height.is_none());
+        assert!(request.spacing.is_none());
+        assert!(request.parts.is_none());
     }
 
     #[tokio::test]
