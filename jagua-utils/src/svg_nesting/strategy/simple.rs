@@ -201,7 +201,7 @@ impl NestingStrategy for SimpleNestingStrategy {
                 prng_seed: Some(seed),
                 n_samples: 200000,
                 ls_frac: 0.2,
-                narrow_concavity_cutoff_ratio: None,
+                narrow_concavity_cutoff: None,
                 svg_draw_options: Default::default(),
             };
 

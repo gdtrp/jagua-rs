@@ -116,8 +116,8 @@ impl AdaptiveNestingStrategy {
                 min_item_separation: Some(spacing),
                 prng_seed: Some(seed),
                 n_samples: placements,
-                ls_frac: 0.2,
-                narrow_concavity_cutoff_ratio: None,
+                ls_frac: 0.3,
+                narrow_concavity_cutoff: None,
                 svg_draw_options: Default::default(),
             };
 
@@ -434,18 +434,18 @@ impl NestingStrategy for AdaptiveNestingStrategy {
 
         // Adaptive optimization loop
         let optimization_start = Instant::now();
-        let mut loops = 1;
-        let mut placements = 10000;
+        let mut loops = 3;
+        let mut placements = 50000;
 
         let mut best_result: Option<NestingResult> = None;
         let mut best_placed = 0;
         let mut best_pages = usize::MAX;
         let mut total_runs = 0;
-        const MAX_TOTAL_RUNS: usize = 40;
-        const MAX_RUNS_WITHOUT_IMPROVEMENT: usize = 10;
-        const MAX_RUN_DURATION_SECONDS: u64 = 60;
+        const MAX_TOTAL_RUNS: usize = 60;
+        const MAX_RUNS_WITHOUT_IMPROVEMENT: usize = 15;
+        const MAX_RUN_DURATION_SECONDS: u64 = 120;
         const MAX_TOTAL_OPTIMIZATION_SECONDS: u64 = 600;
-        const HIGH_DENSITY_THRESHOLD: f32 = 0.50;
+        const HIGH_DENSITY_THRESHOLD: f32 = 0.65;
 
         'outer: loop {
             let elapsed_total = optimization_start.elapsed().as_secs();
@@ -686,8 +686,8 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             }
 
             if !improved_this_batch {
-                loops += 1;
-                placements = (placements * 2).min(200000);
+                loops += 2;
+                placements = (placements * 2).min(500000);
                 log::info!(
                     "No improvement after {} runs, increasing parameters: loops={}, placements={}",
                     MAX_RUNS_WITHOUT_IMPROVEMENT,
