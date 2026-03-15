@@ -99,7 +99,7 @@ pub struct ExtPlacedItem {
 /// Represents a proper rigid transformation defined as a rotation followed by translation
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ExtTransformation {
-    /// The rotation angle in radians
+    /// The rotation angle in degrees
     pub rotation: f32,
     /// The translation vector (x, y)
     pub translation: (f32, f32),
