@@ -679,4 +679,65 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             }
         }
     }
+
+    /// Regression test for high item count nesting (600 copies of a complex guitar SVG).
+    /// Previously this would timeout after 10 minutes because each copy created a separate
+    /// Item object with expensive surrogate generation. Now uses quantity-based items
+    /// (1 Item with qty=600) and scaled-down sample counts for large item counts.
+    #[test]
+    fn test_high_item_count_guitar_completes_in_time() {
+        let _ = env_logger::try_init();
+
+        let guitar_svg_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("jagua-sqs-processor/tests/testdata/guitar.svg");
+        let guitar_svg = std::fs::read(&guitar_svg_path)
+            .unwrap_or_else(|e| panic!("Failed to read guitar.svg at {}: {}", guitar_svg_path.display(), e));
+
+        let strategy = AdaptiveNestingStrategy::new();
+        let start = Instant::now();
+
+        let parts = vec![PartInput {
+            svg_bytes: guitar_svg,
+            count: 600,
+            item_id: None,
+        }];
+
+        let result = strategy.nest(
+            1250.0,  // bin_width
+            2500.0,  // bin_height
+            0.1,     // spacing
+            &parts,
+            4,       // amount_of_rotations
+            None,
+        );
+
+        let duration = start.elapsed();
+
+        assert!(result.is_ok(), "Guitar nesting should succeed: {:?}", result.err());
+        let nesting_result = result.unwrap();
+
+        // Must place at least some parts
+        assert!(
+            nesting_result.parts_placed > 0,
+            "Should place at least 1 guitar"
+        );
+
+        // Must complete within 5 minutes (was timing out at 10 minutes before the fix)
+        assert!(
+            duration.as_secs() < 300,
+            "600 guitars should complete within 5 minutes, took {} seconds",
+            duration.as_secs()
+        );
+
+        println!(
+            "Guitar 600x test: placed {}/{} parts with {:.1}% utilisation in {:.2}s on {} pages",
+            nesting_result.parts_placed,
+            nesting_result.total_parts_requested,
+            nesting_result.utilisation * 100.0,
+            duration.as_secs_f64(),
+            nesting_result.pages.len()
+        );
+    }
 }

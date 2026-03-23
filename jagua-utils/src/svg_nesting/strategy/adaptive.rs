@@ -399,25 +399,24 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             RotationRange::Discrete(rotations)
         };
 
-        // Create items with consecutive IDs across all parts, tracking item_id → part_index and item_id → part_id
-        let mut items = Vec::with_capacity(total_parts_requested);
-        let mut item_id_to_part_idx: Vec<usize> = Vec::with_capacity(total_parts_requested);
-        let mut item_id_to_part_id: Vec<Option<String>> = Vec::with_capacity(total_parts_requested);
+        // Create one Item per part type with quantity = count.
+        // This avoids expensive surrogate generation for each individual copy.
+        let mut items = Vec::with_capacity(parsed_parts.len());
+        let mut item_id_to_part_idx: Vec<usize> = Vec::with_capacity(parsed_parts.len());
+        let mut item_id_to_part_id: Vec<Option<String>> = Vec::with_capacity(parsed_parts.len());
         let mut item_id = 0;
         for (part_idx, parsed) in parsed_parts.iter().enumerate() {
-            for _ in 0..parsed.count {
-                let item = Item::new(
-                    item_id,
-                    parsed.item_shape.clone(),
-                    rotation_range.clone(),
-                    None,
-                    cde_config.item_surrogate_config,
-                )?;
-                items.push((item, 1));
-                item_id_to_part_idx.push(part_idx);
-                item_id_to_part_id.push(parsed.item_id.clone());
-                item_id += 1;
-            }
+            let item = Item::new(
+                item_id,
+                parsed.item_shape.clone(),
+                rotation_range.clone(),
+                None,
+                cde_config.item_surrogate_config,
+            )?;
+            items.push((item, parsed.count));
+            item_id_to_part_idx.push(part_idx);
+            item_id_to_part_id.push(parsed.item_id.clone());
+            item_id += 1;
         }
 
         // Build per-item holes mapping (item_id → holes slice)
@@ -434,8 +433,20 @@ impl NestingStrategy for AdaptiveNestingStrategy {
 
         // Adaptive optimization loop
         let optimization_start = Instant::now();
-        let mut loops = 3;
-        let mut placements = 50000;
+        // For high item counts, scale down loops and samples to keep total work per run manageable.
+        const HIGH_COUNT_SAMPLE_BUDGET: usize = 2_000_000;
+        let base_placements: usize = 50000;
+        let mut loops;
+        let mut placements;
+        if total_parts_requested > 50 {
+            loops = 1.max(50 / total_parts_requested);
+            placements = (HIGH_COUNT_SAMPLE_BUDGET / (total_parts_requested * loops).max(1))
+                .max(1000)
+                .min(base_placements);
+        } else {
+            loops = 3;
+            placements = base_placements;
+        }
 
         let mut best_result: Option<NestingResult> = None;
         let mut best_placed = 0;
@@ -522,14 +533,13 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                 };
 
                 let run_duration = run_start.elapsed();
-                if run_duration.as_secs() > MAX_RUN_DURATION_SECONDS {
+                let run_exceeded_time_limit = run_duration.as_secs() > MAX_RUN_DURATION_SECONDS;
+                if run_exceeded_time_limit {
                     log::warn!(
-                        "Run took {} seconds, exceeding limit of {} seconds. Stopping.",
+                        "Run took {} seconds, exceeding limit of {} seconds. Will stop after processing result.",
                         run_duration.as_secs(),
                         MAX_RUN_DURATION_SECONDS
                     );
-                    should_stop_due_to_timeout = true;
-                    break;
                 }
 
                 let mut result = self.generate_svg_from_solution(
@@ -668,6 +678,12 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     return Ok(best_result.unwrap_or(result));
                 }
 
+                if run_exceeded_time_limit {
+                    log::info!("Stopping adaptive optimization due to run timeout");
+                    should_stop_due_to_timeout = true;
+                    break;
+                }
+
                 if self.is_cancelled() {
                     log::info!("Cancellation detected after completing run, stopping optimization");
                     cancelled = true;
@@ -687,7 +703,15 @@ impl NestingStrategy for AdaptiveNestingStrategy {
 
             if !improved_this_batch {
                 loops += 2;
-                placements = (placements * 2).min(500000);
+                // Cap placements so total work per run stays bounded
+                let max_placements = if total_parts_requested > 50 {
+                    (HIGH_COUNT_SAMPLE_BUDGET / (total_parts_requested * loops).max(1))
+                        .max(1000)
+                        .min(500000)
+                } else {
+                    500000
+                };
+                placements = (placements * 2).min(max_placements);
                 log::info!(
                     "No improvement after {} runs, increasing parameters: loops={}, placements={}",
                     MAX_RUNS_WITHOUT_IMPROVEMENT,

@@ -157,25 +157,24 @@ impl NestingStrategy for SimpleNestingStrategy {
             RotationRange::Discrete(rotations)
         };
 
-        // Create items with consecutive IDs across all parts
-        let mut items = Vec::with_capacity(total_parts_requested);
-        let mut item_id_to_part_idx: Vec<usize> = Vec::with_capacity(total_parts_requested);
-        let mut item_id_to_part_id: Vec<Option<String>> = Vec::with_capacity(total_parts_requested);
+        // Create one Item per part type with quantity = count.
+        // This avoids expensive surrogate generation for each individual copy.
+        let mut items = Vec::with_capacity(parsed_parts.len());
+        let mut item_id_to_part_idx: Vec<usize> = Vec::with_capacity(parsed_parts.len());
+        let mut item_id_to_part_id: Vec<Option<String>> = Vec::with_capacity(parsed_parts.len());
         let mut item_id = 0;
         for (part_idx, parsed) in parsed_parts.iter().enumerate() {
-            for _ in 0..parsed.count {
-                let item = Item::new(
-                    item_id,
-                    parsed.item_shape.clone(),
-                    rotation_range.clone(),
-                    None,
-                    cde_config.item_surrogate_config,
-                )?;
-                items.push((item, 1));
-                item_id_to_part_idx.push(part_idx);
-                item_id_to_part_id.push(parsed.item_id.clone());
-                item_id += 1;
-            }
+            let item = Item::new(
+                item_id,
+                parsed.item_shape.clone(),
+                rotation_range.clone(),
+                None,
+                cde_config.item_surrogate_config,
+            )?;
+            items.push((item, parsed.count));
+            item_id_to_part_idx.push(part_idx);
+            item_id_to_part_id.push(parsed.item_id.clone());
+            item_id += 1;
         }
 
         // Build per-item holes mapping
