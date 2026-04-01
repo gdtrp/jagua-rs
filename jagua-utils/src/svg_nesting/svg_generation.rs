@@ -22,6 +22,10 @@ pub struct PlacedPartInfo {
     pub y: f32,
     /// Rotation in degrees.
     pub rotation: f32,
+    /// Centroid X of the placed shape in bin coordinates.
+    pub centroid_x: f32,
+    /// Centroid Y of the placed shape in bin coordinates.
+    pub centroid_y: f32,
 }
 
 /// Per-page result grouping utilisation, placements, and optional SVG URL for a single sheet.

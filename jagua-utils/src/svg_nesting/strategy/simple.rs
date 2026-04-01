@@ -126,6 +126,51 @@ impl NestingStrategy for SimpleNestingStrategy {
 
         let total_parts_requested: usize = parsed_parts.iter().map(|p| p.count).sum();
 
+        // Validate that each part can physically fit inside the bin (accounting for spacing)
+        let effective_bin_w = bin_width - spacing;
+        let effective_bin_h = bin_height - spacing;
+        if effective_bin_w <= 0.0 || effective_bin_h <= 0.0 {
+            anyhow::bail!(
+                "Bin ({:.2} x {:.2}) is too small for the given spacing ({:.2}). \
+                 Effective bin dimensions would be {:.2} x {:.2}. \
+                 Please increase the bin dimensions or reduce the spacing.",
+                bin_width,
+                bin_height,
+                spacing,
+                effective_bin_w,
+                effective_bin_h,
+            );
+        }
+        for (part_idx, parsed) in parsed_parts.iter().enumerate() {
+            let bbox = &parsed.item_shape.shape.bbox;
+            let item_w = bbox.width();
+            let item_h = bbox.height();
+            let part_label = parsed
+                .item_id
+                .as_deref()
+                .map(|id| format!("'{}'", id))
+                .unwrap_or_else(|| format!("#{}", part_idx));
+
+            // Check if item fits in at least one orientation (original or rotated 90°)
+            let fits_original = item_w <= effective_bin_w && item_h <= effective_bin_h;
+            let fits_rotated = item_h <= effective_bin_w && item_w <= effective_bin_h;
+            if !fits_original && !fits_rotated {
+                anyhow::bail!(
+                    "Part {} (size {:.2} x {:.2}) is too large to fit in the bin ({:.2} x {:.2}) \
+                     with spacing {:.2} (effective bin area: {:.2} x {:.2}). \
+                     Please increase the bin dimensions or reduce the part size/spacing.",
+                    part_label,
+                    item_w,
+                    item_h,
+                    bin_width,
+                    bin_height,
+                    spacing,
+                    effective_bin_w,
+                    effective_bin_h,
+                );
+            }
+        }
+
         // Build container
         let bin_rect = Rect::try_new(0.0, 0.0, bin_width, bin_height)?;
         let bin_polygon = SPolygon::from(bin_rect);
@@ -282,12 +327,15 @@ impl NestingStrategy for SimpleNestingStrategy {
                     .cloned()
                     .flatten()
                     .unwrap_or_else(|| internal_id.to_string());
+                let centroid = placed_item.shape.centroid();
                 page_placements.push(PlacedPartInfo {
                     item_id,
                     part_index,
                     x,
                     y,
                     rotation,
+                    centroid_x: centroid.x() as f32,
+                    centroid_y: centroid.y() as f32,
                 });
             }
 

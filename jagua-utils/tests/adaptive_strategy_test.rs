@@ -226,10 +226,10 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         );
     }
 
-    /// Test that when no items can be placed (part too large for bin),
-    /// the strategy returns 0 parts placed without panicking
+    /// Test that when a part is too large for the bin, the strategy returns
+    /// a clear error message before attempting optimization
     #[test]
-    fn test_returns_zero_when_part_too_large_for_bin() {
+    fn test_returns_error_when_part_too_large_for_bin() {
         // Create a large square SVG (500x500)
         let svg = r#"<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500">
@@ -249,37 +249,43 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             None,   // no callback
         );
 
-        // Should succeed (not panic)
-        assert!(result.is_ok(), "Nesting should return Ok, not panic");
-
-        let nesting_result = result.unwrap();
-
-        // Should place 0 parts since the part doesn't fit
-        assert_eq!(
-            nesting_result.parts_placed, 0,
-            "Should place 0 parts when part is too large for bin"
-        );
-
-        // Should have empty SVG data
+        // Should return an error with a clear message
+        assert!(result.is_err(), "Nesting should return Err when part is too large for bin");
+        let err_msg = result.unwrap_err().to_string();
         assert!(
-            nesting_result.combined_svg.is_empty(),
-            "Combined SVG should be empty when no parts placed"
+            err_msg.contains("too large to fit in the bin"),
+            "Error message should explain the issue, got: {}",
+            err_msg
         );
+    }
+
+    /// Regression test: production SVG with degenerate sub-paths and bin too small.
+    /// The shape is ~10.3 x 8.1 units but the bin is only 1.25 x 2.5 with spacing 2.0.
+    #[test]
+    fn test_returns_error_when_production_svg_too_large_for_small_bin() {
+        let svg = r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="13.805789999999998 -4.328726156318617 10.323501761800273 8.085105356938667">
+  <path d="M17.36421,-1.0262799999999974 L16.41725697921187,-0.08228127372166849 L15.973899999999999,1.1808400000000085 L15.818268177161464,1.9734859138250085 L15.53704,2.730710000000001 L14.972101918584382,3.419937724660888 L14.14579,3.7537000000000003 L14.019314282062785,3.7436477730503785 L13.90831,3.682219999999997 L13.832620142460193,3.580392277025023 L13.805790000000002,3.4563799999999962 L13.80579,2.96978 L13.938693536183862,1.488117101324299 L14.331939999999998,0.0605099999999994 L14.776142829256846,-0.924473089516618 L15.35012,-1.8515599999999992 L16.774653155304694,-3.0847861734977986 L18.60579,-3.52872 L18.92117,-3.52872 L19.091668528372583,-3.4986582005690563 L19.2416,-3.4121000000000024 L19.28343,-3.37699 L19.562080090294714,-3.2615712991475916 L19.85654,-3.3268500000000043 L21.40654,-4.22174 L21.701567551990493,-4.321893457149522 L22.01246,-4.301520000000003 L22.291891091346525,-4.16371065419253 L22.497310000000002,-3.9294700000000007 L23.42106,-2.32949 L24.09075,-1.08336 L24.120453286796987,-0.8551222505490855 L23.99087,-0.664890000000002 L23.767585320075472,-0.6089856056008807 L23.56365,-0.7156999999999983 L23.10647,-1.23172 L22.50429,-1.23172 L22.50429,-0.53172 L21.80641,-0.53172 L21.20652,-1.13162 L19.47597,-1.43676 L18.382054530012695,-1.4272148235335185 L17.36421,-1.026279999999998 Z M15.34038,0.3050899999999943 L15.34038,0.7050899999999978 L15.34038,0.3050899999999943 Z M21.80579,-4.000220000000014 L21.80579,-3.060220000000002 L21.80579,-4.000220000000014 Z M14.9595,1.891560000000002 L14.9595,2.2915600000000014 L14.9595,1.891560000000002 Z" fill="#000" stroke="none" fill-rule="nonzero"/>
+</svg>"##;
+
+        let strategy = AdaptiveNestingStrategy::new();
+
+        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1, item_id: None }];
+        let result = strategy.nest(
+            1.25,   // bin_width - way too small for this shape
+            2.5,    // bin_height
+            2.0,    // spacing
+            &parts,
+            4,      // amount_of_rotations
+            None,
+        );
+
+        assert!(result.is_err(), "Should return error when part doesn't fit in bin");
+        let err_msg = result.unwrap_err().to_string();
         assert!(
-            nesting_result.page_svgs.is_empty(),
-            "Page SVGs should be empty when no parts placed"
-        );
-
-        // Utilisation should be 0
-        assert_eq!(
-            nesting_result.utilisation, 0.0,
-            "Utilisation should be 0 when no parts placed"
-        );
-
-        // total_parts_requested should still reflect the original request
-        assert_eq!(
-            nesting_result.total_parts_requested, 1,
-            "Should still report 1 part was requested"
+            err_msg.contains("too small") || err_msg.contains("too large to fit in the bin"),
+            "Error should explain the sizing issue, got: {}",
+            err_msg
         );
     }
 
