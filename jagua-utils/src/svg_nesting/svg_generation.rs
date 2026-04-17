@@ -22,9 +22,13 @@ pub struct PlacedPartInfo {
     pub y: f32,
     /// Rotation in degrees.
     pub rotation: f32,
-    /// Centroid X of the placed shape in bin coordinates.
+    /// Centroid X of the item's original shape (in the input file's coordinate system).
+    /// Constant across placements of the same item — the QCAD renderer uses this as the
+    /// part-local translation anchor.
     pub centroid_x: f32,
-    /// Centroid Y of the placed shape in bin coordinates.
+    /// Centroid Y of the item's original shape (in the input file's coordinate system).
+    /// Constant across placements of the same item — the QCAD renderer uses this as the
+    /// part-local translation anchor.
     pub centroid_y: f32,
 }
 

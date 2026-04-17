@@ -2268,3 +2268,214 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
 
     Ok(())
 }
+
+/// Real production request reproduction: 3 parts (dnishche, bokovaya panel, prodolnaya panel)
+/// from a cutl-production calculation, nested on a 1250×2500 bin with 2.0 spacing and
+/// 4 rotations. Writes page SVGs, pages.json, request.json, and response.json for
+/// visual/manual validation of the centroid fix.
+#[test]
+fn test_cutl_production_request_three_parts() -> Result<()> {
+    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingStrategy, PartInput};
+    use jagua_sqs_processor::{SqsNestingRequest, SqsNestingResponse, SvgPartSpec};
+    use std::fs;
+    use std::path::PathBuf;
+
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .try_init();
+
+    let dnishche_svg = include_bytes!("testdata/dnishche.svg").to_vec();
+    let bokovaya_svg = include_bytes!("testdata/bokovaya_panel.svg").to_vec();
+    let prodolnaya_svg = include_bytes!("testdata/prodolnaya_panel.svg").to_vec();
+
+    let item_id_dnishche = "b0239125-cc08-43a0-be61-f316ee1e727f";
+    let item_id_bokovaya = "605d7b0c-35c4-4cdf-a8ad-5511bc062690";
+    let item_id_prodolnaya = "cdcfd00f-4049-41dd-9fdb-b334d2f7d108";
+
+    let parts = vec![
+        PartInput {
+            svg_bytes: dnishche_svg,
+            count: 24,
+            item_id: Some(item_id_dnishche.to_string()),
+        },
+        PartInput {
+            svg_bytes: bokovaya_svg,
+            count: 48,
+            item_id: Some(item_id_bokovaya.to_string()),
+        },
+        PartInput {
+            svg_bytes: prodolnaya_svg,
+            count: 48,
+            item_id: Some(item_id_prodolnaya.to_string()),
+        },
+    ];
+
+    let bin_width = 1250.0_f32;
+    let bin_height = 2500.0_f32;
+    let spacing = 2.0_f32;
+    let rotations = 4_usize;
+
+    let strategy = AdaptiveNestingStrategy::new();
+    let nesting_result = strategy
+        .nest(bin_width, bin_height, spacing, &parts, rotations, None)
+        .context("Nesting should succeed")?;
+
+    assert!(nesting_result.parts_placed > 0, "Should place at least some parts");
+    assert!(!nesting_result.pages.is_empty(), "Pages should not be empty");
+    let total_placements: usize =
+        nesting_result.pages.iter().map(|p| p.placements.len()).sum();
+    assert_eq!(
+        total_placements, nesting_result.parts_placed,
+        "Number of placements should match parts_placed"
+    );
+
+    // All placements should carry a user-provided itemId (not the internal integer fallback).
+    for page in &nesting_result.pages {
+        for p in &page.placements {
+            assert!(
+                p.item_id == item_id_dnishche
+                    || p.item_id == item_id_bokovaya
+                    || p.item_id == item_id_prodolnaya,
+                "Unexpected item_id {} — should be one of the three UUIDs",
+                p.item_id
+            );
+            assert!(p.part_index < 3, "part_index {} should be < 3", p.part_index);
+        }
+    }
+
+    // Centroid should be a per-part constant (same across all placements of the same item_id),
+    // because the new code uses the item's original shape centroid (not bin-space).
+    use std::collections::HashMap;
+    let mut centroid_by_item: HashMap<String, (f32, f32)> = HashMap::new();
+    for page in &nesting_result.pages {
+        for p in &page.placements {
+            let entry = centroid_by_item
+                .entry(p.item_id.clone())
+                .or_insert((p.centroid_x, p.centroid_y));
+            assert!(
+                (entry.0 - p.centroid_x).abs() < 1e-3
+                    && (entry.1 - p.centroid_y).abs() < 1e-3,
+                "Centroid for item {} varies across placements: expected ({}, {}), got ({}, {}) — the fix should make this a per-part constant",
+                p.item_id,
+                entry.0,
+                entry.1,
+                p.centroid_x,
+                p.centroid_y,
+            );
+        }
+    }
+
+    // Write output artefacts for visual validation
+    let output_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test_output")
+        .join("cutl_production_request");
+    if output_dir.exists() {
+        fs::remove_dir_all(&output_dir).context("clean output dir")?;
+    }
+    fs::create_dir_all(&output_dir).context("create output dir")?;
+
+    for (i, page_svg) in nesting_result.page_svgs.iter().enumerate() {
+        let path = output_dir.join(format!("page-{}.svg", i));
+        fs::write(&path, page_svg).context(format!("write page-{}.svg", i))?;
+    }
+
+    if !nesting_result.combined_svg.is_empty() {
+        fs::write(output_dir.join("combined.svg"), &nesting_result.combined_svg)
+            .context("write combined.svg")?;
+    }
+
+    if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
+        fs::write(output_dir.join("unplaced.svg"), unplaced_svg)
+            .context("write unplaced.svg")?;
+    }
+
+    let pages_json = serde_json::to_string_pretty(&nesting_result.pages)
+        .context("serialize pages")?;
+    fs::write(output_dir.join("pages.json"), &pages_json).context("write pages.json")?;
+
+    // Mirror of the real SQS request that produced these inputs (URLs kept for traceability).
+    let correlation_id = "test-cutl-production-three-parts";
+    let sqs_request = SqsNestingRequest {
+        correlation_id: correlation_id.to_string(),
+        svg_base64: None,
+        svg_url: None,
+        bin_width: Some(bin_width),
+        bin_height: Some(bin_height),
+        spacing: Some(spacing),
+        amount_of_parts: None,
+        parts: Some(vec![
+            SvgPartSpec {
+                item_id: item_id_dnishche.to_string(),
+                svg_url: "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/18502bca-89ce-4fd8-8102-41182ddeae22/result.svg".to_string(),
+                amount_of_parts: 24,
+            },
+            SvgPartSpec {
+                item_id: item_id_bokovaya.to_string(),
+                svg_url: "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/d490d094-8659-48b9-af3d-8cca28b52fdf/result.svg".to_string(),
+                amount_of_parts: 48,
+            },
+            SvgPartSpec {
+                item_id: item_id_prodolnaya.to_string(),
+                svg_url: "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/07295e53-e6a6-48ed-948b-901214aa3ceb/result.svg".to_string(),
+                amount_of_parts: 48,
+            },
+        ]),
+        amount_of_rotations: rotations,
+        output_queue_url: None,
+        cancelled: false,
+    };
+    fs::write(
+        output_dir.join("request.json"),
+        serde_json::to_string_pretty(&sqs_request).context("serialize SQS request")?,
+    )
+    .context("write request.json")?;
+
+    // Build the full SQS response with placements and centroids
+    let page_svg_urls: Vec<String> = (0..nesting_result.page_svgs.len())
+        .map(|i| format!("https://s3.example.com/nesting/{}/page-{}.svg", correlation_id, i))
+        .collect();
+    let mut response_pages = nesting_result.pages.clone();
+    for (i, page) in response_pages.iter_mut().enumerate() {
+        page.svg_url = Some(page_svg_urls[i].clone());
+    }
+    let sqs_response = SqsNestingResponse {
+        correlation_id: correlation_id.to_string(),
+        first_page_svg_url: page_svg_urls.first().cloned(),
+        last_page_svg_url: page_svg_urls.last().cloned(),
+        sheets: Some(response_pages.len()),
+        page_svg_urls: Some(page_svg_urls),
+        pages: Some(response_pages),
+        parts_placed: nesting_result.parts_placed,
+        utilisation: nesting_result.utilisation,
+        is_improvement: false,
+        is_final: true,
+        timestamp: 1700000000,
+        error_message: None,
+    };
+    fs::write(
+        output_dir.join("response.json"),
+        serde_json::to_string_pretty(&sqs_response).context("serialize SQS response")?,
+    )
+    .context("write response.json")?;
+
+    println!("\nCutl production request test summary:");
+    println!("  Bin: {}×{}, spacing {}, rotations {}", bin_width, bin_height, spacing, rotations);
+    println!(
+        "  Parts requested: {} (dnishche: 24, bokovaya: 48, prodolnaya: 48)",
+        nesting_result.total_parts_requested
+    );
+    println!("  Parts placed: {}", nesting_result.parts_placed);
+    println!("  Pages: {}", nesting_result.pages.len());
+    println!("  Utilisation: {:.1}%", nesting_result.utilisation * 100.0);
+    println!("  Output dir: {}", output_dir.display());
+    for page in &nesting_result.pages {
+        println!(
+            "  Page {}: {} items, utilisation {:.1}%",
+            page.page_index,
+            page.placements.len(),
+            page.utilisation * 100.0
+        );
+    }
+
+    Ok(())
+}

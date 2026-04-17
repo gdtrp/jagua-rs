@@ -9,7 +9,7 @@ use crate::svg_nesting::{
 };
 use anyhow::Result;
 use jagua_rs::collision_detection::CDEConfig;
-use jagua_rs::entities::{Container, Item, Layout};
+use jagua_rs::entities::{Container, Instance, Item, Layout};
 use jagua_rs::geometry::DTransformation;
 use jagua_rs::geometry::OriginalShape;
 use jagua_rs::geometry::fail_fast::SPSurrogateConfig;
@@ -223,7 +223,7 @@ impl AdaptiveNestingStrategy {
                     .cloned()
                     .flatten()
                     .unwrap_or_else(|| internal_id.to_string());
-                let centroid = placed_item.shape.centroid();
+                let centroid = instance.item(internal_id).shape_orig.centroid();
                 page_placements.push(PlacedPartInfo {
                     item_id,
                     part_index,
@@ -603,7 +603,6 @@ impl NestingStrategy for AdaptiveNestingStrategy {
 
                 // Handle unplaced parts SVG generation
                 if result.parts_placed < total_parts_requested {
-                    use jagua_rs::entities::Instance;
                     let mut unplaced_layout = Layout::new(container_template.clone());
                     let unplaced_count = total_parts_requested - result.parts_placed;
 
