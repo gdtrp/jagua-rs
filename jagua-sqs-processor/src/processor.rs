@@ -809,8 +809,11 @@ impl SqsProcessor {
             .await;
 
         if let Err(e) = &result {
-            let error_msg = format!("{}", e);
-            error!("Failed to process message: {}", error_msg);
+            let error_msg = format!("{:#}", e);
+            error!(
+                "Failed to process message for correlation_id={}: {:?}",
+                request.correlation_id, e
+            );
 
             // Send error response for internal processing errors
             let error_response = SqsNestingResponse {
