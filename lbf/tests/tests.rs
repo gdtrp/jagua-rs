@@ -130,6 +130,14 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_rejects_self_intersecting_polygon() -> Result<()> {
+        let ext_instance = read_spp_instance(Path::new("../assets/self_intersecting.json"))?;
+
+        assert!(spp::io::import_instance(&importer(), &ext_instance).is_err());
+        Ok(())
+    }
+
     fn config() -> LBFConfig {
         LBFConfig {
             n_samples: 100,
