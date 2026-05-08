@@ -5,7 +5,9 @@ use crate::svg_nesting::{
         calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
     },
     strategy::{NestingStrategy, PartInput, is_single_part_type},
-    svg_generation::{PageResult, PlacedPartInfo, combine_svg_documents, NestingResult, post_process_svg_multi},
+    svg_generation::{
+        NestingResult, PageResult, PlacedPartInfo, combine_svg_documents, post_process_svg_multi,
+    },
 };
 use anyhow::Result;
 use jagua_rs::collision_detection::CDEConfig;
@@ -67,7 +69,7 @@ impl NestingStrategy for SimpleNestingStrategy {
             },
         };
 
-        let importer = Importer::new(cde_config.clone(), Some(0.001), Some(spacing), None);
+        let importer = Importer::new(cde_config, Some(0.001), Some(spacing), None);
 
         let mut parsed_parts = Vec::with_capacity(parts.len());
         for (part_idx, part) in parts.iter().enumerate() {
@@ -181,14 +183,14 @@ impl NestingStrategy for SimpleNestingStrategy {
             modify_config: importer.shape_modify_config,
         };
 
-        let container_template = Container::new(0, container_shape, vec![], cde_config.clone())?;
+        let container_template = Container::new(0, container_shape, vec![], cde_config)?;
 
         // Build rotation range
         const MAX_ROTATIONS: usize = 4;
         let rotation_count = if amount_of_rotations == 0 {
             0
         } else {
-            amount_of_rotations.max(1).min(MAX_ROTATIONS)
+            amount_of_rotations.clamp(1, MAX_ROTATIONS)
         };
 
         let rotation_range = if rotation_count == 0 {
@@ -207,10 +209,9 @@ impl NestingStrategy for SimpleNestingStrategy {
         let mut items = Vec::with_capacity(parsed_parts.len());
         let mut item_id_to_part_idx: Vec<usize> = Vec::with_capacity(parsed_parts.len());
         let mut item_id_to_part_id: Vec<Option<String>> = Vec::with_capacity(parsed_parts.len());
-        let mut item_id = 0;
         for (part_idx, parsed) in parsed_parts.iter().enumerate() {
             let item = Item::new(
-                item_id,
+                part_idx,
                 parsed.item_shape.clone(),
                 rotation_range.clone(),
                 None,
@@ -219,7 +220,6 @@ impl NestingStrategy for SimpleNestingStrategy {
             items.push((item, parsed.count));
             item_id_to_part_idx.push(part_idx);
             item_id_to_part_id.push(parsed.item_id.clone());
-            item_id += 1;
         }
 
         // Build per-item holes mapping
@@ -239,7 +239,7 @@ impl NestingStrategy for SimpleNestingStrategy {
 
         for seed in 0..10 {
             let lbf_config = LBFConfig {
-                cde_config: cde_config.clone(),
+                cde_config,
                 poly_simpl_tolerance: Some(0.001),
                 min_item_separation: Some(spacing),
                 prng_seed: Some(seed),
@@ -323,7 +323,8 @@ impl NestingStrategy for SimpleNestingStrategy {
                 let rotation = placed_item.d_transf.rotation().to_degrees();
                 let internal_id = placed_item.item_id;
                 let part_index = item_id_to_part_idx.get(internal_id).copied().unwrap_or(0);
-                let item_id = item_id_to_part_id.get(internal_id)
+                let item_id = item_id_to_part_id
+                    .get(internal_id)
                     .cloned()
                     .flatten()
                     .unwrap_or_else(|| internal_id.to_string());
@@ -373,11 +374,15 @@ impl NestingStrategy for SimpleNestingStrategy {
             let part_width = part_bbox.width();
             let part_height = part_bbox.height();
 
-            let cols = ((bin_width - spacing) / (part_width + spacing)).floor().max(1.0) as usize;
+            let cols = ((bin_width - spacing) / (part_width + spacing))
+                .floor()
+                .max(1.0) as usize;
             let rows = ((unplaced_count as f32 / cols as f32).ceil()) as usize;
 
-            let total_grid_width = (cols as f32 * part_width) + ((cols.saturating_sub(1)) as f32 * spacing);
-            let total_grid_height = (rows as f32 * part_height) + ((rows.saturating_sub(1)) as f32 * spacing);
+            let total_grid_width =
+                (cols as f32 * part_width) + ((cols.saturating_sub(1)) as f32 * spacing);
+            let total_grid_height =
+                (rows as f32 * part_height) + ((rows.saturating_sub(1)) as f32 * spacing);
             let offset_x = (bin_width - total_grid_width) / 2.0;
             let offset_y = (bin_height - total_grid_height) / 2.0;
 
@@ -393,8 +398,10 @@ impl NestingStrategy for SimpleNestingStrategy {
             }
 
             let unplaced_snapshot = unplaced_layout.save();
-            let mut svg_options = SvgDrawOptions::default();
-            svg_options.highlight_cd_shapes = false;
+            let svg_options = SvgDrawOptions {
+                highlight_cd_shapes: false,
+                ..SvgDrawOptions::default()
+            };
             let unplaced_svg_doc = s_layout_to_svg(
                 &unplaced_snapshot,
                 &instance,
@@ -402,7 +409,8 @@ impl NestingStrategy for SimpleNestingStrategy {
                 &format!("Unplaced parts: {}", unplaced_count),
             );
             let unplaced_svg_str = unplaced_svg_doc.to_string();
-            let processed_unplaced_svg = post_process_svg_multi(&unplaced_svg_str, &item_id_to_holes);
+            let processed_unplaced_svg =
+                post_process_svg_multi(&unplaced_svg_str, &item_id_to_holes);
             Some(processed_unplaced_svg.into_bytes())
         } else {
             None

@@ -32,3 +32,9 @@ tokio-test = "0.4"
 mockall = "0.12"
 regex = "1"
 
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"

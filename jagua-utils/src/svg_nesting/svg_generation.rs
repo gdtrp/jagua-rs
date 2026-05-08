@@ -1,10 +1,9 @@
 //! SVG generation and post-processing utilities
 
 use anyhow::Result;
-use jagua_rs::geometry::primitives::{Point, SPolygon};
-use jagua_rs::geometry::DTransformation;
-use jagua_rs::geometry::geo_traits::Transformable;
 use jagua_rs::geometry::OriginalShape;
+use jagua_rs::geometry::geo_traits::Transformable;
+use jagua_rs::geometry::primitives::{Point, SPolygon};
 use serde::{Deserialize, Serialize};
 
 /// Per-item placement data describing where a part was placed.
@@ -86,7 +85,9 @@ pub fn points_to_svg_path(points: &[Point]) -> String {
 /// - Changes item fill color to white
 /// - Changes stroke color to gray
 /// - Makes holes transparent
+///
 /// Note: Holes should be in the original coordinate system (same as outer boundary in item definition)
+#[allow(dead_code)]
 pub fn post_process_svg(svg_str: &str, holes: &[Vec<Point>]) -> String {
     use regex::Regex;
 
@@ -176,6 +177,7 @@ pub fn post_process_svg(svg_str: &str, holes: &[Vec<Point>]) -> String {
 ///
 /// # Returns
 /// SVG string with unplaced parts arranged in a grid
+#[allow(dead_code)]
 pub fn generate_unplaced_parts_svg(
     unplaced_count: usize,
     item_shape_orig: &OriginalShape,
@@ -211,14 +213,17 @@ pub fn generate_unplaced_parts_svg(
     let part_bbox = &item_shape_orig.shape.bbox;
     let part_width = part_bbox.width();
     let part_height = part_bbox.height();
-    
+
     // Calculate how many parts fit per row/column
-    let cols = ((bin_width - spacing) / (part_width + spacing)).floor().max(1.0) as usize;
+    let cols = ((bin_width - spacing) / (part_width + spacing))
+        .floor()
+        .max(1.0) as usize;
     let rows = ((unplaced_count as f32 / cols as f32).ceil()) as usize;
-    
+
     // Adjust spacing to center the grid
     let total_grid_width = (cols as f32 * part_width) + ((cols.saturating_sub(1)) as f32 * spacing);
-    let total_grid_height = (rows as f32 * part_height) + ((rows.saturating_sub(1)) as f32 * spacing);
+    let total_grid_height =
+        (rows as f32 * part_height) + ((rows.saturating_sub(1)) as f32 * spacing);
     let offset_x = (bin_width - total_grid_width) / 2.0;
     let offset_y = (bin_height - total_grid_height) / 2.0;
 
@@ -232,25 +237,30 @@ pub fn generate_unplaced_parts_svg(
     // The item definition should be centered at origin, then we translate to grid positions
     let pre_transform = item_shape_orig.pre_transform.compose();
     let inverse_pre_transform = pre_transform.inverse();
-    let centered_shape = item_shape_orig.shape.transform_clone(&inverse_pre_transform);
+    let centered_shape = item_shape_orig
+        .shape
+        .transform_clone(&inverse_pre_transform);
     let item_path_data = polygon_to_svg_path(&centered_shape);
-    
+
     // Calculate viewBox similar to s_layout_to_svg (with 10% padding)
     let viewbox_padding = 0.1;
     let viewbox_x = -bin_width * viewbox_padding;
     let viewbox_y = -bin_height * viewbox_padding;
     let viewbox_width = bin_width * (1.0 + 2.0 * viewbox_padding);
     let viewbox_height = bin_height * (1.0 + 2.0 * viewbox_padding);
-    
+
     let mut svg = String::new();
     svg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    svg.push_str(&format!("<svg viewBox=\"{} {} {} {}\" xmlns=\"http://www.w3.org/2000/svg\">\n", viewbox_x, viewbox_y, viewbox_width, viewbox_height));
-    
+    svg.push_str(&format!(
+        "<svg viewBox=\"{} {} {} {}\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+        viewbox_x, viewbox_y, viewbox_width, viewbox_height
+    ));
+
     // Container group (matching s_layout_to_svg structure)
     svg.push_str("  <g id=\"container_0\">\n");
     svg.push_str(&format!("    <path d=\"M 0,0 L {},0 L {},{} L 0,{} z\" fill=\"transparent\" stroke=\"black\" stroke-width=\"{}\"/>\n", bin_width, bin_width, bin_height, bin_height, stroke_width * 2.0));
     svg.push_str("  </g>\n");
-    
+
     // Items group (matching s_layout_to_svg structure)
     svg.push_str("  <g id=\"items\">\n");
     svg.push_str("    <defs>\n");
@@ -264,17 +274,20 @@ pub fn generate_unplaced_parts_svg(
     for i in 0..unplaced_count {
         let row = i / cols;
         let col = i % cols;
-        
+
         // Calculate grid position (center of grid cell) in bin coordinates
         let grid_x = offset_x + (col as f32 * (part_width + spacing)) + part_width / 2.0;
         let grid_y = offset_y + (row as f32 * (part_height + spacing)) + part_height / 2.0;
-        
+
         // Since the item definition is centered at origin, we just translate to grid position
-        svg.push_str(&format!("    <use href=\"#item_0\" transform=\"translate({} {})\"/>\n", grid_x, grid_y));
+        svg.push_str(&format!(
+            "    <use href=\"#item_0\" transform=\"translate({} {})\"/>\n",
+            grid_x, grid_y
+        ));
     }
-    
+
     svg.push_str("  </g>\n");
-    
+
     // Add empty groups to match structure
     svg.push_str("  <g id=\"quality_zones\"/>\n");
     svg.push_str("  <g id=\"optionals\">\n");
@@ -284,7 +297,7 @@ pub fn generate_unplaced_parts_svg(
     svg.push_str("    </g>\n");
     svg.push_str("    <g id=\"collision_lines\"/>\n");
     svg.push_str("  </g>\n");
-    
+
     // Add label text (matching s_layout_to_svg)
     svg.push_str(&format!("  <text font-family=\"monospace\" font-size=\"{}\" font-weight=\"500\" x=\"0\" y=\"-15\">Unplaced parts: {}</text>\n", bin_width * 0.025, unplaced_count));
 
@@ -333,8 +346,7 @@ pub fn post_process_svg_multi(svg_str: &str, item_id_to_holes: &[&[Vec<Point>]])
         .to_string();
 
     // For each item definition, add the correct holes based on item ID
-    let re_item =
-        Regex::new(r##"(<g id="item_(\d+)">\s*<path d=")([^"]+)(" [^>]*/>)"##).unwrap();
+    let re_item = Regex::new(r##"(<g id="item_(\d+)">\s*<path d=")([^"]+)(" [^>]*/>)"##).unwrap();
 
     result = re_item
         .replace_all(&result, |caps: &regex::Captures| -> String {
@@ -367,18 +379,18 @@ pub fn post_process_svg_multi(svg_str: &str, item_id_to_holes: &[&[Vec<Point>]])
 /// Removes XML declaration and root <svg> tags, returning just the content
 fn extract_svg_inner_content(svg_str: &str) -> String {
     use regex::Regex;
-    
+
     // Remove XML declaration if present
     let re_xml_decl = Regex::new(r##"<\?xml[^>]*\?>\s*"##).unwrap();
     let mut content = re_xml_decl.replace_all(svg_str, "").to_string();
-    
+
     // Extract content between <svg> and </svg> tags
     // Match opening <svg> tag (with all attributes) and capture everything until closing </svg>
     let re_svg_content = Regex::new(r##"(?s)<svg[^>]*>(.*)</svg>"##).unwrap();
     if let Some(caps) = re_svg_content.captures(&content) {
         content = caps.get(1).unwrap().as_str().to_string();
     }
-    
+
     content
 }
 
@@ -410,12 +422,13 @@ pub fn combine_svg_documents(svg_documents: &[String], bin_width: f32, bin_heigh
 }
 
 /// Converts an SPolygon to SVG path data
+#[allow(dead_code)]
 fn polygon_to_svg_path(polygon: &SPolygon) -> String {
     let vertices = &polygon.vertices;
     if vertices.is_empty() {
         return String::new();
     }
-    
+
     let mut path = format!("M {},{}", vertices[0].0, vertices[0].1);
     for vertex in vertices.iter().skip(1) {
         path.push_str(&format!(" L {},{}", vertex.0, vertex.1));
