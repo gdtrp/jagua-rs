@@ -10,7 +10,7 @@ use anyhow::Result;
 #[derive(Clone, Debug)]
 /// A [`SPolygon`] exactly as is defined in the input file
 ///
-/// Also contains all required operation to convert it to a shape that can be used internally.
+/// Also contains all required operations to convert it to a shape that can be used internally.
 /// Currently, these are centering and simplification operations, but could be extended in the future.
 pub struct OriginalShape {
     pub shape: SPolygon,
