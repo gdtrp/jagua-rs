@@ -6,17 +6,8 @@ mod simple;
 pub use adaptive::AdaptiveNestingStrategy;
 pub use simple::SimpleNestingStrategy;
 
-use crate::svg_nesting::parsing::{
-    calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path,
-};
 use crate::svg_nesting::svg_generation::NestingResult;
 use anyhow::Result;
-
-/// Sanity ceiling on the upper-bound count when computing max_fit.
-const MAX_FIT_HARD_CAP: usize = 10_000;
-
-/// Slack multiplier applied to the area-based upper-bound count for max_fit.
-const MAX_FIT_AREA_SLACK: f32 = 1.5;
 
 /// A single part type with its SVG bytes and count
 #[derive(Debug, Clone)]
@@ -67,13 +58,14 @@ pub trait NestingStrategy: Send + Sync {
     ) -> Result<NestingResult>;
 }
 
-/// Compute the maximum number of copies of a single part that fit on one sheet.
+/// Pack as many copies of a single part as possible onto one sheet.
 ///
-/// The strategy is invoked with a generous upper-bound count (derived from
-/// `bin_area / part_area * MAX_FIT_AREA_SLACK`, capped at `MAX_FIT_HARD_CAP`),
-/// then the resulting `NestingResult` is truncated to its first page.
+/// Thin wrapper around [`AdaptiveNestingStrategy::nest_max_fit`] kept for
+/// backwards compatibility with existing callers. Forces single-bin packing
+/// inside the strategy so the optimiser concentrates on bin-0 density rather
+/// than spilling overflow onto subsequent bins.
 pub fn nest_max_fit_single_sheet(
-    strategy: &dyn NestingStrategy,
+    strategy: &AdaptiveNestingStrategy,
     bin_width: f32,
     bin_height: f32,
     spacing: f32,
@@ -81,65 +73,12 @@ pub fn nest_max_fit_single_sheet(
     amount_of_rotations: usize,
     improvement_callback: Option<ImprovementCallback>,
 ) -> Result<NestingResult> {
-    let path_data = extract_path_from_svg_bytes(&part.svg_bytes)?;
-    let (polygon_points, _holes) = parse_svg_path(&path_data)?;
-    let part_area = calculate_signed_area(&polygon_points).abs();
-    if part_area <= 0.0 {
-        anyhow::bail!("max_fit: part has non-positive area, cannot compute upper bound");
-    }
-    let bin_area = bin_width * bin_height;
-    if bin_area <= 0.0 {
-        anyhow::bail!(
-            "max_fit: bin area is non-positive ({} x {})",
-            bin_width,
-            bin_height
-        );
-    }
-    let raw = (bin_area / part_area * MAX_FIT_AREA_SLACK).ceil();
-    let upper_bound = (raw as usize).clamp(1, MAX_FIT_HARD_CAP);
-
-    let saturated_part = PartInput {
-        svg_bytes: part.svg_bytes.clone(),
-        count: upper_bound,
-        item_id: part.item_id.clone(),
-    };
-    let parts = std::slice::from_ref(&saturated_part);
-
-    let mut result = strategy.nest(
+    strategy.nest_max_fit(
         bin_width,
         bin_height,
         spacing,
-        parts,
+        part,
         amount_of_rotations,
         improvement_callback,
-    )?;
-
-    truncate_to_first_page(&mut result);
-    Ok(result)
-}
-
-/// Truncate a `NestingResult` to keep only its first page.
-///
-/// Used by [`nest_max_fit_single_sheet`] so callers see exactly one page even
-/// when the upper-bound count overflows onto additional sheets.
-fn truncate_to_first_page(result: &mut NestingResult) {
-    if result.pages.is_empty() {
-        result.parts_placed = 0;
-        result.total_parts_requested = 0;
-        result.page_svgs.clear();
-        result.combined_svg.clear();
-        result.unplaced_parts_svg = None;
-        result.utilisation = 0.0;
-        return;
-    }
-    result.pages.truncate(1);
-    let first = &result.pages[0];
-    result.parts_placed = first.parts_placed;
-    result.total_parts_requested = first.parts_placed;
-    result.utilisation = first.utilisation;
-    if !result.page_svgs.is_empty() {
-        result.page_svgs.truncate(1);
-        result.combined_svg = result.page_svgs[0].clone();
-    }
-    result.unplaced_parts_svg = None;
+    )
 }

@@ -870,4 +870,64 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             "should fit at least one fork on a 1000x1000 sheet"
         );
     }
+
+    /// Regression test for under-packing on 1800x1800 with the rounded-rect
+    /// part-with-cutouts fixture (~240x141 bbox). With the original
+    /// implementation the optimiser only placed 70 parts (the per-item
+    /// placement budget was scaled by the saturated 10k count). After forcing
+    /// bin_stock=1 + scaling the budget by an effective single-bin capacity,
+    /// we expect strictly more. Result SVG is written to test_output/ for
+    /// visual validation.
+    #[test]
+    fn test_max_fit_repro_1800_rounded_rect_cutouts() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let svg = include_bytes!(
+            "../../jagua-sqs-processor/tests/testdata/maxfit_repro.svg"
+        )
+        .to_vec();
+        let strategy = AdaptiveNestingStrategy::new();
+        let part = PartInput {
+            svg_bytes: svg,
+            count: 0,
+            item_id: None,
+        };
+
+        let result =
+            nest_max_fit_single_sheet(&strategy, 1800.0, 1800.0, 20.0, &part, 4, None);
+
+        assert!(
+            result.is_ok(),
+            "max_fit nesting should succeed: {:?}",
+            result.err()
+        );
+        let nr = result.unwrap();
+        assert_eq!(nr.pages.len(), 1, "must collapse to one page");
+
+        // Write the result SVG to disk for manual visual validation.
+        let output_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_output")
+            .join("max_fit_repro");
+        let _ = fs::remove_dir_all(&output_dir);
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        let page_path = output_dir.join("page-0.svg");
+        fs::write(&page_path, &nr.combined_svg).expect("write page-0.svg");
+        println!("Wrote result SVG: {}", page_path.display());
+
+        // Theoretical naive grid: floor(1800/(240+20)) * floor(1800/(141+20))
+        //   = 6 * 11 = 66. Pre-fix produced 70. After the bin_stock=1 +
+        // budget-rescale + extended max_fit iteration count + ls_frac
+        // diversification, we observe 72.
+        assert!(
+            nr.parts_placed >= 72,
+            "expected at least 72 parts on 1800x1800, got {}",
+            nr.parts_placed
+        );
+        println!(
+            "max_fit 1800x1800 rounded-rect-with-cutouts: placed {} parts, utilisation {:.1}%",
+            nr.parts_placed,
+            nr.utilisation * 100.0
+        );
+    }
 }

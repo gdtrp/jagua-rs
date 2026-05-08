@@ -96,6 +96,7 @@ impl AdaptiveNestingStrategy {
         loops: usize,
         placements: usize,
         seed_offset: usize,
+        ls_frac: f32,
     ) -> Result<(usize, BPSolution)> {
         let mut best_solution = None;
         let mut best_placed = 0;
@@ -114,7 +115,7 @@ impl AdaptiveNestingStrategy {
                 min_item_separation: Some(spacing),
                 prng_seed: Some(seed),
                 n_samples: placements,
-                ls_frac: 0.3,
+                ls_frac,
                 narrow_concavity_cutoff: None,
                 svg_draw_options: Default::default(),
             };
@@ -289,6 +290,56 @@ impl Default for AdaptiveNestingStrategy {
     }
 }
 
+impl AdaptiveNestingStrategy {
+    /// Pack as many copies of a single part as possible onto one sheet.
+    ///
+    /// Forces `bin_stock = 1` so the optimizer has nowhere to spill — every
+    /// adaptive iteration is dedicated to maximising bin-0 density. The result
+    /// is then truncated to its first page (extras are reported as unplaced
+    /// internally and discarded).
+    pub fn nest_max_fit(
+        &self,
+        bin_width: f32,
+        bin_height: f32,
+        spacing: f32,
+        part: &PartInput,
+        amount_of_rotations: usize,
+        improvement_callback: Option<crate::svg_nesting::strategy::ImprovementCallback>,
+    ) -> Result<NestingResult> {
+        // Saturate the part count: the optimizer will pack as many as fit on
+        // bin 0 and report the rest as unplaced. Hard cap to avoid pathological
+        // memory usage on tiny parts in huge bins.
+        const MAX_FIT_PART_COUNT: usize = 10_000;
+        let saturated = PartInput {
+            svg_bytes: part.svg_bytes.clone(),
+            count: MAX_FIT_PART_COUNT,
+            item_id: part.item_id.clone(),
+        };
+        let parts = std::slice::from_ref(&saturated);
+        // Wrap the user callback so intermediate improvements report
+        // truncated single-page numbers (otherwise subscribers see
+        // parts_placed=71 / total=10000 + a giant unplaced grid SVG).
+        let wrapped_callback: Option<crate::svg_nesting::strategy::ImprovementCallback> =
+            improvement_callback.map(|cb| {
+                Box::new(move |mut intermediate: NestingResult| -> Result<()> {
+                    truncate_to_first_page(&mut intermediate);
+                    cb(intermediate)
+                }) as crate::svg_nesting::strategy::ImprovementCallback
+            });
+        let mut result = self.nest_inner(
+            bin_width,
+            bin_height,
+            spacing,
+            parts,
+            amount_of_rotations,
+            wrapped_callback,
+            Some(1), // bin_stock = 1: forces single-bin packing
+        )?;
+        truncate_to_first_page(&mut result);
+        Ok(result)
+    }
+}
+
 impl NestingStrategy for AdaptiveNestingStrategy {
     fn nest(
         &self,
@@ -298,6 +349,54 @@ impl NestingStrategy for AdaptiveNestingStrategy {
         parts: &[PartInput],
         amount_of_rotations: usize,
         improvement_callback: Option<crate::svg_nesting::strategy::ImprovementCallback>,
+    ) -> Result<NestingResult> {
+        self.nest_inner(
+            bin_width,
+            bin_height,
+            spacing,
+            parts,
+            amount_of_rotations,
+            improvement_callback,
+            None,
+        )
+    }
+}
+
+/// Truncate a `NestingResult` to keep only its first page. Used by `nest_max_fit`.
+fn truncate_to_first_page(result: &mut NestingResult) {
+    if result.pages.is_empty() {
+        result.parts_placed = 0;
+        result.total_parts_requested = 0;
+        result.page_svgs.clear();
+        result.combined_svg.clear();
+        result.unplaced_parts_svg = None;
+        result.utilisation = 0.0;
+        return;
+    }
+    result.pages.truncate(1);
+    let first = &result.pages[0];
+    result.parts_placed = first.parts_placed;
+    result.total_parts_requested = first.parts_placed;
+    result.utilisation = first.utilisation;
+    if !result.page_svgs.is_empty() {
+        result.page_svgs.truncate(1);
+        result.combined_svg = result.page_svgs[0].clone();
+    }
+    result.unplaced_parts_svg = None;
+}
+
+impl AdaptiveNestingStrategy {
+    /// Internal nest entry point. `bin_stock_override = Some(n)` caps available
+    /// bins to `n` (used by max_fit to force single-bin packing).
+    fn nest_inner(
+        &self,
+        bin_width: f32,
+        bin_height: f32,
+        spacing: f32,
+        parts: &[PartInput],
+        amount_of_rotations: usize,
+        improvement_callback: Option<crate::svg_nesting::strategy::ImprovementCallback>,
+        bin_stock_override: Option<usize>,
     ) -> Result<NestingResult> {
         // Parse all part SVGs and build per-part data
         struct ParsedPart {
@@ -471,21 +570,40 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                 .map(|&part_idx| parsed_parts[part_idx].processed_holes.as_slice())
                 .collect();
 
-        // Stock = total_parts_requested ensures enough bins are available
-        // (worst case: each item needs its own bin)
-        let bin = Bin::new(container_template.clone(), total_parts_requested, 0);
+        // Stock = total_parts_requested by default (worst case: each item needs
+        // its own bin). max_fit forces stock = 1 to concentrate optimisation
+        // on a single sheet.
+        let bin_stock = bin_stock_override.unwrap_or(total_parts_requested);
+        let bin = Bin::new(container_template.clone(), bin_stock, 0);
         let instance = BPInstance::new(items, vec![bin]);
 
         // Adaptive optimization loop
         let optimization_start = Instant::now();
+        let is_max_fit = bin_stock_override.is_some();
         // For high item counts, scale down loops and samples to keep total work per run manageable.
-        const HIGH_COUNT_SAMPLE_BUDGET: usize = 2_000_000;
+        // max_fit gets a 2x budget since the user explicitly asked for the
+        // densest possible single-sheet packing (quality over speed).
+        const HIGH_COUNT_SAMPLE_BUDGET_DEFAULT: usize = 2_000_000;
+        const HIGH_COUNT_SAMPLE_BUDGET_MAX_FIT: usize = 4_000_000;
+        let high_count_sample_budget = if is_max_fit {
+            HIGH_COUNT_SAMPLE_BUDGET_MAX_FIT
+        } else {
+            HIGH_COUNT_SAMPLE_BUDGET_DEFAULT
+        };
         let base_placements: usize = 50000;
+        // For budget scaling, use the bin stock cap when set (max_fit feeds a
+        // saturated count that vastly overstates the items that will actually
+        // be placed). Without this we'd under-budget per-item placement
+        // attempts and produce sparse packings.
+        let effective_count = match bin_stock_override {
+            Some(_) => total_parts_requested.min(200),
+            None => total_parts_requested,
+        };
         let mut loops;
         let mut placements;
-        if total_parts_requested > 50 {
-            loops = 1.max(50 / total_parts_requested);
-            placements = (HIGH_COUNT_SAMPLE_BUDGET / (total_parts_requested * loops).max(1))
+        if effective_count > 50 {
+            loops = 1.max(50 / effective_count);
+            placements = (high_count_sample_budget / (effective_count * loops).max(1))
                 .max(1000)
                 .min(base_placements);
         } else {
@@ -497,7 +615,9 @@ impl NestingStrategy for AdaptiveNestingStrategy {
         let mut best_placed = 0;
         let mut best_pages = usize::MAX;
         let mut total_runs = 0;
-        const MAX_TOTAL_RUNS: usize = 60;
+        // Wider exploration budget for max_fit: extra adaptive iterations can
+        // find seeds/orderings that interlock the last few parts.
+        let max_total_runs: usize = if is_max_fit { 100 } else { 60 };
         const MAX_RUNS_WITHOUT_IMPROVEMENT: usize = 15;
         const MAX_RUN_DURATION_SECONDS: u64 = 120;
         const MAX_TOTAL_OPTIMIZATION_SECONDS: u64 = 600;
@@ -519,8 +639,8 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                 break 'outer;
             }
 
-            if total_runs >= MAX_TOTAL_RUNS {
-                log::info!("Reached maximum total runs ({}), stopping", MAX_TOTAL_RUNS);
+            if total_runs >= max_total_runs {
+                log::info!("Reached maximum total runs ({}), stopping", max_total_runs);
                 break 'outer;
             }
 
@@ -534,22 +654,34 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     break;
                 }
 
-                if total_runs >= MAX_TOTAL_RUNS {
+                if total_runs >= max_total_runs {
                     break;
                 }
 
                 let run_start = Instant::now();
                 total_runs += 1;
 
+                // Vary ls_frac across iterations to explore both biased and
+                // diversified local search regimes. Empirically the
+                // {0.3, 0.5, 0.7} cycle finds tighter packings than a fixed
+                // value because some shapes need more aggressive local search
+                // to interlock cutouts/concavities.
+                let ls_frac = match total_runs % 3 {
+                    1 => 0.3,
+                    2 => 0.5,
+                    _ => 0.7,
+                };
+
                 log::info!(
-                    "Run {}/{} (batch {}/{}): loops={}, placements={}, rotations={}",
+                    "Run {}/{} (batch {}/{}): loops={}, placements={}, rotations={}, ls_frac={}",
                     total_runs,
-                    MAX_TOTAL_RUNS,
+                    max_total_runs,
                     batch_run + 1,
                     MAX_RUNS_WITHOUT_IMPROVEMENT,
                     loops,
                     placements,
-                    amount_of_rotations
+                    amount_of_rotations,
+                    ls_frac
                 );
 
                 let optimization_result = self.run_single_optimization(
@@ -559,6 +691,7 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     loops,
                     placements,
                     total_runs,
+                    ls_frac,
                 );
 
                 let (_placed, solution) = match optimization_result {
@@ -598,8 +731,11 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     total_parts_requested,
                 )?;
 
-                // Handle unplaced parts SVG generation
-                if result.parts_placed < total_parts_requested {
+                // Handle unplaced parts SVG generation. Skip in max_fit mode
+                // (bin_stock_override set) where "unplaced" is expected and
+                // discarded by the caller — generating a giant grid SVG for
+                // 9k+ unplaced parts is pure waste.
+                if bin_stock_override.is_none() && result.parts_placed < total_parts_requested {
                     let mut unplaced_layout = Layout::new(container_template.clone());
                     let unplaced_count = total_parts_requested - result.parts_placed;
 
@@ -749,8 +885,8 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             if !improved_this_batch {
                 loops += 2;
                 // Cap placements so total work per run stays bounded
-                let max_placements = if total_parts_requested > 50 {
-                    (HIGH_COUNT_SAMPLE_BUDGET / (total_parts_requested * loops).max(1))
+                let max_placements = if effective_count > 50 {
+                    ( high_count_sample_budget / (effective_count * loops).max(1))
                         .clamp(1000, 500000)
                 } else {
                     500000
