@@ -5,7 +5,10 @@ mod strategy;
 mod svg_generation;
 
 pub use parsing::*;
-pub use strategy::{NestingStrategy, SimpleNestingStrategy, AdaptiveNestingStrategy, ImprovementCallback, PartInput};
+pub use strategy::{
+    AdaptiveNestingStrategy, ImprovementCallback, NestingStrategy, PartInput,
+    SimpleNestingStrategy, nest_max_fit_single_sheet,
+};
 pub use svg_generation::{NestingResult, PageResult, PlacedPartInfo};
 
 use anyhow::Result;

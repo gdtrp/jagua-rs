@@ -5,7 +5,9 @@ use crate::svg_nesting::{
         calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
     },
     strategy::{NestingStrategy, PartInput, is_single_part_type},
-    svg_generation::{PageResult, PlacedPartInfo, combine_svg_documents, NestingResult, post_process_svg_multi},
+    svg_generation::{
+        NestingResult, PageResult, PlacedPartInfo, combine_svg_documents, post_process_svg_multi,
+    },
 };
 use anyhow::Result;
 use jagua_rs::collision_detection::CDEConfig;
@@ -18,7 +20,7 @@ use jagua_rs::geometry::primitives::{Rect, SPolygon};
 use jagua_rs::geometry::shape_modification::ShapeModifyMode;
 use jagua_rs::io::import::Importer;
 use jagua_rs::io::svg::{SvgDrawOptions, s_layout_to_svg};
-use jagua_rs::probs::bpp::entities::{BPInstance, Bin, BPSolution};
+use jagua_rs::probs::bpp::entities::{BPInstance, BPSolution, Bin};
 use lbf::config::LBFConfig;
 use lbf::opt::lbf_bpp::LBFOptimizerBP;
 use rand::SeedableRng;
@@ -59,12 +61,8 @@ impl AdaptiveNestingStrategy {
 
     /// Calculate average bin utilisation (density) from a solution
     /// Returns a ratio between 0.0 and 1.0 representing how much of the total bin area is occupied
-    fn calculate_bin_density(
-        &self,
-        solution: &BPSolution,
-        bin_width: f32,
-        bin_height: f32,
-    ) -> f32 {
+    #[allow(dead_code)]
+    fn calculate_bin_density(&self, solution: &BPSolution, bin_width: f32, bin_height: f32) -> f32 {
         let single_bin_area = bin_width * bin_height;
         let num_bins = solution.layout_snapshots.len();
 
@@ -86,7 +84,7 @@ impl AdaptiveNestingStrategy {
             .sum();
 
         // Return utilisation ratio clamped to [0.0, 1.0]
-        (used_area / total_bin_area).min(1.0).max(0.0)
+        (used_area / total_bin_area).clamp(0.0, 1.0)
     }
 
     /// Run a single optimization run with given parameters
@@ -111,7 +109,7 @@ impl AdaptiveNestingStrategy {
 
             let seed = (seed_offset * 1000 + loop_idx) as u64;
             let lbf_config = LBFConfig {
-                cde_config: cde_config.clone(),
+                cde_config: *cde_config,
                 poly_simpl_tolerance: Some(0.001),
                 min_item_separation: Some(spacing),
                 prng_seed: Some(seed),
@@ -219,7 +217,8 @@ impl AdaptiveNestingStrategy {
                 let rotation = placed_item.d_transf.rotation().to_degrees();
                 let internal_id = placed_item.item_id;
                 let part_index = item_id_to_part_idx.get(internal_id).copied().unwrap_or(0);
-                let item_id = item_id_to_part_id.get(internal_id)
+                let item_id = item_id_to_part_id
+                    .get(internal_id)
                     .cloned()
                     .flatten()
                     .unwrap_or_else(|| internal_id.to_string());
@@ -230,8 +229,8 @@ impl AdaptiveNestingStrategy {
                     x,
                     y,
                     rotation,
-                    centroid_x: centroid.x() as f32,
-                    centroid_y: centroid.y() as f32,
+                    centroid_x: centroid.x(),
+                    centroid_y: centroid.y(),
                 });
             }
 
@@ -276,7 +275,7 @@ impl AdaptiveNestingStrategy {
             combined_svg: combined_svg.into_bytes(),
             page_svgs,
             parts_placed: corrected_count,
-            total_parts_requested: total_parts_requested,
+            total_parts_requested,
             unplaced_parts_svg: None,
             utilisation,
             pages,
@@ -318,7 +317,7 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             },
         };
 
-        let importer = Importer::new(cde_config.clone(), None, Some(spacing), None);
+        let importer = Importer::new(cde_config, None, Some(spacing), None);
 
         let mut parsed_parts = Vec::with_capacity(parts.len());
         for (part_idx, part) in parts.iter().enumerate() {
@@ -426,14 +425,14 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             modify_config: importer.shape_modify_config,
         };
 
-        let container_template = Container::new(0, container_shape, vec![], cde_config.clone())?;
+        let container_template = Container::new(0, container_shape, vec![], cde_config)?;
 
         // Build rotation range
         const MAX_ROTATIONS: usize = 4;
         let rotation_count = if amount_of_rotations == 0 {
             0
         } else {
-            amount_of_rotations.max(1).min(MAX_ROTATIONS)
+            amount_of_rotations.clamp(1, MAX_ROTATIONS)
         };
 
         let rotation_range = if rotation_count == 0 {
@@ -452,10 +451,9 @@ impl NestingStrategy for AdaptiveNestingStrategy {
         let mut items = Vec::with_capacity(parsed_parts.len());
         let mut item_id_to_part_idx: Vec<usize> = Vec::with_capacity(parsed_parts.len());
         let mut item_id_to_part_id: Vec<Option<String>> = Vec::with_capacity(parsed_parts.len());
-        let mut item_id = 0;
         for (part_idx, parsed) in parsed_parts.iter().enumerate() {
             let item = Item::new(
-                item_id,
+                part_idx,
                 parsed.item_shape.clone(),
                 rotation_range.clone(),
                 None,
@@ -464,7 +462,6 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             items.push((item, parsed.count));
             item_id_to_part_idx.push(part_idx);
             item_id_to_part_id.push(parsed.item_id.clone());
-            item_id += 1;
         }
 
         // Build per-item holes mapping (item_id → holes slice)
@@ -655,19 +652,20 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                     }
 
                     let unplaced_snapshot = unplaced_layout.save();
-                    let mut svg_options = SvgDrawOptions::default();
-                    svg_options.highlight_cd_shapes = false;
+                    let svg_options = SvgDrawOptions {
+                        highlight_cd_shapes: false,
+                        ..SvgDrawOptions::default()
+                    };
                     let label = if unplaced_count > items_to_render {
-                        format!("Unplaced parts: {} (showing {})", unplaced_count, items_to_render)
+                        format!(
+                            "Unplaced parts: {} (showing {})",
+                            unplaced_count, items_to_render
+                        )
                     } else {
                         format!("Unplaced parts: {}", unplaced_count)
                     };
-                    let unplaced_svg_doc = s_layout_to_svg(
-                        &unplaced_snapshot,
-                        &instance,
-                        svg_options,
-                        &label,
-                    );
+                    let unplaced_svg_doc =
+                        s_layout_to_svg(&unplaced_snapshot, &instance, svg_options, &label);
                     let unplaced_svg_str = unplaced_svg_doc.to_string();
                     let processed_unplaced_svg =
                         post_process_svg_multi(&unplaced_svg_str, &item_id_to_holes);
@@ -703,10 +701,10 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                         best_pages
                     );
 
-                    if let Some(ref callback) = improvement_callback {
-                        if let Err(e) = callback(result.clone()) {
-                            log::warn!("Failed to send improvement callback: {}", e);
-                        }
+                    if let Some(ref callback) = improvement_callback
+                        && let Err(e) = callback(result.clone())
+                    {
+                        log::warn!("Failed to send improvement callback: {}", e);
                     }
                 }
 
@@ -753,8 +751,7 @@ impl NestingStrategy for AdaptiveNestingStrategy {
                 // Cap placements so total work per run stays bounded
                 let max_placements = if total_parts_requested > 50 {
                     (HIGH_COUNT_SAMPLE_BUDGET / (total_parts_requested * loops).max(1))
-                        .max(1000)
-                        .min(500000)
+                        .clamp(1000, 500000)
                 } else {
                     500000
                 };
@@ -768,17 +765,14 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             }
         }
 
-        Ok(best_result.unwrap_or_else(|| {
-            NestingResult {
-                combined_svg: Vec::new(),
-                page_svgs: Vec::new(),
-                parts_placed: 0,
-                total_parts_requested,
-                unplaced_parts_svg: None,
-                utilisation: 0.0,
-                pages: Vec::new(),
-            }
+        Ok(best_result.unwrap_or_else(|| NestingResult {
+            combined_svg: Vec::new(),
+            page_svgs: Vec::new(),
+            parts_placed: 0,
+            total_parts_requested,
+            unplaced_parts_svg: None,
+            utilisation: 0.0,
+            pages: Vec::new(),
         }))
     }
 }
-

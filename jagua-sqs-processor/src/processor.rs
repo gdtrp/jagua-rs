@@ -1,13 +1,15 @@
 use anyhow::{anyhow, Context, Result};
-use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_sqs::Client as SqsClient;
 use base64::{engine::general_purpose, Engine as _};
-use jagua_utils::svg_nesting::{NestingStrategy, AdaptiveNestingStrategy, NestingResult, PartInput, PlacedPartInfo, PageResult};
+use jagua_utils::svg_nesting::{
+    AdaptiveNestingStrategy, NestingResult, NestingStrategy, PageResult, PartInput,
+};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -44,6 +46,7 @@ pub struct SvgPartSpec {
 /// Trait for downloading SVG bytes from a URL.
 /// Abstracts S3 access so strategies and tests stay S3-agnostic.
 #[async_trait::async_trait]
+#[allow(dead_code)]
 pub trait SvgDownloader: Send + Sync {
     /// Download SVG bytes from the given URL
     async fn download(&self, url: &str) -> Result<Vec<u8>>;
@@ -80,7 +83,10 @@ pub struct SqsNestingRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parts: Option<Vec<SvgPartSpec>>,
     /// Number of rotations to try (default: 8)
-    #[serde(default = "default_rotations", deserialize_with = "deserialize_rotations_or_default")]
+    #[serde(
+        default = "default_rotations",
+        deserialize_with = "deserialize_rotations_or_default"
+    )]
     pub amount_of_rotations: usize,
     /// Output queue URL for results (falls back to default if omitted)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +94,10 @@ pub struct SqsNestingRequest {
     /// Whether this is a cancellation request
     #[serde(default)]
     pub cancelled: bool,
+    /// When `Some(true)`, compute the maximum number of copies of a single part
+    /// that fit on one sheet. Requires exactly one part type in the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fit: Option<bool>,
 }
 
 /// Generate an empty page SVG (used when all parts are placed)
@@ -159,10 +169,7 @@ where
 /// Determine the last page SVG bytes based on nesting result
 /// Returns None if all parts placed (no unplaced sheet needed),
 /// unplaced parts SVG if available, otherwise the last filled page
-fn determine_last_page_svg(
-    result: &NestingResult,
-    first_page_bytes: &[u8],
-) -> Option<Vec<u8>> {
+fn determine_last_page_svg(result: &NestingResult, first_page_bytes: &[u8]) -> Option<Vec<u8>> {
     if result.parts_placed == result.total_parts_requested {
         // All parts placed - no last page needed
         info!(
@@ -183,7 +190,13 @@ fn determine_last_page_svg(
             "No unplaced parts SVG available, using last filled page (parts_placed: {} of {})",
             result.parts_placed, result.total_parts_requested
         );
-        Some(result.page_svgs.last().unwrap_or(&first_page_bytes.to_vec()).clone())
+        Some(
+            result
+                .page_svgs
+                .last()
+                .unwrap_or(&first_page_bytes.to_vec())
+                .clone(),
+        )
     }
 }
 
@@ -360,9 +373,13 @@ impl SqsProcessor {
         // Parse S3 URL (supports both s3://bucket/key and https://bucket.s3.region.amazonaws.com/key)
         let (bucket, key) = parse_s3_url(s3_url)?;
 
-        info!("Downloading SVG from S3: url={}, bucket={}, key={}", s3_url, bucket, key);
+        info!(
+            "Downloading SVG from S3: url={}, bucket={}, key={}",
+            s3_url, bucket, key
+        );
 
-        let response = match self.s3_client
+        let response = match self
+            .s3_client
             .get_object()
             .bucket(&bucket)
             .key(&key)
@@ -389,7 +406,9 @@ impl SqsProcessor {
 
                 return Err(anyhow::anyhow!(
                     "Failed to download SVG from S3: bucket={}, key={}, error={}",
-                    bucket, key, e
+                    bucket,
+                    key,
+                    e
                 ));
             }
         };
@@ -425,13 +444,15 @@ impl SvgDownloader for SqsProcessor {
 /// - https://hostname:port/bucket/key (path-style, for localstack/minio)
 fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
     // Handle s3://bucket/key format
-    if s3_url.starts_with("s3://") {
-        let path = &s3_url[5..];
+    if let Some(path) = s3_url.strip_prefix("s3://") {
         if let Some(slash_pos) = path.find('/') {
             let bucket = path[..slash_pos].to_string();
             let key = path[slash_pos + 1..].to_string();
             if bucket.is_empty() || key.is_empty() {
-                return Err(anyhow!("Invalid S3 URL: bucket or key is empty: {}", s3_url));
+                return Err(anyhow!(
+                    "Invalid S3 URL: bucket or key is empty: {}",
+                    s3_url
+                ));
             }
             return Ok((bucket, key));
         }
@@ -444,7 +465,10 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
     } else if let Some(stripped) = s3_url.strip_prefix("http://") {
         stripped
     } else {
-        return Err(anyhow!("Unsupported S3 URL format (must start with s3://, http://, or https://): {}", s3_url));
+        return Err(anyhow!(
+            "Unsupported S3 URL format (must start with s3://, http://, or https://): {}",
+            s3_url
+        ));
     };
 
     // Check for AWS path-style URL: https://s3.region.amazonaws.com/bucket/key
@@ -457,11 +481,17 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
                 let bucket = path[..slash_pos].to_string();
                 let key = path[slash_pos + 1..].to_string();
                 if bucket.is_empty() || key.is_empty() {
-                    return Err(anyhow!("Invalid S3 path-style URL: bucket or key is empty: {}", s3_url));
+                    return Err(anyhow!(
+                        "Invalid S3 path-style URL: bucket or key is empty: {}",
+                        s3_url
+                    ));
                 }
                 return Ok((bucket, key));
             }
-            return Err(anyhow!("Invalid S3 path-style URL (missing key): {}", s3_url));
+            return Err(anyhow!(
+                "Invalid S3 path-style URL (missing key): {}",
+                s3_url
+            ));
         }
     }
 
@@ -473,11 +503,17 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
         if let Some(aws_pos) = url.find(".amazonaws.com/") {
             let key = url[aws_pos + 15..].to_string();
             if bucket.is_empty() || key.is_empty() {
-                return Err(anyhow!("Invalid S3 virtual-hosted URL: bucket or key is empty: {}", s3_url));
+                return Err(anyhow!(
+                    "Invalid S3 virtual-hosted URL: bucket or key is empty: {}",
+                    s3_url
+                ));
             }
             return Ok((bucket, key));
         }
-        return Err(anyhow!("Invalid S3 virtual-hosted URL (missing .amazonaws.com): {}", s3_url));
+        return Err(anyhow!(
+            "Invalid S3 virtual-hosted URL (missing .amazonaws.com): {}",
+            s3_url
+        ));
     }
 
     // Path-style URL for non-AWS S3-compatible services (e.g., localstack, minio):
@@ -489,11 +525,17 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
             let bucket = path[..second_slash].to_string();
             let key = path[second_slash + 1..].to_string();
             if bucket.is_empty() || key.is_empty() {
-                return Err(anyhow!("Invalid S3-compatible URL: bucket or key is empty: {}", s3_url));
+                return Err(anyhow!(
+                    "Invalid S3-compatible URL: bucket or key is empty: {}",
+                    s3_url
+                ));
             }
             return Ok((bucket, key));
         }
-        return Err(anyhow!("Invalid S3-compatible URL (missing key after bucket): {}", s3_url));
+        return Err(anyhow!(
+            "Invalid S3-compatible URL (missing key after bucket): {}",
+            s3_url
+        ));
     }
 
     Err(anyhow!("Invalid S3-compatible URL format: {}", s3_url))
@@ -512,14 +554,26 @@ async fn upload_svg_to_s3_internal(
     let s3_key = format!("nesting/{}/{}", request_id, filename);
     let s3_url = if let Some(endpoint) = endpoint_url {
         // Path-style URL for LocalStack/Minio
-        format!("{}/{}/{}", endpoint.trim_end_matches('/'), s3_bucket, s3_key)
+        format!(
+            "{}/{}/{}",
+            endpoint.trim_end_matches('/'),
+            s3_bucket,
+            s3_key
+        )
     } else {
         // Virtual-hosted style for AWS
-        format!("https://{}.s3.{}.amazonaws.com/{}", s3_bucket, aws_region, s3_key)
+        format!(
+            "https://{}.s3.{}.amazonaws.com/{}",
+            s3_bucket, aws_region, s3_key
+        )
     };
-    
-    info!("Uploading SVG to S3: bucket={}, key={}, size={} bytes", 
-        s3_bucket, s3_key, svg_bytes.len());
+
+    info!(
+        "Uploading SVG to S3: bucket={}, key={}, size={} bytes",
+        s3_bucket,
+        s3_key,
+        svg_bytes.len()
+    );
 
     s3_client
         .put_object()
@@ -669,7 +723,10 @@ impl SqsProcessor {
                 Err(_) => {
                     // Base64 encoding increases size by ~33%, so approximate decoded size
                     let approx_decoded_size = (base64_len * 3) / 4;
-                    format!("~{} bytes (base64: {} bytes, decode failed)", approx_decoded_size, base64_len)
+                    format!(
+                        "~{} bytes (base64: {} bytes, decode failed)",
+                        approx_decoded_size, base64_len
+                    )
                 }
             }
         } else {
@@ -686,7 +743,7 @@ impl SqsProcessor {
             request.amount_of_rotations,
             request.cancelled,
             svg_size_info,
-            request.output_queue_url.as_ref().map(|s| s.as_str()).unwrap_or("default")
+            request.output_queue_url.as_deref().unwrap_or("default")
         );
 
         // Handle cancellation requests
@@ -713,7 +770,7 @@ impl SqsProcessor {
             .unwrap_or_else(|| self.output_queue_url.clone());
 
         // Validate required fields for non-cancellation requests
-        let has_multi_parts = request.parts.as_ref().map_or(false, |p| !p.is_empty());
+        let has_multi_parts = request.parts.as_ref().is_some_and(|p| !p.is_empty());
         let has_legacy_svg = request.svg_base64.is_some() || request.svg_url.is_some();
 
         // Must have either multi-part or legacy SVG source
@@ -745,7 +802,8 @@ impl SqsProcessor {
 
         // Legacy format requires amount_of_parts
         if !has_multi_parts && request.amount_of_parts.is_none() {
-            let error_msg = "Missing required field: amount_of_parts (required for legacy single-part format)";
+            let error_msg =
+                "Missing required field: amount_of_parts (required for legacy single-part format)";
             error!("{}", error_msg);
             let error_response = SqsNestingResponse {
                 correlation_id: request.correlation_id.clone(),
@@ -909,6 +967,14 @@ impl SqsProcessor {
                 decode_start.elapsed()
             );
 
+            let max_fit = request.max_fit.unwrap_or(false);
+            if max_fit && part_inputs.len() != 1 {
+                return Err(anyhow!(
+                    "max_fit requires exactly one part type, got {}",
+                    part_inputs.len()
+                ));
+            }
+
             // Create cancellation checker closure using the helper method
             // The checker also monitors for execution timeout
             let execution_timeout = get_execution_timeout();
@@ -921,7 +987,7 @@ impl SqsProcessor {
             let cancellation_check_count_for_log = cancellation_check_count.clone();
             let cancellation_checker = move || {
                 let count = cancellation_check_count_for_log.fetch_add(1, Ordering::Relaxed) + 1;
-                if count % 1000 == 0 {
+                if count.is_multiple_of(1000) {
                     log::debug!("Cancellation checker called {} times", count);
                 }
                 // Check for timeout
@@ -1086,16 +1152,28 @@ impl SqsProcessor {
             let failsafe_timeout = execution_timeout + Duration::from_secs(60);
 
             let nesting_future = tokio::task::spawn_blocking(move || {
-                info!("Inside spawn_blocking: calling strategy.nest()");
+                info!("Inside spawn_blocking: calling strategy.nest() (max_fit={})", max_fit);
                 let nest_call_start = Instant::now();
-                let result = strategy.nest(
-                    bin_width,
-                    bin_height,
-                    spacing,
-                    &part_inputs_for_nest,
-                    amount_of_rotations,
-                    improvement_callback,
-                );
+                let result = if max_fit {
+                    jagua_utils::svg_nesting::nest_max_fit_single_sheet(
+                        &strategy,
+                        bin_width,
+                        bin_height,
+                        spacing,
+                        &part_inputs_for_nest[0],
+                        amount_of_rotations,
+                        improvement_callback,
+                    )
+                } else {
+                    strategy.nest(
+                        bin_width,
+                        bin_height,
+                        spacing,
+                        &part_inputs_for_nest,
+                        amount_of_rotations,
+                        improvement_callback,
+                    )
+                };
                 info!("Inside spawn_blocking: strategy.nest() completed (took {:?})", nest_call_start.elapsed());
                 result
             });
@@ -1259,10 +1337,7 @@ impl SqsProcessor {
     /// Listen and process messages from the queue (concurrent processing)
     /// Processes messages concurrently using tokio tasks with semaphore-based concurrency control.
     /// The maximum number of concurrent tasks is configurable via MAX_CONCURRENT_TASKS env var (default: 20).
-    pub async fn listen_and_process(
-        &self,
-        mut shutdown_rx: broadcast::Receiver<()>,
-    ) -> Result<()> {
+    pub async fn listen_and_process(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
         let max_concurrent = get_max_concurrent_tasks();
         info!(
             "Starting concurrent worker on queue: {} (max {} concurrent tasks)",
@@ -1401,14 +1476,23 @@ impl SqsProcessor {
         }
 
         // Graceful shutdown: wait for all active tasks to complete
-        info!("Waiting for {} active tasks to complete...", active_tasks.len());
+        info!(
+            "Waiting for {} active tasks to complete...",
+            active_tasks.len()
+        );
         while let Some(result) = active_tasks.join_next().await {
             match result {
                 Ok((receipt_handle, success)) => {
                     if success {
-                        info!("Shutdown: task completed successfully for receipt_handle: {}", receipt_handle);
+                        info!(
+                            "Shutdown: task completed successfully for receipt_handle: {}",
+                            receipt_handle
+                        );
                     } else {
-                        warn!("Shutdown: task completed with error for receipt_handle: {}", receipt_handle);
+                        warn!(
+                            "Shutdown: task completed with error for receipt_handle: {}",
+                            receipt_handle
+                        );
                     }
                 }
                 Err(e) => {
@@ -1424,7 +1508,9 @@ impl SqsProcessor {
 
 #[cfg(test)]
 impl SqsProcessor {
-    pub(crate) fn cancellation_registry_handle(&self) -> Arc<Mutex<HashMap<String, CancellationEntry>>> {
+    pub(crate) fn cancellation_registry_handle(
+        &self,
+    ) -> Arc<Mutex<HashMap<String, CancellationEntry>>> {
         self.cancellation_registry.clone()
     }
 }
@@ -1560,7 +1646,8 @@ mod tests {
     #[test]
     fn test_parse_s3_url_localstack() {
         // LocalStack/Minio path-style URL
-        let (bucket, key) = parse_s3_url("http://localstack:4566/my-bucket/path/to/file.svg").unwrap();
+        let (bucket, key) =
+            parse_s3_url("http://localstack:4566/my-bucket/path/to/file.svg").unwrap();
         assert_eq!(bucket, "my-bucket");
         assert_eq!(key, "path/to/file.svg");
     }
@@ -1568,7 +1655,8 @@ mod tests {
     #[test]
     fn test_parse_s3_url_localstack_https() {
         // LocalStack/Minio path-style URL with HTTPS
-        let (bucket, key) = parse_s3_url("https://localhost:4566/my-bucket/path/to/file.svg").unwrap();
+        let (bucket, key) =
+            parse_s3_url("https://localhost:4566/my-bucket/path/to/file.svg").unwrap();
         assert_eq!(bucket, "my-bucket");
         assert_eq!(key, "path/to/file.svg");
     }
@@ -1655,10 +1743,7 @@ mod tests {
         }"#;
 
         let request: SqsNestingRequest = serde_json::from_str(request_json).unwrap();
-        assert_eq!(
-            request.cancelled, false,
-            "cancelled should default to false"
-        );
+        assert!(!request.cancelled, "cancelled should default to false");
     }
 
     #[test]
@@ -1674,7 +1759,7 @@ mod tests {
         }"#;
 
         let request: SqsNestingRequest = serde_json::from_str(request_json).unwrap();
-        assert_eq!(request.cancelled, true, "cancelled should be true when set");
+        assert!(request.cancelled, "cancelled should be true when set");
     }
 
     #[test]
@@ -1685,8 +1770,14 @@ mod tests {
 
         let request: SqsNestingRequest = serde_json::from_str(request_json).unwrap();
         assert!(request.cancelled);
-        assert_eq!(request.correlation_id, "9abdb358-35fd-4dbf-ba06-1ae9023a4512");
-        assert_eq!(request.amount_of_rotations, 8, "null amountOfRotations should default to 8");
+        assert_eq!(
+            request.correlation_id,
+            "9abdb358-35fd-4dbf-ba06-1ae9023a4512"
+        );
+        assert_eq!(
+            request.amount_of_rotations, 8,
+            "null amountOfRotations should default to 8"
+        );
         assert!(request.bin_width.is_none());
         assert!(request.bin_height.is_none());
         assert!(request.spacing.is_none());
@@ -1726,6 +1817,7 @@ mod tests {
             amount_of_rotations: 8,
             output_queue_url: None,
             cancelled: true,
+            max_fit: None,
         };
         let cancellation_body =
             serde_json::to_string(&cancellation_request).expect("serialize cancellation");
@@ -1797,15 +1889,14 @@ mod tests {
         let call_count = Arc::new(AtomicU64::new(0));
         let call_count_clone = call_count.clone();
 
-        let result: std::result::Result<i32, String> =
-            retry_with_backoff("test_op", || {
-                let count = call_count_clone.clone();
-                async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok(42)
-                }
-            })
-            .await;
+        let result: std::result::Result<i32, String> = retry_with_backoff("test_op", || {
+            let count = call_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            }
+        })
+        .await;
 
         assert_eq!(result.unwrap(), 42);
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -1816,19 +1907,18 @@ mod tests {
         let call_count = Arc::new(AtomicU64::new(0));
         let call_count_clone = call_count.clone();
 
-        let result: std::result::Result<i32, String> =
-            retry_with_backoff("test_op", || {
-                let count = call_count_clone.clone();
-                async move {
-                    let calls = count.fetch_add(1, Ordering::SeqCst) + 1;
-                    if calls < 3 {
-                        Err(format!("Failed attempt {}", calls))
-                    } else {
-                        Ok(42)
-                    }
+        let result: std::result::Result<i32, String> = retry_with_backoff("test_op", || {
+            let count = call_count_clone.clone();
+            async move {
+                let calls = count.fetch_add(1, Ordering::SeqCst) + 1;
+                if calls < 3 {
+                    Err(format!("Failed attempt {}", calls))
+                } else {
+                    Ok(42)
                 }
-            })
-            .await;
+            }
+        })
+        .await;
 
         assert_eq!(result.unwrap(), 42);
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
@@ -1839,15 +1929,14 @@ mod tests {
         let call_count = Arc::new(AtomicU64::new(0));
         let call_count_clone = call_count.clone();
 
-        let result: std::result::Result<i32, String> =
-            retry_with_backoff("test_op", || {
-                let count = call_count_clone.clone();
-                async move {
-                    let calls = count.fetch_add(1, Ordering::SeqCst) + 1;
-                    Err(format!("Failed attempt {}", calls))
-                }
-            })
-            .await;
+        let result: std::result::Result<i32, String> = retry_with_backoff("test_op", || {
+            let count = call_count_clone.clone();
+            async move {
+                let calls = count.fetch_add(1, Ordering::SeqCst) + 1;
+                Err(format!("Failed attempt {}", calls))
+            }
+        })
+        .await;
 
         assert!(result.is_err());
         assert_eq!(call_count.load(Ordering::SeqCst), MAX_RETRY_ATTEMPTS as u64);
@@ -1855,10 +1944,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_download() {
-        use std::env;
         use aws_config::BehaviorVersion;
-        use aws_sdk_s3::Client as S3Client;
         use aws_sdk_s3::error::ProvideErrorMetadata;
+        use aws_sdk_s3::Client as S3Client;
+        use std::env;
 
         // Initialize logger for test output
         let _ = env_logger::Builder::from_default_env()
@@ -1868,17 +1957,20 @@ mod tests {
         // Get configuration from environment variables
         let bucket = env::var("S3_BUCKET").unwrap_or_else(|_| "cutl-staging-uploads".to_string());
         let test_key = "22db4d1f-44cb-4c3d-917d-17836ba986ac/projectParts/9720e425-6a18-4a46-aa4c-7a7934ae9f23/project_part_internal_svg.svg";
-        
+
         println!("Testing S3 download:");
         println!("  Bucket: {}", bucket);
         println!("  Key: {}", test_key);
         println!("  AWS_REGION: {:?}", env::var("AWS_REGION"));
         println!("  AWS_ENDPOINT_URL: {:?}", env::var("AWS_ENDPOINT_URL"));
-        println!("  AWS_ACCESS_KEY_ID: {:?}", env::var("AWS_ACCESS_KEY_ID").map(|s| format!("{}...", &s[..10.min(s.len())])));
+        println!(
+            "  AWS_ACCESS_KEY_ID: {:?}",
+            env::var("AWS_ACCESS_KEY_ID").map(|s| format!("{}...", &s[..10.min(s.len())]))
+        );
 
         // Initialize AWS config
         let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
-        
+
         // Configure LocalStack endpoint if provided
         if let Ok(endpoint_url) = env::var("AWS_ENDPOINT_URL") {
             config_loader = config_loader.endpoint_url(&endpoint_url);
@@ -1910,20 +2002,22 @@ mod tests {
                     }
                 };
                 println!("✓ Successfully downloaded {} bytes", svg_bytes.len());
-                
+
                 // Try to parse as SVG
                 let svg_content = String::from_utf8_lossy(&svg_bytes);
                 if svg_content.contains("<svg") {
                     println!("✓ Content appears to be valid SVG");
                 } else {
-                    println!("⚠ Content doesn't appear to be SVG (first 100 chars: {})", 
-                        svg_content.chars().take(100).collect::<String>());
+                    println!(
+                        "⚠ Content doesn't appear to be SVG (first 100 chars: {})",
+                        svg_content.chars().take(100).collect::<String>()
+                    );
                 }
             }
             Err(e) => {
                 println!("✗ Failed to download from S3: {}", e);
                 println!("Error details:");
-                
+
                 // Try to get more error information
                 if let Some(code) = e.code() {
                     println!("  Error code: {:?}", code);
@@ -1931,7 +2025,7 @@ mod tests {
                 if let Some(message) = e.message() {
                     println!("  Error message: {:?}", message);
                 }
-                
+
                 // Test 2: Try to list objects in the bucket to verify connectivity
                 println!("\nTest 2: Testing bucket connectivity by listing objects...");
                 let list_result = s3_client
@@ -1940,7 +2034,7 @@ mod tests {
                     .max_keys(5)
                     .send()
                     .await;
-                
+
                 match list_result {
                     Ok(list_response) => {
                         println!("✓ Successfully connected to bucket");
@@ -1948,7 +2042,13 @@ mod tests {
                         if !contents.is_empty() {
                             println!("  Found {} objects (showing first 5)", contents.len());
                             for (i, obj) in contents.iter().take(5).enumerate() {
-                                println!("    {}. {}", i + 1, obj.key().map(|k| k.to_string()).unwrap_or_else(|| "(no key)".to_string()));
+                                println!(
+                                    "    {}. {}",
+                                    i + 1,
+                                    obj.key()
+                                        .map(|k| k.to_string())
+                                        .unwrap_or_else(|| "(no key)".to_string())
+                                );
                             }
                         } else {
                             println!("  Bucket is empty");
@@ -1959,15 +2059,11 @@ mod tests {
                         println!("  This suggests a connectivity or permissions issue");
                     }
                 }
-                
+
                 // Test 3: Try to check if bucket exists
                 println!("\nTest 3: Checking if bucket exists...");
-                let head_result = s3_client
-                    .head_bucket()
-                    .bucket(&bucket)
-                    .send()
-                    .await;
-                
+                let head_result = s3_client.head_bucket().bucket(&bucket).send().await;
+
                 match head_result {
                     Ok(_) => {
                         println!("✓ Bucket exists and is accessible");

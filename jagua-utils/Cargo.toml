@@ -21,3 +21,9 @@ regex = "1"
 env_logger = { workspace = true }
 serde_json = { workspace = true }
 
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"

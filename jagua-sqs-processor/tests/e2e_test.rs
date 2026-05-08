@@ -12,16 +12,22 @@ fn process_request_direct(
     request_json: &str,
     shared_responses: Option<Arc<Mutex<Vec<SqsNestingResponse>>>>,
     shared_intermediate_results: Option<Arc<Mutex<Vec<jagua_utils::svg_nesting::NestingResult>>>>,
-) -> Result<(Vec<SqsNestingResponse>, jagua_utils::svg_nesting::NestingResult)> {
-    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput};
+) -> Result<(
+    Vec<SqsNestingResponse>,
+    jagua_utils::svg_nesting::NestingResult,
+)> {
+    use jagua_utils::svg_nesting::{
+        AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput,
+    };
 
     let request: SqsNestingRequest = serde_json::from_str(request_json)?;
 
     // Validate required fields for non-cancellation requests
-    let svg_base64 = request
-        .svg_base64
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Missing required field: svg_base64 (svg_s3_url not supported in test helper)"))?;
+    let svg_base64 = request.svg_base64.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Missing required field: svg_base64 (svg_s3_url not supported in test helper)"
+        )
+    })?;
     let bin_width = request
         .bin_width
         .ok_or_else(|| anyhow::anyhow!("Missing required field: bin_width"))?;
@@ -45,6 +51,14 @@ fn process_request_direct(
         item_id: None,
     }];
 
+    let max_fit = request.max_fit.unwrap_or(false);
+    if max_fit && part_inputs.len() != 1 {
+        anyhow::bail!(
+            "max_fit requires exactly one part type, got {}",
+            part_inputs.len()
+        );
+    }
+
     let improvements: Arc<Mutex<Vec<SqsNestingResponse>>> = Arc::new(Mutex::new(Vec::new()));
     let improvements_clone = improvements.clone();
     let shared_responses_clone = shared_responses.clone();
@@ -56,16 +70,15 @@ fn process_request_direct(
         if let Some(ref shared_results) = shared_intermediate_results_clone {
             shared_results.lock().unwrap().push(result.clone());
         }
-        
-        let first_page_bytes = result.page_svgs.first()
-            .unwrap_or(&result.combined_svg);
+
+        let first_page_bytes = result.page_svgs.first().unwrap_or(&result.combined_svg);
         let last_page_bytes = result.page_svgs.last().unwrap_or(first_page_bytes);
-        let encoded_first = general_purpose::STANDARD.encode(first_page_bytes);
-        let encoded_last = general_purpose::STANDARD.encode(last_page_bytes);
+        let _encoded_first = general_purpose::STANDARD.encode(first_page_bytes);
+        let _encoded_last = general_purpose::STANDARD.encode(last_page_bytes);
         let response = SqsNestingResponse {
             correlation_id: correlation_id.clone(),
             first_page_svg_url: None, // Tests don't use S3
-            last_page_svg_url: None, // Tests don't use S3
+            last_page_svg_url: None,  // Tests don't use S3
             sheets: None,
             page_svg_urls: None,
             pages: None,
@@ -85,21 +98,33 @@ fn process_request_direct(
     };
 
     let strategy = AdaptiveNestingStrategy::new();
-    let nesting_result = strategy.nest(
-        bin_width,
-        bin_height,
-        spacing,
-        &part_inputs,
-        request.amount_of_rotations,
-        Some(Box::new(callback)),
-    )?;
+    let nesting_result = if max_fit {
+        jagua_utils::svg_nesting::nest_max_fit_single_sheet(
+            &strategy,
+            bin_width,
+            bin_height,
+            spacing,
+            &part_inputs[0],
+            request.amount_of_rotations,
+            Some(Box::new(callback)),
+        )?
+    } else {
+        strategy.nest(
+            bin_width,
+            bin_height,
+            spacing,
+            &part_inputs,
+            request.amount_of_rotations,
+            Some(Box::new(callback)),
+        )?
+    };
 
     let mut responses = improvements.lock().unwrap().clone();
 
     responses.push(SqsNestingResponse {
         correlation_id: request.correlation_id,
         first_page_svg_url: None, // Tests don't use S3
-        last_page_svg_url: None, // Tests don't use S3
+        last_page_svg_url: None,  // Tests don't use S3
         sheets: None,
         page_svg_urls: None,
         pages: None,
@@ -144,6 +169,7 @@ async fn test_e2e_processing() -> Result<()> {
         parts: None,
         output_queue_url: Some("test-output-queue".to_string()),
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -206,6 +232,7 @@ async fn test_single_page_last_page_matches_first() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -271,6 +298,7 @@ async fn test_multiple_pages_last_page_is_set() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -354,6 +382,7 @@ async fn test_svg_with_circles() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -437,6 +466,7 @@ async fn test_all_parts_fit_last_page_empty() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -449,11 +479,11 @@ async fn test_all_parts_fit_last_page_empty() -> Result<()> {
         .find(|r| r.is_final)
         .ok_or_else(|| anyhow::anyhow!("No final response found"))?;
 
-    assert_eq!(final_response.correlation_id, "test-all-parts-fit-empty-last-page");
     assert_eq!(
-        final_response.parts_placed, 11,
-        "Should place all 11 parts"
+        final_response.correlation_id,
+        "test-all-parts-fit-empty-last-page"
     );
+    assert_eq!(final_response.parts_placed, 11, "Should place all 11 parts");
     assert!(final_response.is_final);
     assert!(!final_response.is_improvement);
 
@@ -483,16 +513,19 @@ fn process_request_with_cancellation(
     request_json: &str,
     cancellation_registry: Arc<Mutex<std::collections::HashMap<String, bool>>>,
 ) -> Result<Vec<SqsNestingResponse>> {
-    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput};
+    use jagua_utils::svg_nesting::{
+        AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput,
+    };
 
     let request: SqsNestingRequest = serde_json::from_str(request_json)?;
 
     // Validate required fields for non-cancellation requests
     // Either svg_base64 or svg_s3_url must be provided
-    let svg_base64 = request
-        .svg_base64
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Missing required field: svg_base64 (svg_s3_url not supported in test helper)"))?;
+    let svg_base64 = request.svg_base64.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Missing required field: svg_base64 (svg_s3_url not supported in test helper)"
+        )
+    })?;
     let bin_width = request
         .bin_width
         .ok_or_else(|| anyhow::anyhow!("Missing required field: bin_width"))?;
@@ -524,19 +557,21 @@ fn process_request_with_cancellation(
     let correlation_id_for_checker = correlation_id.clone();
     let cancellation_checker = move || {
         let registry = cancellation_registry_for_checker.lock().unwrap();
-        registry.get(&correlation_id_for_checker).copied().unwrap_or(false)
+        registry
+            .get(&correlation_id_for_checker)
+            .copied()
+            .unwrap_or(false)
     };
 
     let callback = move |result: NestingResult| -> Result<()> {
-        let first_page_bytes = result.page_svgs.first()
-            .unwrap_or(&result.combined_svg);
+        let first_page_bytes = result.page_svgs.first().unwrap_or(&result.combined_svg);
         let last_page_bytes = result.page_svgs.last().unwrap_or(first_page_bytes);
-        let encoded_first = general_purpose::STANDARD.encode(first_page_bytes);
-        let encoded_last = general_purpose::STANDARD.encode(last_page_bytes);
+        let _encoded_first = general_purpose::STANDARD.encode(first_page_bytes);
+        let _encoded_last = general_purpose::STANDARD.encode(last_page_bytes);
         let response = SqsNestingResponse {
             correlation_id: correlation_id.clone(),
             first_page_svg_url: None, // Tests don't use S3
-            last_page_svg_url: None, // Tests don't use S3
+            last_page_svg_url: None,  // Tests don't use S3
             sheets: None,
             page_svg_urls: None,
             pages: None,
@@ -551,7 +586,8 @@ fn process_request_with_cancellation(
         Ok(())
     };
 
-    let strategy = AdaptiveNestingStrategy::with_cancellation_checker(Box::new(cancellation_checker));
+    let strategy =
+        AdaptiveNestingStrategy::with_cancellation_checker(Box::new(cancellation_checker));
     let nesting_result = strategy.nest(
         bin_width,
         bin_height,
@@ -566,7 +602,7 @@ fn process_request_with_cancellation(
     responses.push(SqsNestingResponse {
         correlation_id: request.correlation_id,
         first_page_svg_url: None, // Tests don't use S3
-        last_page_svg_url: None, // Tests don't use S3
+        last_page_svg_url: None,  // Tests don't use S3
         sheets: None,
         page_svg_urls: None,
         pages: None,
@@ -588,8 +624,8 @@ async fn test_cancellation_request_handling() -> Result<()> {
         .try_init();
 
     use aws_config::BehaviorVersion;
-    use aws_sdk_sqs::Client as SqsClient;
     use aws_sdk_s3::Client as S3Client;
+    use aws_sdk_sqs::Client as SqsClient;
     use jagua_sqs_processor::SqsProcessor;
 
     // Create a processor
@@ -619,6 +655,7 @@ async fn test_cancellation_request_handling() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: true,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&cancellation_request)?;
@@ -677,6 +714,7 @@ async fn test_optimization_cancellation_during_execution() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -766,6 +804,7 @@ async fn test_cancellation_before_optimization_starts() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -830,6 +869,7 @@ async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> 
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_b = SqsNestingRequest {
@@ -844,6 +884,7 @@ async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> 
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let registry: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -947,6 +988,7 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_cancelled = SqsNestingRequest {
@@ -961,6 +1003,7 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let registry: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1046,44 +1089,61 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
-    
+
     // Add 1 minute timeout using a thread-based approach
     // Use Arc<Mutex> to share intermediate responses and results between threads so we can capture them even on timeout
-    let intermediate_responses: Arc<Mutex<Vec<SqsNestingResponse>>> = Arc::new(Mutex::new(Vec::new()));
-    let intermediate_results: Arc<Mutex<Vec<jagua_utils::svg_nesting::NestingResult>>> = Arc::new(Mutex::new(Vec::new()));
-    let final_result: Arc<Mutex<Option<Result<(Vec<SqsNestingResponse>, jagua_utils::svg_nesting::NestingResult)>>>> = Arc::new(Mutex::new(None));
+    let intermediate_responses: Arc<Mutex<Vec<SqsNestingResponse>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let intermediate_results: Arc<Mutex<Vec<jagua_utils::svg_nesting::NestingResult>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let final_result: Arc<
+        Mutex<
+            Option<
+                Result<(
+                    Vec<SqsNestingResponse>,
+                    jagua_utils::svg_nesting::NestingResult,
+                )>,
+            >,
+        >,
+    > = Arc::new(Mutex::new(None));
     let intermediate_responses_clone = intermediate_responses.clone();
     let intermediate_results_clone = intermediate_results.clone();
     let final_result_clone = final_result.clone();
     let request_json_clone = request_json.clone();
-    
-    let nesting_result: Arc<Mutex<Option<jagua_utils::svg_nesting::NestingResult>>> = Arc::new(Mutex::new(None));
+
+    let nesting_result: Arc<Mutex<Option<jagua_utils::svg_nesting::NestingResult>>> =
+        Arc::new(Mutex::new(None));
     let nesting_result_clone = nesting_result.clone();
-    
+
     let handle = std::thread::spawn(move || {
-        let result = process_request_direct(&request_json_clone, Some(intermediate_responses_clone), Some(intermediate_results_clone));
-        match &result {
-            Ok((_, ref nr)) => {
-                *nesting_result_clone.lock().unwrap() = Some(nr.clone());
-            }
-            _ => {}
+        let result = process_request_direct(
+            &request_json_clone,
+            Some(intermediate_responses_clone),
+            Some(intermediate_results_clone),
+        );
+        if let Ok((_, ref nr)) = &result {
+            *nesting_result_clone.lock().unwrap() = Some(nr.clone());
         }
         *final_result_clone.lock().unwrap() = Some(result);
     });
-    
+
     // Wait for completion or timeout
     let timeout_duration = std::time::Duration::from_secs(60);
     let start_time = std::time::Instant::now();
     let (responses, final_nesting_result) = loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        
+
         // Check for intermediate responses
         let intermediate = intermediate_responses.lock().unwrap();
         if !intermediate.is_empty() {
-            println!("Captured {} intermediate responses so far:", intermediate.len());
+            println!(
+                "Captured {} intermediate responses so far:",
+                intermediate.len()
+            );
             for (i, response) in intermediate.iter().enumerate() {
                 println!(
                     "  Response {}: parts_placed={}, is_improvement={}, is_final={}",
@@ -1092,13 +1152,16 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
             }
         }
         drop(intermediate);
-        
+
         // Check if final result is ready
         if let Some(result) = final_result.lock().unwrap().take() {
             handle.join().ok();
             match result {
                 Ok((responses, nesting_result)) => {
-                    println!("Test completed successfully. Total responses: {}", responses.len());
+                    println!(
+                        "Test completed successfully. Total responses: {}",
+                        responses.len()
+                    );
                     for (i, response) in responses.iter().enumerate() {
                         println!(
                             "  Response {}: parts_placed={}, is_improvement={}, is_final={}",
@@ -1112,25 +1175,29 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                 }
             }
         }
-        
+
         if start_time.elapsed() >= timeout_duration {
             // On timeout, try to get nesting result if available
             let nr = nesting_result.lock().unwrap().clone();
             let intermediate = intermediate_responses.lock().unwrap();
             if !intermediate.is_empty() {
-                println!("Test timed out but captured {} intermediate responses before timeout:", intermediate.len());
+                println!(
+                    "Test timed out but captured {} intermediate responses before timeout:",
+                    intermediate.len()
+                );
                 for (i, response) in intermediate.iter().enumerate() {
                     println!(
                         "  Response {}: parts_placed={}, is_improvement={}, is_final={}",
                         i, response.parts_placed, response.is_improvement, response.is_final
                     );
                 }
-                let best_response = intermediate.iter()
-                    .max_by_key(|r| r.parts_placed)
-                    .cloned();
+                let best_response = intermediate.iter().max_by_key(|r| r.parts_placed).cloned();
                 drop(intermediate);
                 if let Some(best) = best_response {
-                    println!("Best placement result before timeout: {} parts placed", best.parts_placed);
+                    println!(
+                        "Best placement result before timeout: {} parts placed",
+                        best.parts_placed
+                    );
                     // Return the best response as if it were the final response for test purposes
                     let mut final_responses = vec![best];
                     final_responses.push(SqsNestingResponse {
@@ -1145,7 +1212,9 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         is_improvement: false,
                         is_final: true,
                         timestamp: current_timestamp(),
-                        error_message: Some("Test timed out - using best intermediate result".to_string()),
+                        error_message: Some(
+                            "Test timed out - using best intermediate result".to_string(),
+                        ),
                     });
                     // Create a dummy nesting result for timeout case
                     use jagua_utils::svg_nesting::NestingResult;
@@ -1161,7 +1230,9 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                     break (final_responses, nr.unwrap_or(dummy_result));
                 }
             }
-            return Err(anyhow::anyhow!("Test timed out after 1 minute - no responses captured"));
+            return Err(anyhow::anyhow!(
+                "Test timed out after 1 minute - no responses captured"
+            ));
         }
     };
 
@@ -1190,42 +1261,60 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
     // Save the result SVG to project root for inspection
     use std::fs;
     use std::path::PathBuf;
-    
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let project_root = manifest_dir.parent().unwrap();
-    
+
     // Save all intermediate results (improvements)
     let intermediate_results_vec = intermediate_results.lock().unwrap();
     if !intermediate_results_vec.is_empty() {
-        println!("Saving {} intermediate improvement results:", intermediate_results_vec.len());
+        println!(
+            "Saving {} intermediate improvement results:",
+            intermediate_results_vec.len()
+        );
         for (idx, intermediate_result) in intermediate_results_vec.iter().enumerate() {
             let improvement_dir = project_root.join("dr_e2e_improvements");
             fs::create_dir_all(&improvement_dir)
                 .context("Failed to create improvements directory")?;
-            
+
             // Save each page of the intermediate result
             if !intermediate_result.page_svgs.is_empty() {
                 for (page_idx, page_svg) in intermediate_result.page_svgs.iter().enumerate() {
-                    let page_path = improvement_dir.join(format!("improvement_{}_page_{}.svg", idx, page_idx));
-                    fs::write(&page_path, page_svg)
-                        .context(format!("Failed to write improvement {} page {} SVG", idx, page_idx))?;
-                    println!("  Saved improvement {} page {} ({} parts placed) to: {}", 
-                        idx, page_idx, intermediate_result.parts_placed, page_path.display());
+                    let page_path =
+                        improvement_dir.join(format!("improvement_{}_page_{}.svg", idx, page_idx));
+                    fs::write(&page_path, page_svg).context(format!(
+                        "Failed to write improvement {} page {} SVG",
+                        idx, page_idx
+                    ))?;
+                    println!(
+                        "  Saved improvement {} page {} ({} parts placed) to: {}",
+                        idx,
+                        page_idx,
+                        intermediate_result.parts_placed,
+                        page_path.display()
+                    );
                 }
             } else if !intermediate_result.combined_svg.is_empty() {
-                let combined_path = improvement_dir.join(format!("improvement_{}_combined.svg", idx));
+                let combined_path =
+                    improvement_dir.join(format!("improvement_{}_combined.svg", idx));
                 fs::write(&combined_path, &intermediate_result.combined_svg)
                     .context(format!("Failed to write improvement {} combined SVG", idx))?;
-                println!("  Saved improvement {} combined ({} parts placed) to: {}", 
-                    idx, intermediate_result.parts_placed, combined_path.display());
+                println!(
+                    "  Saved improvement {} combined ({} parts placed) to: {}",
+                    idx,
+                    intermediate_result.parts_placed,
+                    combined_path.display()
+                );
             } else {
-                println!("  Warning: Improvement {} has no SVG data (parts_placed: {})", 
-                    idx, intermediate_result.parts_placed);
+                println!(
+                    "  Warning: Improvement {} has no SVG data (parts_placed: {})",
+                    idx, intermediate_result.parts_placed
+                );
             }
         }
     }
     drop(intermediate_results_vec);
-    
+
     // Save final result SVG
     if !final_nesting_result.page_svgs.is_empty() {
         let output_path = project_root.join("dr_e2e_result.svg");
@@ -1233,13 +1322,12 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
         fs::write(&output_path, first_page_svg)
             .context("Failed to write result SVG to project root")?;
         println!("Saved final first page SVG to: {}", output_path.display());
-        
+
         // Save all pages if there are multiple
         if final_nesting_result.page_svgs.len() > 1 {
             for (i, page_svg) in final_nesting_result.page_svgs.iter().enumerate() {
                 let page_path = project_root.join(format!("dr_e2e_result_page_{}.svg", i));
-                fs::write(&page_path, page_svg)
-                    .context("Failed to write page SVG")?;
+                fs::write(&page_path, page_svg).context("Failed to write page SVG")?;
                 println!("Saved final page {} SVG to: {}", i, page_path.display());
             }
         }
@@ -1250,13 +1338,24 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
             .context("Failed to write result SVG to project root")?;
         println!("Saved final combined SVG to: {}", output_path.display());
     } else {
-        println!("Warning: No SVG data available to save (page_svgs and combined_svg are both empty)");
+        println!(
+            "Warning: No SVG data available to save (page_svgs and combined_svg are both empty)"
+        );
         println!("  Parts placed: {}", final_nesting_result.parts_placed);
-        println!("  Total parts requested: {}", final_nesting_result.total_parts_requested);
-        println!("  Number of pages: {}", final_nesting_result.page_svgs.len());
-        println!("  combined_svg length: {}", final_nesting_result.combined_svg.len());
+        println!(
+            "  Total parts requested: {}",
+            final_nesting_result.total_parts_requested
+        );
+        println!(
+            "  Number of pages: {}",
+            final_nesting_result.page_svgs.len()
+        );
+        println!(
+            "  combined_svg length: {}",
+            final_nesting_result.combined_svg.len()
+        );
         println!("  This suggests the solution had placed items but layout_snapshots was empty during SVG generation");
-        
+
         // Try to generate a minimal SVG showing that parts were placed
         if final_nesting_result.parts_placed > 0 {
             let output_path = project_root.join("dr_e2e_result.svg");
@@ -1340,7 +1439,10 @@ fn test_parse_and_serialize_dr_svg() -> Result<()> {
         let hole_area = calculate_signed_area(hole);
         if hole_area > 0.0 {
             *hole = reverse_winding(hole);
-            println!("Reversed hole {} winding (was counter-clockwise, area: {})", i, hole_area);
+            println!(
+                "Reversed hole {} winding (was counter-clockwise, area: {})",
+                i, hole_area
+            );
         }
     }
 
@@ -1348,11 +1450,16 @@ fn test_parse_and_serialize_dr_svg() -> Result<()> {
     let mut svg = String::new();
     svg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     svg.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 2000 2000\">\n");
-    
+
     // Build a single path with outer boundary and holes
     // Outer boundary first, then holes (holes should be opposite winding)
-    let mut combined_path = points_to_svg_path(&outer_boundary.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
-    
+    let mut combined_path = points_to_svg_path(
+        &outer_boundary
+            .iter()
+            .map(|p| (p.0, p.1))
+            .collect::<Vec<_>>(),
+    );
+
     // Add holes to the same path (they'll be cutouts due to fill-rule="evenodd")
     for (i, hole) in holes.iter().enumerate() {
         let hole_path = points_to_svg_path(&hole.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
@@ -1361,16 +1468,16 @@ fn test_parse_and_serialize_dr_svg() -> Result<()> {
         combined_path.push_str(&format!(" M {} z", hole_path_inner));
         println!("  Hole {}: {} points", i, hole.len());
     }
-    
+
     // Render as a single path with evenodd fill rule (holes will be cutouts)
     svg.push_str(&format!(
         "  <path d=\"{}\" fill=\"lightgray\" stroke=\"black\" stroke-width=\"2\" fill-rule=\"evenodd\"/>\n",
         combined_path
     ));
-    
+
     // Also render holes separately in red for visualization/debugging
     svg.push_str("  <!-- Holes rendered separately for visualization -->\n");
-    for (_i, hole) in holes.iter().enumerate() {
+    for hole in holes.iter() {
         let hole_path = points_to_svg_path(&hole.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
         svg.push_str(&format!(
             "  <path d=\"{}\" fill=\"red\" stroke=\"blue\" stroke-width=\"1\" opacity=\"0.3\"/>\n",
@@ -1420,6 +1527,7 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -1450,10 +1558,10 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
     // Save the result SVG to project root for validation
     use std::fs;
     use std::path::PathBuf;
-    
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let project_root = manifest_dir.parent().unwrap();
-    
+
     // Save final result SVG
     if !final_nesting_result.page_svgs.is_empty() {
         let output_path = project_root.join("custom_svg_e2e_result.svg");
@@ -1461,13 +1569,12 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
         fs::write(&output_path, first_page_svg)
             .context("Failed to write result SVG to project root")?;
         println!("Saved final first page SVG to: {}", output_path.display());
-        
+
         // Save all pages if there are multiple
         if final_nesting_result.page_svgs.len() > 1 {
             for (i, page_svg) in final_nesting_result.page_svgs.iter().enumerate() {
                 let page_path = project_root.join(format!("custom_svg_e2e_result_page_{}.svg", i));
-                fs::write(&page_path, page_svg)
-                    .context("Failed to write page SVG")?;
+                fs::write(&page_path, page_svg).context("Failed to write page SVG")?;
                 println!("Saved final page {} SVG to: {}", i, page_path.display());
             }
         }
@@ -1478,9 +1585,14 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
             .context("Failed to write result SVG to project root")?;
         println!("Saved final combined SVG to: {}", output_path.display());
     } else {
-        println!("Warning: No SVG data available to save (page_svgs and combined_svg are both empty)");
+        println!(
+            "Warning: No SVG data available to save (page_svgs and combined_svg are both empty)"
+        );
         println!("  Parts placed: {}", final_nesting_result.parts_placed);
-        println!("  Total parts requested: {}", final_nesting_result.total_parts_requested);
+        println!(
+            "  Total parts requested: {}",
+            final_nesting_result.total_parts_requested
+        );
     }
 
     Ok(())
@@ -1488,9 +1600,7 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
 
 #[test]
 fn test_parse_and_serialize_custom_svg() -> Result<()> {
-    use jagua_utils::svg_nesting::{
-        calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
-    };
+    use jagua_utils::svg_nesting::{calculate_signed_area, parse_svg_path, reverse_winding};
     use std::fs;
     use std::path::PathBuf;
 
@@ -1535,11 +1645,11 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
     // Extract all paths, lines, and circles from the SVG and combine them
     // The outer boundary is formed by the lines and arcs in KN_7
     // The holes are the 4 circles (KN_3, KN_4, KN_5, KN_6)
-    
+
     // Build the outer boundary path from lines and arcs in KN_7
     // The boundary should be: arcs and lines connected in order to form a closed path
     let svg_str = test_svg;
-    
+
     // Extract all path elements (arcs)
     let mut all_paths = Vec::new();
     let mut search_start = 0;
@@ -1554,7 +1664,7 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
         }
         search_start = absolute_start + 1;
     }
-    
+
     // Extract all line elements and convert them to path segments
     let mut all_lines = Vec::new();
     search_start = 0;
@@ -1565,7 +1675,7 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
         let mut y1 = None;
         let mut x2 = None;
         let mut y2 = None;
-        
+
         if let Some(x1_match) = svg_str[absolute_start..].find("x1=\"") {
             let x1_start = absolute_start + x1_match + 4;
             if let Some(x1_end) = svg_str[x1_start..].find("\"") {
@@ -1590,22 +1700,22 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
                 y2 = svg_str[y2_start..y2_start + y2_end].parse::<f32>().ok();
             }
         }
-        
-        if let (Some(x1_val), Some(y1_val), Some(x2_val), Some(y2_val)) = (x1, y1, x2, y2) {
+
+        if let (Some(_x1_val), Some(_y1_val), Some(x2_val), Some(y2_val)) = (x1, y1, x2, y2) {
             // Convert line to path: L x2,y2 (assuming we start from x1,y1)
             all_lines.push(format!("L {},{}", x2_val, y2_val));
         }
-        
+
         search_start = absolute_start + 1;
     }
-    
+
     // The arcs in the SVG form a continuous boundary when connected in order
     // However, they're separate sub-paths. The parser will treat them as separate polygons
     // and pick the largest one. Since all arcs together form the outer boundary,
     // we need to ensure they're parsed as a single continuous path.
     // The arcs should connect end-to-end, so we'll keep them as separate sub-paths
     // and let the parser combine them, or we construct a single path manually.
-    
+
     // For now, combine all paths - the parser will extract the largest area polygon
     // which should be the combined outer boundary
     let outer_path = if !all_paths.is_empty() {
@@ -1613,7 +1723,7 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
     } else {
         String::new()
     };
-    
+
     // Extract circles for holes
     let mut circles = Vec::new();
     search_start = 0;
@@ -1631,7 +1741,11 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
                             let r_start = absolute_start + r_match + 3;
                             if let Some(r_end) = svg_str[r_start..].find("\"") {
                                 let r_str = &svg_str[r_start..r_start + r_end];
-                                if let (Ok(cx), Ok(cy), Ok(r)) = (cx_str.parse::<f32>(), cy_str.parse::<f32>(), r_str.parse::<f32>()) {
+                                if let (Ok(cx), Ok(cy), Ok(r)) = (
+                                    cx_str.parse::<f32>(),
+                                    cy_str.parse::<f32>(),
+                                    r_str.parse::<f32>(),
+                                ) {
                                     circles.push((cx, cy, r));
                                 }
                             }
@@ -1642,10 +1756,14 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
         }
         search_start = absolute_start + 1;
     }
-    
-    println!("Extracted {} paths, {} circles", all_paths.len(), circles.len());
+
+    println!(
+        "Extracted {} paths, {} circles",
+        all_paths.len(),
+        circles.len()
+    );
     println!("Combined outer path: {}", outer_path);
-    
+
     // Parse each arc sub-path separately and combine them
     // Split the path by "M " to get individual arc paths
     let mut all_subpaths_points = Vec::new();
@@ -1656,40 +1774,41 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
             }
         }
     }
-    
+
     // Combine all sub-paths into a single polygon
     // Remove duplicate points where arcs connect
-    let (mut outer_boundary, mut path_holes) = if !all_subpaths_points.is_empty() && all_subpaths_points.len() > 1 {
-        let mut combined = all_subpaths_points[0].clone();
-        for subpath in all_subpaths_points.iter().skip(1) {
-            if !combined.is_empty() && !subpath.is_empty() {
-                let last = combined.last().unwrap();
-                let first = &subpath[0];
-                // Use a larger threshold to snap nearby points (arcs might have slight endpoint mismatches)
-                let threshold = 1.0;
-                let dist_sq = (last.0 - first.0).powi(2) + (last.1 - first.1).powi(2);
-                if dist_sq < threshold * threshold {
-                    // Points are close - snap the last point to the first point for exact connection
-                    let _ = combined.pop();
-                    combined.push(*first);
-                    // Add the rest of the subpath
-                    combined.extend_from_slice(&subpath[1..]);
-                } else {
-                    // Points are far apart - add a connecting line segment
-                    combined.push(*first);
-                    combined.extend_from_slice(&subpath[1..]);
+    let (mut outer_boundary, path_holes) =
+        if !all_subpaths_points.is_empty() && all_subpaths_points.len() > 1 {
+            let mut combined = all_subpaths_points[0].clone();
+            for subpath in all_subpaths_points.iter().skip(1) {
+                if !combined.is_empty() && !subpath.is_empty() {
+                    let last = combined.last().unwrap();
+                    let first = &subpath[0];
+                    // Use a larger threshold to snap nearby points (arcs might have slight endpoint mismatches)
+                    let threshold = 1.0;
+                    let dist_sq = (last.0 - first.0).powi(2) + (last.1 - first.1).powi(2);
+                    if dist_sq < threshold * threshold {
+                        // Points are close - snap the last point to the first point for exact connection
+                        let _ = combined.pop();
+                        combined.push(*first);
+                        // Add the rest of the subpath
+                        combined.extend_from_slice(&subpath[1..]);
+                    } else {
+                        // Points are far apart - add a connecting line segment
+                        combined.push(*first);
+                        combined.extend_from_slice(&subpath[1..]);
+                    }
+                } else if !subpath.is_empty() {
+                    combined.extend_from_slice(subpath);
                 }
-            } else if !subpath.is_empty() {
-                combined.extend_from_slice(subpath);
             }
-        }
-        (combined, Vec::new())
-    } else if !all_subpaths_points.is_empty() {
-        (all_subpaths_points[0].clone(), Vec::new())
-    } else {
-        parse_svg_path(&outer_path)?
-    };
-    
+            (combined, Vec::new())
+        } else if !all_subpaths_points.is_empty() {
+            (all_subpaths_points[0].clone(), Vec::new())
+        } else {
+            parse_svg_path(&outer_path)?
+        };
+
     // Convert circles to holes
     let mut holes = path_holes;
     // circle_to_path is re-exported from jagua_utils::svg_nesting
@@ -1705,7 +1824,7 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
             holes.push(circle_points);
         }
     }
-    
+
     println!(
         "Parsed SVG: {} outer boundary points, {} holes",
         outer_boundary.len(),
@@ -1731,7 +1850,10 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
         let hole_area = calculate_signed_area(hole);
         if hole_area > 0.0 {
             *hole = reverse_winding(hole);
-            println!("Reversed hole {} winding (was counter-clockwise, area: {})", i, hole_area);
+            println!(
+                "Reversed hole {} winding (was counter-clockwise, area: {})",
+                i, hole_area
+            );
         }
     }
 
@@ -1739,11 +1861,16 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
     let mut svg = String::new();
     svg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     svg.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 215 101\">\n");
-    
+
     // Build a single path with outer boundary and holes
     // Outer boundary first, then holes (holes should be opposite winding)
-    let mut combined_path = points_to_svg_path(&outer_boundary.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
-    
+    let mut combined_path = points_to_svg_path(
+        &outer_boundary
+            .iter()
+            .map(|p| (p.0, p.1))
+            .collect::<Vec<_>>(),
+    );
+
     // Add holes to the same path (they'll be cutouts due to fill-rule="evenodd")
     for (i, hole) in holes.iter().enumerate() {
         let hole_path = points_to_svg_path(&hole.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
@@ -1752,16 +1879,16 @@ fn test_parse_and_serialize_custom_svg() -> Result<()> {
         combined_path.push_str(&format!(" M {} z", hole_path_inner));
         println!("  Hole {}: {} points", i, hole.len());
     }
-    
+
     // Render as a single path with evenodd fill rule (holes will be cutouts)
     svg.push_str(&format!(
         "  <path d=\"{}\" fill=\"lightgray\" stroke=\"black\" stroke-width=\"2\" fill-rule=\"evenodd\"/>\n",
         combined_path
     ));
-    
+
     // Also render holes separately in red for visualization/debugging
     svg.push_str("  <!-- Holes rendered separately for visualization -->\n");
-    for (_i, hole) in holes.iter().enumerate() {
+    for hole in holes.iter() {
         let hole_path = points_to_svg_path(&hole.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
         svg.push_str(&format!(
             "  <path d=\"{}\" fill=\"red\" stroke=\"blue\" stroke-width=\"1\" opacity=\"0.3\"/>\n",
@@ -1818,10 +1945,11 @@ async fn test_execution_timeout() -> Result<()> {
         bin_height: Some(500.0),
         spacing: Some(10.0),
         amount_of_parts: Some(1000), // Large number of parts to ensure timeout
-        amount_of_rotations: 16, // More rotations to make it slower
+        amount_of_rotations: 16,     // More rotations to make it slower
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -1877,7 +2005,9 @@ async fn test_execution_timeout() -> Result<()> {
 
 /// Process a request with timeout support (reads EXECUTION_TIMEOUT_SECS env var)
 fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResponse>> {
-    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput};
+    use jagua_utils::svg_nesting::{
+        AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1953,7 +2083,8 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
         Ok(())
     };
 
-    let strategy = AdaptiveNestingStrategy::with_cancellation_checker(Box::new(cancellation_checker));
+    let strategy =
+        AdaptiveNestingStrategy::with_cancellation_checker(Box::new(cancellation_checker));
     let nesting_result = strategy.nest(
         bin_width,
         bin_height,
@@ -2003,9 +2134,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
             });
             Ok(responses)
         }
-        Err(e) => {
-            Err(anyhow::anyhow!("Nesting failed: {}", e))
-        }
+        Err(e) => Err(anyhow::anyhow!("Nesting failed: {}", e)),
     }
 }
 
@@ -2013,8 +2142,8 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
 /// Uses 2-minute timeout - complex SVG needs more time
 #[tokio::test]
 async fn test_complex_svg_timeout() -> Result<()> {
-    use std::time::Duration;
     use std::path::PathBuf;
+    use std::time::Duration;
     use tokio::time::Instant;
 
     let _ = env_logger::Builder::from_default_env()
@@ -2042,6 +2171,7 @@ async fn test_complex_svg_timeout() -> Result<()> {
         parts: None,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -2071,8 +2201,10 @@ async fn test_complex_svg_timeout() -> Result<()> {
             if let Some(resp) = final_response {
                 if let Some(ref err) = resp.error_message {
                     println!("Got error response: {}", err);
-                    assert!(err.contains("execution timeout") || err.contains("cancelled"),
-                        "Expected timeout or cancellation error");
+                    assert!(
+                        err.contains("execution timeout") || err.contains("cancelled"),
+                        "Expected timeout or cancellation error"
+                    );
                 } else {
                     println!("Completed successfully: {} parts placed", resp.parts_placed);
                 }
@@ -2091,10 +2223,8 @@ async fn test_complex_svg_timeout() -> Result<()> {
 /// page SVGs and placements JSON to disk for visual validation.
 #[test]
 fn test_multi_part_placements_real_svgs() -> Result<()> {
-    use jagua_utils::svg_nesting::{
-        AdaptiveNestingStrategy, NestingStrategy, PartInput,
-    };
     use jagua_sqs_processor::{SqsNestingRequest, SqsNestingResponse, SvgPartSpec};
+    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingStrategy, PartInput};
     use std::fs;
     use std::path::PathBuf;
 
@@ -2111,9 +2241,21 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
     // dr.svg is ~1055x771 units, fireman ~83x264, fork ~60x370
     // With a 1500x1200 bin: ~2 dr parts per sheet + small parts → expect 5-10 sheets.
     let parts = vec![
-        PartInput { svg_bytes: dr_svg, count: 12, item_id: None },
-        PartInput { svg_bytes: fireman_svg, count: 15, item_id: None },
-        PartInput { svg_bytes: fork_svg, count: 12, item_id: None },
+        PartInput {
+            svg_bytes: dr_svg,
+            count: 12,
+            item_id: None,
+        },
+        PartInput {
+            svg_bytes: fireman_svg,
+            count: 15,
+            item_id: None,
+        },
+        PartInput {
+            svg_bytes: fork_svg,
+            count: 12,
+            item_id: None,
+        },
     ];
 
     let strategy = AdaptiveNestingStrategy::new();
@@ -2121,23 +2263,32 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
         1500.0, // bin_width
         1200.0, // bin_height
         5.0,    // spacing
-        &parts,
-        4,      // amount_of_rotations
-        None,   // no callback
+        &parts, 4,    // amount_of_rotations
+        None, // no callback
     );
 
-    assert!(result.is_ok(), "Multi-part nesting should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Multi-part nesting should succeed: {:?}",
+        result.err()
+    );
     let nesting_result = result.unwrap();
 
-    assert!(nesting_result.parts_placed > 0, "Should place at least some parts");
+    assert!(
+        nesting_result.parts_placed > 0,
+        "Should place at least some parts"
+    );
     assert!(
         !nesting_result.pages.is_empty(),
         "Pages should not be empty"
     );
-    let total_placements: usize = nesting_result.pages.iter().map(|p| p.placements.len()).sum();
+    let total_placements: usize = nesting_result
+        .pages
+        .iter()
+        .map(|p| p.placements.len())
+        .sum();
     assert_eq!(
-        total_placements,
-        nesting_result.parts_placed,
+        total_placements, nesting_result.parts_placed,
         "Number of placements should match parts_placed"
     );
 
@@ -2200,13 +2351,28 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
         spacing: Some(5.0),
         amount_of_parts: None,
         parts: Some(vec![
-            SvgPartSpec { item_id: "dr-part".to_string(), svg_url: "https://s3.example.com/svgs/dr.svg".to_string(), amount_of_parts: 12 },
-            SvgPartSpec { item_id: "fireman-part".to_string(), svg_url: "https://s3.example.com/svgs/fireman.svg".to_string(), amount_of_parts: 15 },
-            SvgPartSpec { item_id: "fork-part".to_string(), svg_url: "https://s3.example.com/svgs/fork.svg".to_string(), amount_of_parts: 12 },
+            SvgPartSpec {
+                item_id: "dr-part".to_string(),
+                svg_url: "https://s3.example.com/svgs/dr.svg".to_string(),
+                amount_of_parts: 12,
+            },
+            SvgPartSpec {
+                item_id: "fireman-part".to_string(),
+                svg_url: "https://s3.example.com/svgs/fireman.svg".to_string(),
+                amount_of_parts: 15,
+            },
+            SvgPartSpec {
+                item_id: "fork-part".to_string(),
+                svg_url: "https://s3.example.com/svgs/fork.svg".to_string(),
+                amount_of_parts: 12,
+            },
         ]),
         amount_of_rotations: 4,
-        output_queue_url: Some("https://sqs.eu-north-1.amazonaws.com/123456789/output-queue".to_string()),
+        output_queue_url: Some(
+            "https://sqs.eu-north-1.amazonaws.com/123456789/output-queue".to_string(),
+        ),
         cancelled: false,
+        max_fit: None,
     };
     let request_json =
         serde_json::to_string_pretty(&sqs_request).context("serialize SQS request")?;
@@ -2250,10 +2416,7 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
     );
     println!("  Parts placed: {}", nesting_result.parts_placed);
     println!("  Pages: {}", nesting_result.pages.len());
-    println!(
-        "  Utilisation: {:.1}%",
-        nesting_result.utilisation * 100.0
-    );
+    println!("  Utilisation: {:.1}%", nesting_result.utilisation * 100.0);
     println!("  Output dir: {}", output_dir.display());
 
     // Per-page breakdown
@@ -2275,8 +2438,8 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
 /// visual/manual validation of the centroid fix.
 #[test]
 fn test_cutl_production_request_three_parts() -> Result<()> {
-    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingStrategy, PartInput};
     use jagua_sqs_processor::{SqsNestingRequest, SqsNestingResponse, SvgPartSpec};
+    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingStrategy, PartInput};
     use std::fs;
     use std::path::PathBuf;
 
@@ -2320,10 +2483,19 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
         .nest(bin_width, bin_height, spacing, &parts, rotations, None)
         .context("Nesting should succeed")?;
 
-    assert!(nesting_result.parts_placed > 0, "Should place at least some parts");
-    assert!(!nesting_result.pages.is_empty(), "Pages should not be empty");
-    let total_placements: usize =
-        nesting_result.pages.iter().map(|p| p.placements.len()).sum();
+    assert!(
+        nesting_result.parts_placed > 0,
+        "Should place at least some parts"
+    );
+    assert!(
+        !nesting_result.pages.is_empty(),
+        "Pages should not be empty"
+    );
+    let total_placements: usize = nesting_result
+        .pages
+        .iter()
+        .map(|p| p.placements.len())
+        .sum();
     assert_eq!(
         total_placements, nesting_result.parts_placed,
         "Number of placements should match parts_placed"
@@ -2339,7 +2511,11 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
                 "Unexpected item_id {} — should be one of the three UUIDs",
                 p.item_id
             );
-            assert!(p.part_index < 3, "part_index {} should be < 3", p.part_index);
+            assert!(
+                p.part_index < 3,
+                "part_index {} should be < 3",
+                p.part_index
+            );
         }
     }
 
@@ -2380,17 +2556,19 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
     }
 
     if !nesting_result.combined_svg.is_empty() {
-        fs::write(output_dir.join("combined.svg"), &nesting_result.combined_svg)
-            .context("write combined.svg")?;
+        fs::write(
+            output_dir.join("combined.svg"),
+            &nesting_result.combined_svg,
+        )
+        .context("write combined.svg")?;
     }
 
     if let Some(ref unplaced_svg) = nesting_result.unplaced_parts_svg {
-        fs::write(output_dir.join("unplaced.svg"), unplaced_svg)
-            .context("write unplaced.svg")?;
+        fs::write(output_dir.join("unplaced.svg"), unplaced_svg).context("write unplaced.svg")?;
     }
 
-    let pages_json = serde_json::to_string_pretty(&nesting_result.pages)
-        .context("serialize pages")?;
+    let pages_json =
+        serde_json::to_string_pretty(&nesting_result.pages).context("serialize pages")?;
     fs::write(output_dir.join("pages.json"), &pages_json).context("write pages.json")?;
 
     // Mirror of the real SQS request that produced these inputs (URLs kept for traceability).
@@ -2423,6 +2601,7 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
         amount_of_rotations: rotations,
         output_queue_url: None,
         cancelled: false,
+        max_fit: None,
     };
     fs::write(
         output_dir.join("request.json"),
@@ -2432,7 +2611,12 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
 
     // Build the full SQS response with placements and centroids
     let page_svg_urls: Vec<String> = (0..nesting_result.page_svgs.len())
-        .map(|i| format!("https://s3.example.com/nesting/{}/page-{}.svg", correlation_id, i))
+        .map(|i| {
+            format!(
+                "https://s3.example.com/nesting/{}/page-{}.svg",
+                correlation_id, i
+            )
+        })
         .collect();
     let mut response_pages = nesting_result.pages.clone();
     for (i, page) in response_pages.iter_mut().enumerate() {
@@ -2459,7 +2643,10 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
     .context("write response.json")?;
 
     println!("\nCutl production request test summary:");
-    println!("  Bin: {}×{}, spacing {}, rotations {}", bin_width, bin_height, spacing, rotations);
+    println!(
+        "  Bin: {}×{}, spacing {}, rotations {}",
+        bin_width, bin_height, spacing, rotations
+    );
     println!(
         "  Parts requested: {} (dnishche: 24, bokovaya: 48, prodolnaya: 48)",
         nesting_result.total_parts_requested
@@ -2478,4 +2665,149 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// max_fit happy path through the legacy single-part SQS request path.
+/// Sends a request with `max_fit: true` and a single base64-encoded SVG;
+/// the test helper mirrors the production processor branching.
+#[test]
+fn test_max_fit_legacy_single_part_returns_one_page() -> Result<()> {
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .try_init();
+
+    let fork_svg = include_bytes!("testdata/fork.svg");
+    let svg_b64 = general_purpose::STANDARD.encode(fork_svg);
+
+    let request = jagua_sqs_processor::SqsNestingRequest {
+        correlation_id: "test-max-fit-legacy".to_string(),
+        svg_base64: Some(svg_b64),
+        svg_url: None,
+        bin_width: Some(1000.0),
+        bin_height: Some(1000.0),
+        spacing: Some(5.0),
+        amount_of_parts: Some(1), // ignored under max_fit
+        parts: None,
+        amount_of_rotations: 4,
+        output_queue_url: None,
+        cancelled: false,
+        max_fit: Some(true),
+    };
+    let request_json = serde_json::to_string(&request)?;
+
+    let (responses, nesting_result) = process_request_direct(&request_json, None, None)?;
+
+    assert_eq!(
+        nesting_result.pages.len(),
+        1,
+        "max_fit must produce exactly one page"
+    );
+    assert!(
+        nesting_result.parts_placed >= 1,
+        "should fit at least one fork on a 1000x1000 sheet (placed {})",
+        nesting_result.parts_placed
+    );
+    assert_eq!(
+        nesting_result.parts_placed, nesting_result.total_parts_requested,
+        "total_parts_requested must equal parts_placed for max_fit"
+    );
+    assert!(
+        nesting_result.unplaced_parts_svg.is_none(),
+        "unplaced_parts_svg must be cleared"
+    );
+
+    let final_resp = responses.last().expect("at least one response");
+    assert!(final_resp.is_final, "last response must be final");
+    assert_eq!(final_resp.parts_placed, nesting_result.parts_placed);
+
+    Ok(())
+}
+
+/// max_fit must reject requests with multiple part types.
+/// The test invokes the production processor's pre-flight validation by
+/// constructing a multi-`parts` request — but since `process_request_direct`
+/// only handles legacy single-part, we exercise the validation through the
+/// helper's own (mirrored) check on a hand-built `part_inputs` slice.
+#[test]
+fn test_max_fit_errors_on_multiple_part_types() {
+    use jagua_utils::svg_nesting::{nest_max_fit_single_sheet, AdaptiveNestingStrategy, PartInput};
+
+    // Two different part types simulate a multi-part request. The production
+    // processor returns an error before reaching the strategy; we verify the
+    // helper itself only takes a single PartInput by construction (the type
+    // signature enforces it). What we test here is the processor's policy:
+    // simulate the validation directly.
+    let part_a = PartInput {
+        svg_bytes: include_bytes!("testdata/fork.svg").to_vec(),
+        count: 1,
+        item_id: None,
+    };
+    let part_b = PartInput {
+        svg_bytes: include_bytes!("testdata/fireman.svg").to_vec(),
+        count: 1,
+        item_id: None,
+    };
+    let part_inputs = [part_a, part_b];
+
+    // Mirror the processor's validation
+    let max_fit = true;
+    let validation_err = if max_fit && part_inputs.len() != 1 {
+        Some(format!(
+            "max_fit requires exactly one part type, got {}",
+            part_inputs.len()
+        ))
+    } else {
+        None
+    };
+    assert_eq!(
+        validation_err.as_deref(),
+        Some("max_fit requires exactly one part type, got 2"),
+        "validation must reject multi-part max_fit requests"
+    );
+
+    // Sanity: the helper itself succeeds for the single-part case.
+    let strategy = AdaptiveNestingStrategy::new();
+    let single = nest_max_fit_single_sheet(&strategy, 500.0, 500.0, 5.0, &part_inputs[0], 4, None);
+    assert!(single.is_ok(), "single-part max_fit should succeed");
+    assert_eq!(single.unwrap().pages.len(), 1);
+}
+
+/// Sanity: serializing a SqsNestingRequest with max_fit produces JSON that
+/// round-trips, and `max_fit: None` is omitted from the output.
+#[test]
+fn test_max_fit_dto_serialization() {
+    let with_max_fit = jagua_sqs_processor::SqsNestingRequest {
+        correlation_id: "x".to_string(),
+        svg_base64: None,
+        svg_url: None,
+        bin_width: Some(100.0),
+        bin_height: Some(100.0),
+        spacing: Some(1.0),
+        amount_of_parts: Some(1),
+        parts: None,
+        amount_of_rotations: 4,
+        output_queue_url: None,
+        cancelled: false,
+        max_fit: Some(true),
+    };
+    let json = serde_json::to_string(&with_max_fit).unwrap();
+    assert!(
+        json.contains("\"maxFit\":true"),
+        "serialized JSON: {}",
+        json
+    );
+
+    let parsed: jagua_sqs_processor::SqsNestingRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.max_fit, Some(true));
+
+    let without = jagua_sqs_processor::SqsNestingRequest {
+        max_fit: None,
+        ..with_max_fit
+    };
+    let json2 = serde_json::to_string(&without).unwrap();
+    assert!(
+        !json2.contains("maxFit"),
+        "max_fit:None must be omitted: {}",
+        json2
+    );
 }

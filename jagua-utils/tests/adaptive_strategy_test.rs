@@ -1,8 +1,11 @@
 #[cfg(test)]
 mod tests {
-    use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use jagua_utils::svg_nesting::{
+        AdaptiveNestingStrategy, NestingResult, NestingStrategy, PartInput,
+        nest_max_fit_single_sheet,
+    };
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     /// Test that optimization stops immediately when all parts are placed,
@@ -18,14 +21,17 @@ mod tests {
         let strategy = AdaptiveNestingStrategy::new();
 
         // Try to place just 1 part in a large bin (should succeed on first run)
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1, item_id: None }];
+        let parts = vec![PartInput {
+            svg_bytes: svg.as_bytes().to_vec(),
+            count: 1,
+            item_id: None,
+        }];
         let result = strategy.nest(
-            500.0,  // bin_width - large enough to fit the part
-            500.0,  // bin_height
-            5.0,    // spacing
-            &parts,
-            4,      // amount_of_rotations
-            None,   // no callback
+            500.0, // bin_width - large enough to fit the part
+            500.0, // bin_height
+            5.0,   // spacing
+            &parts, 4,    // amount_of_rotations
+            None, // no callback
         );
 
         // Should succeed
@@ -34,10 +40,7 @@ mod tests {
         let nesting_result = result.unwrap();
 
         // Should place the part
-        assert_eq!(
-            nesting_result.parts_placed, 1,
-            "Should place 1 part"
-        );
+        assert_eq!(nesting_result.parts_placed, 1, "Should place 1 part");
 
         // Should not have unplaced parts
         assert!(
@@ -68,15 +71,12 @@ mod tests {
         let strategy = AdaptiveNestingStrategy::new();
 
         // Try to place 4 parts in a large bin
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 4, item_id: None }];
-        let result = strategy.nest(
-            500.0,
-            500.0,
-            5.0,
-            &parts,
-            4,
-            Some(Box::new(callback)),
-        );
+        let parts = vec![PartInput {
+            svg_bytes: svg.as_bytes().to_vec(),
+            count: 4,
+            item_id: None,
+        }];
+        let result = strategy.nest(500.0, 500.0, 5.0, &parts, 4, Some(Box::new(callback)));
 
         assert!(result.is_ok(), "Nesting should succeed");
 
@@ -171,20 +171,26 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let start = Instant::now();
 
         // Use parameters from user's scenario: 1200x1200 bin, 2mm spacing, 4 rotations, 6 parts
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 6, item_id: None }];
+        let parts = vec![PartInput {
+            svg_bytes: svg.as_bytes().to_vec(),
+            count: 6,
+            item_id: None,
+        }];
         let result = strategy.nest(
-            1200.0,  // bin_width
-            1200.0,  // bin_height
-            2.0,     // spacing
-            &parts,
-            4,       // amount_of_rotations
+            1200.0, // bin_width
+            1200.0, // bin_height
+            2.0,    // spacing
+            &parts, 4, // amount_of_rotations
             None,
         );
 
         let duration = start.elapsed();
 
         // Should complete successfully (even if not all parts fit)
-        assert!(result.is_ok(), "Complex nesting should complete without error");
+        assert!(
+            result.is_ok(),
+            "Complex nesting should complete without error"
+        );
 
         let nesting_result = result.unwrap();
 
@@ -239,18 +245,24 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let strategy = AdaptiveNestingStrategy::new();
 
         // Try to place the part in a bin that's too small (100x100 bin for 500x500 part)
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1, item_id: None }];
+        let parts = vec![PartInput {
+            svg_bytes: svg.as_bytes().to_vec(),
+            count: 1,
+            item_id: None,
+        }];
         let result = strategy.nest(
-            100.0,  // bin_width - smaller than the part
-            100.0,  // bin_height - smaller than the part
-            5.0,    // spacing
-            &parts,
-            4,      // amount_of_rotations
-            None,   // no callback
+            100.0, // bin_width - smaller than the part
+            100.0, // bin_height - smaller than the part
+            5.0,   // spacing
+            &parts, 4,    // amount_of_rotations
+            None, // no callback
         );
 
         // Should return an error with a clear message
-        assert!(result.is_err(), "Nesting should return Err when part is too large for bin");
+        assert!(
+            result.is_err(),
+            "Nesting should return Err when part is too large for bin"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("too large to fit in the bin"),
@@ -270,17 +282,23 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
 
         let strategy = AdaptiveNestingStrategy::new();
 
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 1, item_id: None }];
+        let parts = vec![PartInput {
+            svg_bytes: svg.as_bytes().to_vec(),
+            count: 1,
+            item_id: None,
+        }];
         let result = strategy.nest(
-            1.25,   // bin_width - way too small for this shape
-            2.5,    // bin_height
-            2.0,    // spacing
-            &parts,
-            4,      // amount_of_rotations
+            1.25, // bin_width - way too small for this shape
+            2.5,  // bin_height
+            2.0,  // spacing
+            &parts, 4, // amount_of_rotations
             None,
         );
 
-        assert!(result.is_err(), "Should return error when part doesn't fit in bin");
+        assert!(
+            result.is_err(),
+            "Should return error when part doesn't fit in bin"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("too small") || err_msg.contains("too large to fit in the bin"),
@@ -319,40 +337,58 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
 </svg>"#;
 
         let parts = vec![
-            PartInput { svg_bytes: svg_circle.as_bytes().to_vec(), count: 10, item_id: None },
-            PartInput { svg_bytes: svg_square.as_bytes().to_vec(), count: 15, item_id: None },
-            PartInput { svg_bytes: svg_lshape.as_bytes().to_vec(), count: 12, item_id: None },
+            PartInput {
+                svg_bytes: svg_circle.as_bytes().to_vec(),
+                count: 10,
+                item_id: None,
+            },
+            PartInput {
+                svg_bytes: svg_square.as_bytes().to_vec(),
+                count: 15,
+                item_id: None,
+            },
+            PartInput {
+                svg_bytes: svg_lshape.as_bytes().to_vec(),
+                count: 12,
+                item_id: None,
+            },
         ];
 
         let strategy = AdaptiveNestingStrategy::new();
 
-        let result = strategy.nest(
-            1200.0,
-            1200.0,
-            5.0,
-            &parts,
-            4,
-            None,
-        );
+        let result = strategy.nest(1200.0, 1200.0, 5.0, &parts, 4, None);
 
         assert!(result.is_ok(), "Multi-part nesting should succeed");
         let nesting_result = result.unwrap();
 
-        assert!(nesting_result.parts_placed > 0, "Should place at least some parts");
-        assert!(!nesting_result.pages.is_empty(), "Pages should not be empty");
+        assert!(
+            nesting_result.parts_placed > 0,
+            "Should place at least some parts"
+        );
+        assert!(
+            !nesting_result.pages.is_empty(),
+            "Pages should not be empty"
+        );
 
         // Verify placement data consistency
-        let total_placements: usize = nesting_result.pages.iter().map(|p| p.placements.len()).sum();
+        let total_placements: usize = nesting_result
+            .pages
+            .iter()
+            .map(|p| p.placements.len())
+            .sum();
         assert_eq!(
-            total_placements,
-            nesting_result.parts_placed,
+            total_placements, nesting_result.parts_placed,
             "Number of placements should match parts_placed"
         );
 
         // Verify all part_index values are within range
         for page in &nesting_result.pages {
             for p in &page.placements {
-                assert!(p.part_index < 3, "part_index {} should be < 3", p.part_index);
+                assert!(
+                    p.part_index < 3,
+                    "part_index {} should be < 3",
+                    p.part_index
+                );
             }
         }
 
@@ -386,14 +422,13 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         }
 
         // Write pages JSON (grouped placements by page)
-        let pages_json = serde_json::to_string_pretty(&nesting_result.pages)
-            .expect("serialize pages");
+        let pages_json =
+            serde_json::to_string_pretty(&nesting_result.pages).expect("serialize pages");
         let pages_path = output_dir.join("pages.json");
         std::fs::write(&pages_path, &pages_json).expect("write pages JSON");
         println!("Wrote pages JSON: {}", pages_path.display());
 
-        println!(
-            "\nMulti-part placement test summary:");
+        println!("\nMulti-part placement test summary:");
         println!(
             "  Parts requested: {} (circle: 10, square: 15, L-shape: 12)",
             nesting_result.total_parts_requested
@@ -427,14 +462,14 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let start = Instant::now();
 
         // Try to place 100 parts in a large bin - should stop early when density is high
-        let parts = vec![PartInput { svg_bytes: svg.as_bytes().to_vec(), count: 100, item_id: None }];
+        let parts = vec![PartInput {
+            svg_bytes: svg.as_bytes().to_vec(),
+            count: 100,
+            item_id: None,
+        }];
         let result = strategy.nest(
-            1500.0,  // Large bin
-            1500.0,
-            5.0,
-            &parts,
-            4,
-            None,
+            1500.0, // Large bin
+            1500.0, 5.0, &parts, 4, None,
         );
 
         let duration = start.elapsed();
@@ -560,8 +595,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             1000.0, // bin_width
             1000.0, // bin_height
             20.0,   // spacing
-            &parts,
-            4,      // amount_of_rotations (0°, 90°, 180°, 270°)
+            &parts, 4, // amount_of_rotations (0°, 90°, 180°, 270°)
             None,
         );
 
@@ -598,7 +632,9 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         // Shape is ~240x141, rotated 90° it's ~141x240
         // With spacing 20, effective ~161x260 or ~260x161
         // 1000x1000 bin should fit at least 21 parts with good packing
-        let first_page_placed = nesting_result.pages.first()
+        let first_page_placed = nesting_result
+            .pages
+            .first()
             .map(|p| p.parts_placed)
             .unwrap_or(0);
         assert!(
@@ -647,10 +683,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             .nest(300.0, 300.0, 5.0, &parts, 4, None)
             .expect("Nesting should succeed");
 
-        assert!(
-            result.parts_placed > 0,
-            "Should place at least some parts"
-        );
+        assert!(result.parts_placed > 0, "Should place at least some parts");
 
         // Verify placement data consistency
         let total_placements: usize = result.pages.iter().map(|p| p.placements.len()).sum();
@@ -698,8 +731,13 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             .parent()
             .unwrap()
             .join("jagua-sqs-processor/tests/testdata/guitar.svg");
-        let guitar_svg = std::fs::read(&guitar_svg_path)
-            .unwrap_or_else(|e| panic!("Failed to read guitar.svg at {}: {}", guitar_svg_path.display(), e));
+        let guitar_svg = std::fs::read(&guitar_svg_path).unwrap_or_else(|e| {
+            panic!(
+                "Failed to read guitar.svg at {}: {}",
+                guitar_svg_path.display(),
+                e
+            )
+        });
 
         let strategy = AdaptiveNestingStrategy::new();
         let start = Instant::now();
@@ -711,17 +749,20 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         }];
 
         let result = strategy.nest(
-            1250.0,  // bin_width
-            2500.0,  // bin_height
-            0.1,     // spacing
-            &parts,
-            4,       // amount_of_rotations
+            1250.0, // bin_width
+            2500.0, // bin_height
+            0.1,    // spacing
+            &parts, 4, // amount_of_rotations
             None,
         );
 
         let duration = start.elapsed();
 
-        assert!(result.is_ok(), "Guitar nesting should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Guitar nesting should succeed: {:?}",
+            result.err()
+        );
         let nesting_result = result.unwrap();
 
         // Must place at least some parts
@@ -744,6 +785,89 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             nesting_result.utilisation * 100.0,
             duration.as_secs_f64(),
             nesting_result.pages.len()
+        );
+    }
+
+    /// max_fit on a small inline rectangle: must return exactly one page
+    /// with a non-zero number of parts placed, and result counters must be
+    /// trimmed to that single page.
+    #[test]
+    fn test_max_fit_single_sheet_simple_rect() {
+        let svg = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">
+    <path d="M 0,0 L 10,0 L 10,10 L 0,10 Z" fill="black"/>
+</svg>"#;
+
+        let strategy = AdaptiveNestingStrategy::new();
+        let part = PartInput {
+            svg_bytes: svg.as_bytes().to_vec(),
+            count: 0, // ignored by max_fit helper
+            item_id: None,
+        };
+
+        let result = nest_max_fit_single_sheet(
+            &strategy, 100.0, // bin_width
+            100.0, // bin_height
+            1.0,   // spacing
+            &part, 4, None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "max_fit nesting should succeed: {:?}",
+            result.err()
+        );
+        let nesting_result = result.unwrap();
+        assert_eq!(nesting_result.pages.len(), 1, "must collapse to one page");
+        assert_eq!(
+            nesting_result.page_svgs.len(),
+            1,
+            "page_svgs must be trimmed"
+        );
+        assert!(
+            nesting_result.parts_placed > 0,
+            "must place at least one rect"
+        );
+        assert_eq!(
+            nesting_result.parts_placed, nesting_result.total_parts_requested,
+            "total_parts_requested must equal parts_placed for max_fit"
+        );
+        assert!(
+            nesting_result.unplaced_parts_svg.is_none(),
+            "unplaced_parts_svg must be cleared"
+        );
+        // 10x10 part with 1 spacing inside a 100x100 bin → ~9x9 grid expected
+        assert!(
+            nesting_result.parts_placed >= 50,
+            "expected dense packing of small rects, got {}",
+            nesting_result.parts_placed
+        );
+    }
+
+    /// max_fit using a real fixture SVG. Uses the small fork.svg shared with
+    /// the sqs-processor test fixtures.
+    #[test]
+    fn test_max_fit_single_sheet_with_real_svg() {
+        let svg = include_bytes!("../../jagua-sqs-processor/tests/testdata/fork.svg").to_vec();
+        let strategy = AdaptiveNestingStrategy::new();
+        let part = PartInput {
+            svg_bytes: svg,
+            count: 0,
+            item_id: None,
+        };
+
+        let result = nest_max_fit_single_sheet(&strategy, 1000.0, 1000.0, 5.0, &part, 4, None);
+
+        assert!(
+            result.is_ok(),
+            "max_fit nesting should succeed: {:?}",
+            result.err()
+        );
+        let nesting_result = result.unwrap();
+        assert_eq!(nesting_result.pages.len(), 1, "must collapse to one page");
+        assert!(
+            nesting_result.parts_placed >= 1,
+            "should fit at least one fork on a 1000x1000 sheet"
         );
     }
 }

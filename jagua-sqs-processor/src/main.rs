@@ -2,8 +2,8 @@ mod processor;
 
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
-use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_sqs::Client as SqsClient;
 use log::info;
 use processor::SqsProcessor;
 use std::env;
@@ -24,8 +24,7 @@ async fn main() -> Result<()> {
         env::var("INPUT_QUEUE_URL").context("INPUT_QUEUE_URL environment variable is required")?;
     let output_queue_url = env::var("OUTPUT_QUEUE_URL")
         .context("OUTPUT_QUEUE_URL environment variable is required")?;
-    let s3_bucket = env::var("S3_BUCKET")
-        .context("S3_BUCKET environment variable is required")?;
+    let s3_bucket = env::var("S3_BUCKET").context("S3_BUCKET environment variable is required")?;
     let aws_region = env::var("AWS_REGION").unwrap_or_else(|_| "eu-north-1".to_string());
 
     info!("Configuration:");
@@ -33,27 +32,40 @@ async fn main() -> Result<()> {
     info!("  OUTPUT_QUEUE_URL: {}", output_queue_url);
     info!("  S3_BUCKET: {}", s3_bucket);
     info!("  AWS_REGION: {}", aws_region);
-    
+
     // Log AWS configuration
     info!("AWS Configuration:");
     info!("  AWS_REGION: {:?}", env::var("AWS_REGION"));
     info!("  AWS_ENDPOINT_URL: {:?}", env::var("AWS_ENDPOINT_URL"));
-    info!("  AWS_ACCESS_KEY_ID: {:?}", env::var("AWS_ACCESS_KEY_ID").map(|s| format!("{}...", &s[..10.min(s.len())])));
-    info!("  AWS_SECRET_ACCESS_KEY: {:?}", env::var("AWS_SECRET_ACCESS_KEY").map(|_| "***"));
+    info!(
+        "  AWS_ACCESS_KEY_ID: {:?}",
+        env::var("AWS_ACCESS_KEY_ID").map(|s| format!("{}...", &s[..10.min(s.len())]))
+    );
+    info!(
+        "  AWS_SECRET_ACCESS_KEY: {:?}",
+        env::var("AWS_SECRET_ACCESS_KEY").map(|_| "***")
+    );
 
     // Initialize AWS clients - both use LocalStack endpoint if provided
     let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
 
     // Check if using custom endpoint (LocalStack/Minio)
-    let use_path_style = env::var("AWS_ENDPOINT_URL").is_ok() || env::var("AWS_ENDPOINT_URL_SQS").is_ok();
+    let use_path_style =
+        env::var("AWS_ENDPOINT_URL").is_ok() || env::var("AWS_ENDPOINT_URL_SQS").is_ok();
 
     // Configure LocalStack endpoint if provided (applies to both SQS and S3)
     if let Ok(endpoint_url) = env::var("AWS_ENDPOINT_URL") {
         config_loader = config_loader.endpoint_url(&endpoint_url);
-        info!("Using AWS endpoint: {} (applies to both SQS and S3)", endpoint_url);
+        info!(
+            "Using AWS endpoint: {} (applies to both SQS and S3)",
+            endpoint_url
+        );
     } else if let Ok(endpoint_url) = env::var("AWS_ENDPOINT_URL_SQS") {
         config_loader = config_loader.endpoint_url(&endpoint_url);
-        info!("Using SQS endpoint: {} (applies to both SQS and S3)", endpoint_url);
+        info!(
+            "Using SQS endpoint: {} (applies to both SQS and S3)",
+            endpoint_url
+        );
     } else {
         info!("No AWS_ENDPOINT_URL set, using default AWS endpoints");
     }
@@ -77,7 +89,15 @@ async fn main() -> Result<()> {
     let endpoint_url = env::var("AWS_ENDPOINT_URL").ok();
 
     // Create processor
-    let processor = SqsProcessor::new(sqs_client, s3_client, s3_bucket, aws_region, input_queue_url, output_queue_url, endpoint_url);
+    let processor = SqsProcessor::new(
+        sqs_client,
+        s3_client,
+        s3_bucket,
+        aws_region,
+        input_queue_url,
+        output_queue_url,
+        endpoint_url,
+    );
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);

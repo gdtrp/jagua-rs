@@ -1,4 +1,6 @@
 pub mod processor;
 
-pub use processor::{SqsNestingRequest, SqsNestingResponse, SqsProcessor, SvgPartSpec, SvgDownloader};
-pub use jagua_utils::{PlacedPartInfo, PageResult};
+pub use jagua_utils::{PageResult, PlacedPartInfo};
+pub use processor::{
+    SqsNestingRequest, SqsNestingResponse, SqsProcessor, SvgDownloader, SvgPartSpec,
+};
