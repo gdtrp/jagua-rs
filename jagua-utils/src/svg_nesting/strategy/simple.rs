@@ -3,6 +3,7 @@
 use crate::svg_nesting::{
     parsing::{
         calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
+        sanitize_polygon,
     },
     strategy::{NestingStrategy, PartInput, is_single_part_type},
     svg_generation::{
@@ -107,6 +108,7 @@ impl NestingStrategy for SimpleNestingStrategy {
                 processed_holes.push(processed_hole);
             }
 
+            let polygon_points = sanitize_polygon(polygon_points);
             let polygon = SPolygon::new(polygon_points)?;
             let centroid = polygon.centroid();
             let pre_transform = DTransformation::new(0.0, (-centroid.x(), -centroid.y()));

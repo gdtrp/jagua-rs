@@ -98,6 +98,13 @@ pub struct SqsNestingRequest {
     /// that fit on one sheet. Requires exactly one part type in the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fit: Option<bool>,
+    /// Bucket the worker must write outputs into. None ⇒ legacy default
+    /// bucket (BE data-CDN path disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    /// Key prefix under `bucket`; None ⇒ fall back to `nesting/{correlation_id}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_prefix: Option<String>,
 }
 
 /// Generate an empty page SVG (used when all parts are placed)
@@ -541,17 +548,19 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
     Err(anyhow!("Invalid S3-compatible URL format: {}", s3_url))
 }
 
-/// Internal helper function to upload SVG to S3 (used by both improvement and final responses)
+/// Internal helper function to upload SVG to S3 (used by both improvement and final responses).
+/// `s3_prefix` is the full key prefix (without trailing slash) — callers should pass either the
+/// BE-provided `request.s3_prefix` or the legacy default `nesting/{correlation_id}`.
 async fn upload_svg_to_s3_internal(
     s3_client: &S3Client,
     s3_bucket: &str,
     aws_region: &str,
     svg_bytes: &[u8],
-    request_id: &str,
+    s3_prefix: &str,
     filename: &str,
     endpoint_url: Option<&str>,
 ) -> Result<String> {
-    let s3_key = format!("nesting/{}/{}", request_id, filename);
+    let s3_key = format!("{}/{}", s3_prefix.trim_end_matches('/'), filename);
     let s3_url = if let Some(endpoint) = endpoint_url {
         // Path-style URL for LocalStack/Minio
         format!(
@@ -1006,7 +1015,16 @@ impl SqsProcessor {
             info!("Spawning async task to handle improvement messages");
             let sqs_client_for_task = self.sqs_client.clone();
             let s3_client_for_task = self.s3_client.clone();
-            let s3_bucket_for_task = self.s3_bucket.clone();
+            // BE may override bucket / key-prefix per request; fall back to the
+            // worker's defaults so legacy callers keep working unchanged.
+            let s3_bucket_for_task = request
+                .bucket
+                .clone()
+                .unwrap_or_else(|| self.s3_bucket.clone());
+            let s3_prefix_for_task = request
+                .s3_prefix
+                .clone()
+                .unwrap_or_else(|| format!("nesting/{}", request.correlation_id));
             let aws_region_for_task = self.aws_region.clone();
             let endpoint_url_for_task = self.endpoint_url.clone();
             let output_queue_url_for_task = output_queue_url.to_string();
@@ -1027,10 +1045,10 @@ impl SqsProcessor {
                             let region = aws_region_for_task.clone();
                             let endpoint = endpoint_url_for_task.clone();
                             let bytes = page_bytes.clone();
-                            let corr_id = correlation_id_for_task.clone();
+                            let prefix = s3_prefix_for_task.clone();
                             let fname = filename.clone();
                             async move {
-                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, &fname, endpoint.as_deref()).await
+                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &prefix, &fname, endpoint.as_deref()).await
                             }
                         }).await {
                             Ok(url) => {
@@ -1056,9 +1074,9 @@ impl SqsProcessor {
                             let region = aws_region_for_task.clone();
                             let endpoint = endpoint_url_for_task.clone();
                             let bytes = last_page_bytes.clone();
-                            let corr_id = correlation_id_for_task.clone();
+                            let prefix = s3_prefix_for_task.clone();
                             async move {
-                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
+                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &prefix, "last-page.svg", endpoint.as_deref()).await
                             }
                         }).await {
                             Ok(url) => {
@@ -1230,20 +1248,32 @@ impl SqsProcessor {
                 nesting_result.page_svgs.len()
             );
 
+            // Resolve bucket / key-prefix for the final-response uploads. BE may
+            // override; otherwise we fall back to the worker default and the
+            // legacy `nesting/{correlation_id}` prefix.
+            let final_bucket = request
+                .bucket
+                .clone()
+                .unwrap_or_else(|| self.s3_bucket.clone());
+            let final_prefix = request
+                .s3_prefix
+                .clone()
+                .unwrap_or_else(|| format!("nesting/{}", request.correlation_id));
+
             // Upload all page SVGs to S3
             let mut page_svg_urls: Vec<String> = Vec::new();
             for (page_idx, page_bytes) in nesting_result.page_svgs.iter().enumerate() {
                 let filename = format!("page-{}.svg", page_idx);
                 match retry_with_backoff(&format!("upload final page {}", page_idx), || {
                     let s3_client = self.s3_client.clone();
-                    let bucket = self.s3_bucket.clone();
+                    let bucket = final_bucket.clone();
                     let region = self.aws_region.clone();
                     let endpoint = self.endpoint_url.clone();
                     let bytes = page_bytes.clone();
-                    let corr_id = request.correlation_id.clone();
+                    let prefix = final_prefix.clone();
                     let fname = filename.clone();
                     async move {
-                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, &fname, endpoint.as_deref()).await
+                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &prefix, &fname, endpoint.as_deref()).await
                     }
                 }).await {
                     Ok(url) => {
@@ -1265,13 +1295,13 @@ impl SqsProcessor {
             ) {
                 match retry_with_backoff("upload final last page", || {
                     let s3_client = self.s3_client.clone();
-                    let bucket = self.s3_bucket.clone();
+                    let bucket = final_bucket.clone();
                     let region = self.aws_region.clone();
                     let endpoint = self.endpoint_url.clone();
                     let bytes = last_page_bytes.clone();
-                    let corr_id = request.correlation_id.clone();
+                    let prefix = final_prefix.clone();
                     async move {
-                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &corr_id, "last-page.svg", endpoint.as_deref()).await
+                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &prefix, "last-page.svg", endpoint.as_deref()).await
                     }
                 }).await {
                     Ok(url) => {
