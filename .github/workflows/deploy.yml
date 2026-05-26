@@ -1,125 +1,203 @@
-name: Build, Push, and Deploy Docker Image
+name: Build, Push, and Deploy Jagua SQS Processor
+
+# Triggers
+#   - push to STAGING_BRANCH      → build :staging  → deploy staging
+#   - push to main or live-v* tag → build :production (also tagged :staging) → deploy prod AND staging
 
 on:
   push:
     tags:
       - 'live-v[0-9]+.[0-9]+.[0-9]+'
+    # Match every branch — GitHub Actions doesn't allow ${{ }} in trigger
+    # filters, so we can't reference env.STAGING_BRANCH here. Instead we
+    # trigger on all branches and let each job's `if:` gate the actual work
+    # against STAGING_BRANCH / main / live-v* tags. Cost: a short `config`
+    # runner fires on every branch push, but nothing else runs unless the
+    # branch matches.
     branches:
-      - bucket
-      - main
+      - '**'
   workflow_dispatch:
 
 env:
   AWS_REGION: eu-north-1
   ECR_REPOSITORY: jagua-sqs-processor
   IMAGE_TAG: ${{ github.sha }}
-  ECS_CLUSTER_STAGING: CUTLStagingCluster
-  ECS_SERVICE_STAGING: CUTLStagingJaguaSqsProcessorService
-  ECS_CLUSTER_PROD: CUTL-prodProductionCluster
-  ECS_SERVICE_PROD: CUTL-prodProductionJaguaSqsProcessorService
+  # Single source of truth for the staging branch name. Exported by the
+  # `config` job as an output so other jobs can reference it from their `if:`
+  # conditions (GitHub Actions does not expose `env.*` to job-level `if:`
+  # expressions — only `needs.*.outputs.*` works there). The `on.push.branches`
+  # trigger above matches `**` so renames here take effect with no other edits.
+  STAGING_BRANCH: bucket
 
 jobs:
-  build-and-push:
+  # ---------------------------------------------------------------------------
+  # Surfaces env.STAGING_BRANCH to downstream jobs' `if:` expressions, which
+  # can't read `env.*` directly.
+  # ---------------------------------------------------------------------------
+  config:
+    runs-on: ubuntu-latest
+    outputs:
+      staging_branch: ${{ env.STAGING_BRANCH }}
+    steps:
+      - run: echo "staging branch = $STAGING_BRANCH"
+
+  # ===========================================================================
+  # STAGING — STAGING_BRANCH only. Builds the artifact and tags it :staging.
+  # Pushes to main / live-v* skip this job — they reuse the production image
+  # (see build-prod, which also tags :staging).
+  # ===========================================================================
+  build-staging:
+    name: Build jagua image → staging
+    needs: config
+    if: github.ref == format('refs/heads/{0}', needs.config.outputs.staging_branch)
+    concurrency:
+      group: jagua-staging-${{ github.ref }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Log in to Amazon ECR
-        id: login-ecr
+      - id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build, tag, and push Docker image
+      - name: Build, tag, and push jagua image (staging)
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f jagua-sqs-processor/Dockerfile .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-      - name: Push staging tag for staging branch
-        if: github.ref == 'refs/heads/bucket'
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:staging
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:staging
-
-      - name: Push production tag for main branch
-        if: github.ref == 'refs/heads/main'
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:production
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:production
-
-      - name: Push production tag for release tag
-        if: startsWith(github.ref, 'refs/tags/live-v')
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:production
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:production
+          # Layer cache lives as a separate OCI artifact tag in the same ECR
+          # repo (:buildcache-staging). cache-to=mode=max also stores
+          # intermediate stages (apt installs, cargo dependency build), so
+          # unchanged stages are reused across runs. Each environment has its
+          # own cache ref so staging and prod don't fight over layer slots.
+          docker buildx build --platform linux/amd64 \
+            -f jagua-sqs-processor/Dockerfile \
+            --cache-from=type=registry,ref=$ECR_REGISTRY/$ECR_REPOSITORY:buildcache-staging \
+            --cache-to=type=registry,ref=$ECR_REGISTRY/$ECR_REPOSITORY:buildcache-staging,mode=max,image-manifest=true,oci-mediatypes=true \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:staging \
+            --push .
 
   deploy-staging:
-    needs: build-and-push
+    name: Deploy jagua → staging
+    # Runs after whichever build produced the :staging tag — build-staging on a
+    # STAGING_BRANCH push, or build-prod on main / live-v* (which tags the same
+    # image as :staging too). `!failure() && !cancelled()` lets us tolerate the
+    # always-skipped sibling build job. `config` is in needs so `if:` below can
+    # read its staging_branch output.
+    needs: [config, build-staging, build-prod]
+    if: |
+      !failure() && !cancelled()
+      && github.event_name == 'push'
+      && (
+        github.ref == format('refs/heads/{0}', needs.config.outputs.staging_branch)
+        || github.ref == 'refs/heads/main'
+        || startsWith(github.ref, 'refs/tags/live-v')
+      )
+    concurrency:
+      group: jagua-staging-deploy
+      cancel-in-progress: false
+    environment:
+      name: staging
+      url: https://eu-north-1.console.aws.amazon.com/ecs/v2/clusters/CUTLStagingCluster/services/CUTLStagingJaguaSqsProcessorService
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    if: github.ref == 'refs/heads/bucket'
+    env:
+      ECS_CLUSTER: CUTLStagingCluster
+      ECS_SERVICE: CUTLStagingJaguaSqsProcessorService
     steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Update ECS service staging
-        env:
-          ECS_CLUSTER: ${{ env.ECS_CLUSTER_STAGING }}
-          ECS_SERVICE: ${{ env.ECS_SERVICE_STAGING }}
+      - name: Force new ECS deployment (staging)
         run: |
           aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
             --force-new-deployment
 
-  deploy-production:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+  # ===========================================================================
+  # PRODUCTION — main branch or live-v* tag only.
+  # Independent concurrency group; a staging push never cancels a prod deploy.
+  # Tags the built image as :staging too so deploy-staging can roll the same
+  # artifact to staging in parallel (see comment on deploy-staging).
+  # ===========================================================================
+  build-prod:
+    name: Build jagua image → production
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/live-v')
+    concurrency:
+      group: jagua-prod-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build, tag, and push jagua image (production)
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          # Layer cache lives as :buildcache-prod in the same ECR repo (kept
+          # separate from staging so the two pipelines don't evict each
+          # other's intermediates). cache-from also reads :buildcache-staging
+          # as a fallback so a fresh prod build right after a staging build
+          # of the same SHA hits warm layers.
+          docker buildx build --platform linux/amd64 \
+            -f jagua-sqs-processor/Dockerfile \
+            --cache-from=type=registry,ref=$ECR_REGISTRY/$ECR_REPOSITORY:buildcache-prod \
+            --cache-from=type=registry,ref=$ECR_REGISTRY/$ECR_REPOSITORY:buildcache-staging \
+            --cache-to=type=registry,ref=$ECR_REGISTRY/$ECR_REPOSITORY:buildcache-prod,mode=max,image-manifest=true,oci-mediatypes=true \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:production \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:staging \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            --push .
+
+  deploy-prod:
+    name: Deploy jagua → production
+    needs: build-prod
+    if: github.event_name == 'push'
+    concurrency:
+      group: jagua-prod-deploy
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: https://eu-north-1.console.aws.amazon.com/ecs/v2/clusters/CUTL-prodProductionCluster/services/CUTL-prodProductionJaguaSqsProcessorService
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ECS_CLUSTER: CUTL-prodProductionCluster
+      ECS_SERVICE: CUTL-prodProductionJaguaSqsProcessorService
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Update ECS service production
-        env:
-          ECS_CLUSTER: ${{ env.ECS_CLUSTER_PROD }}
-          ECS_SERVICE: ${{ env.ECS_SERVICE_PROD }}
+      - name: Force new ECS deployment (production)
         run: |
           aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
             --force-new-deployment
-
