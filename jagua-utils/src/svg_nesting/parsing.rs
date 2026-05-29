@@ -1,7 +1,8 @@
 //! SVG parsing utilities for extracting geometry from SVG files
 
 use anyhow::Result;
-use jagua_rs::geometry::primitives::Point;
+use jagua_rs::geometry::geo_traits::CollidesWith;
+use jagua_rs::geometry::primitives::{Edge, Point};
 
 /// Number of segments to use when linearizing curves
 const CURVE_SEGMENTS: usize = 16;
@@ -982,6 +983,110 @@ pub fn reverse_winding(points: &[Point]) -> Vec<Point> {
     points.iter().rev().cloned().collect()
 }
 
+/// Detects the first pair of non-adjacent edges that collide, mirroring exactly
+/// the self-intersection check inside `jagua_rs::geometry::primitives::SPolygon::new`
+/// (same `Edge::collides_with` semantics and same neighbouring-edge exclusion).
+///
+/// Returns the colliding edge indices `(i, j)` with `i < j`, or `None` when the
+/// ring is simple.
+fn find_self_intersection(points: &[Point]) -> Option<(usize, usize)> {
+    let n = points.len();
+    if n < 4 {
+        return None;
+    }
+    let edge = |i: usize| Edge {
+        start: points[i],
+        end: points[(i + 1) % n],
+    };
+    let are_neighboring = |i: usize, j: usize| i + 1 == j || (i == 0 && j == n - 1);
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if !are_neighboring(i, j) && edge(i).collides_with(&edge(j)) {
+                return Some((i, j));
+            }
+        }
+    }
+    None
+}
+
+/// Removes consecutive duplicate vertices (including the wrap-around pair) so
+/// that cutting a self-intersecting ring does not leave a zero-length edge.
+fn remove_consecutive_duplicates(mut points: Vec<Point>) -> Vec<Point> {
+    points.dedup();
+    while points.len() > 1 && points.first() == points.last() {
+        points.pop();
+    }
+    points
+}
+
+/// Repairs a self-intersecting outer boundary before it reaches
+/// `SPolygon::new`. Such rings are produced by upstream SVG/DXF generation that
+/// we do not control — e.g. a malformed rounded corner that folds back on
+/// itself, like the top-left corner spike `... L-117.57,70.5 L-119.36,69.36
+/// L-117.0,70.5 L-120.0,-67.5 ...` where the second-to-last vertex lands back
+/// on the top edge.
+///
+/// Strategy: while the ring self-intersects, find the first colliding pair of
+/// non-adjacent edges `(i, j)`. This splits the ring into two chains — the
+/// "detour" `i+1 ..= j` and the remaining vertices. The chain with the smaller
+/// absolute area is discarded (it is the spurious spike/loop), keeping the part
+/// body intact. Consecutive duplicates are removed after every cut. The loop is
+/// bounded by the vertex count; if a clean ring cannot be produced the original
+/// points are returned unchanged so the caller still surfaces jagua-rs's
+/// descriptive error rather than silently mangling geometry.
+pub fn sanitize_polygon(points: Vec<Point>) -> Vec<Point> {
+    if find_self_intersection(&points).is_none() {
+        return points;
+    }
+
+    log::warn!(
+        "Self-intersecting outer boundary detected ({} vertices); attempting repair",
+        points.len()
+    );
+
+    let original = points.clone();
+    let mut pts = points;
+    let max_iters = original.len() + 1;
+
+    for _ in 0..max_iters {
+        let Some((i, j)) = find_self_intersection(&pts) else {
+            log::info!(
+                "Repaired self-intersecting boundary: {} -> {} vertices",
+                original.len(),
+                pts.len()
+            );
+            return pts;
+        };
+
+        // Chain A: the detour vertices i+1 ..= j.
+        let chain_a: Vec<Point> = pts[i + 1..=j].to_vec();
+        // Chain B: everything else (the remaining ring).
+        let mut chain_b: Vec<Point> = Vec::with_capacity(pts.len());
+        chain_b.extend_from_slice(&pts[..=i]);
+        chain_b.extend_from_slice(&pts[j + 1..]);
+
+        let area_a = calculate_signed_area(&chain_a).abs();
+        let area_b = calculate_signed_area(&chain_b).abs();
+
+        // Keep the larger-area chain; the smaller one is the spurious spike.
+        pts = if area_a <= area_b { chain_b } else { chain_a };
+        pts = remove_consecutive_duplicates(pts);
+
+        if pts.len() < 3 {
+            log::warn!("Polygon repair collapsed the ring; returning original points");
+            return original;
+        }
+    }
+
+    if find_self_intersection(&pts).is_none() {
+        pts
+    } else {
+        log::warn!("Could not fully repair self-intersecting boundary; returning original points");
+        original
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1415,5 +1520,113 @@ mod tests {
         }
 
         result.expect("Failed to parse fork.svg path");
+    }
+
+    /// The exact outer boundary from correlation_id=b9f7a886-... (the max_fit
+    /// request that failed). The top-left rounded corner folds back on itself:
+    /// vertex 3 `(-117.0, 70.5)` lands on edge 0 (the top edge at y=70.5),
+    /// producing intersecting edges 0 and 2.
+    fn corner_spike_polygon() -> Vec<Point> {
+        vec![
+            Point(117.0, 70.5),
+            Point(-117.5746, 70.5),
+            Point(-119.35766, 69.35511),
+            Point(-117.0, 70.5),
+            Point(-120.0, -67.5),
+            Point(-120.0, -68.0746),
+            Point(-119.91582, -68.20571),
+            Point(-117.0, -70.5),
+            Point(-57.039314, -91.2616),
+            Point(117.0, -70.5),
+            Point(119.35766, -69.35511),
+            Point(120.0, -68.942665),
+            Point(120.0, 67.5),
+            Point(119.91582, 68.20571),
+            Point(119.75596, 69.54574),
+            Point(118.85511, 69.85766),
+        ]
+    }
+
+    #[test]
+    fn test_raw_corner_spike_polygon_is_rejected_by_jagua_rs() {
+        use jagua_rs::geometry::primitives::SPolygon;
+        // Documents the original bug: jagua-rs rejects the unsanitized ring.
+        let err = SPolygon::new(corner_spike_polygon())
+            .expect_err("expected the self-intersecting ring to be rejected");
+        assert!(
+            err.to_string().contains("intersecting edges"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_repairs_corner_spike_polygon() {
+        use jagua_rs::geometry::primitives::SPolygon;
+
+        let raw = corner_spike_polygon();
+        assert!(
+            find_self_intersection(&raw).is_some(),
+            "fixture should be self-intersecting"
+        );
+
+        let repaired = sanitize_polygon(raw);
+        assert!(
+            find_self_intersection(&repaired).is_none(),
+            "repaired ring must be simple"
+        );
+
+        // The spurious 2-vertex spike is dropped; the part body is preserved.
+        assert_eq!(repaired.len(), 14);
+        let poly = SPolygon::new(repaired).expect("sanitized polygon must be valid");
+        // Bounding box ~240 x ~161 (with the notch). Area is dominated by the
+        // ~240 x 141 body; assert it is in a sane range, not collapsed.
+        assert!(
+            poly.area > 30_000.0 && poly.area < 40_000.0,
+            "unexpected area after repair: {}",
+            poly.area
+        );
+    }
+
+    #[test]
+    fn test_sanitize_is_noop_for_simple_polygon() {
+        let square = vec![
+            Point(0.0, 0.0),
+            Point(100.0, 0.0),
+            Point(100.0, 100.0),
+            Point(0.0, 100.0),
+        ];
+        assert_eq!(sanitize_polygon(square.clone()), square);
+    }
+
+    #[test]
+    fn test_parse_and_sanitize_corner_spike_svg_path() {
+        use jagua_rs::geometry::primitives::SPolygon;
+
+        // The outer subpath as it appears in the failing result.svg.
+        let path = "M116.99999999999827,70.49999999999501 \
+            L-117.57460033234875,70.50000000000001 \
+            L-119.35766178233175,69.35510940921101 \
+            L-117.0000000000001,70.49999999999993 \
+            L-120.00000000000172,-67.49999999999997 \
+            L-120.00000000000175,-68.074600332348 \
+            L-119.91581370408993,-68.2057127199091 \
+            L-117.00000000000175,-70.49999999999999 \
+            L-57.039314822834754,-91.26160007367899 \
+            L117,-70.50000000000003 \
+            L119.35766178233027,-69.35510940920899 \
+            L119.99999999999827,-68.94266878271098 \
+            L120,67.4999999999935 \
+            L119.91581370408827,68.20571271991001 \
+            L119.75595842979627,69.54573961138101 \
+            L118.85510940920915,69.85766178233088 \
+            L116.99999999999827,70.50000000000001 \
+            L116.99999999999827,70.49999999999501 Z";
+
+        let (outer, _holes) = parse_svg_path(path).expect("path should parse");
+        // Without repair the engine rejects this ring.
+        assert!(SPolygon::new(outer.clone()).is_err());
+
+        let outer = sanitize_polygon(outer);
+        SPolygon::new(outer).expect("sanitized outer boundary must be valid");
     }
 }
