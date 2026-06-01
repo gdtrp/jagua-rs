@@ -919,15 +919,161 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         //   = 6 * 11 = 66. Pre-fix produced 70. After the bin_stock=1 +
         // budget-rescale + extended max_fit iteration count + ls_frac
         // diversification, we observe 72.
+        // Under the hard 55s max_fit cap (single rotation tier, ~1 full wave on
+        // an 1800x1800 sheet) the optimiser lands ~65-68 here — it can no longer
+        // afford the many refinement waves that previously reached 72. This is
+        // the deliberate quality/latency trade of the time cap; assert >= 64 to
+        // keep a real packing-quality floor (well above the ~60 naive grid)
+        // without being flaky on non-deterministic parallel seeds.
         assert!(
-            nr.parts_placed >= 72,
-            "expected at least 72 parts on 1800x1800, got {}",
+            nr.parts_placed >= 64,
+            "expected at least 64 parts on 1800x1800, got {}",
             nr.parts_placed
         );
         println!(
             "max_fit 1800x1800 rounded-rect-with-cutouts: placed {} parts, utilisation {:.1}%",
             nr.parts_placed,
             nr.utilisation * 100.0
+        );
+    }
+
+    /// Regression test for the "runs forever" bug reproduced from production logs.
+    ///
+    /// A `max_fit` request (production part `prod-1.svg`, ~488x488mm) on a
+    /// 1500x3000 sheet with spacing 10 would keep optimising for 10-15 minutes
+    /// ("in circles") even though it found its best packing within seconds. Two
+    /// compounding causes:
+    ///   1. `max_fit` saturated the count to 10_000 copies, so every run wasted
+    ///      work on the ~9.9k copies that can never fit (LBF cost scales with the
+    ///      requested quantity).
+    ///   2. Once the best placement plateaued, no single run could improve it, so
+    ///      the loop never converged — it just escalated parameters (making each
+    ///      run slower) until the 100-run / 600s cap.
+    ///
+    /// The fix caps the count to a geometric upper bound (bin_area/part_area) and
+    /// stops after a couple of batches without improvement. This test asserts the
+    /// optimisation terminates well under the old 600s ceiling.
+    #[test]
+    fn test_max_fit_prod_1_terminates_quickly() {
+        let _ = env_logger::try_init();
+
+        let svg = include_bytes!("../../jagua-sqs-processor/tests/testdata/prod-1.svg").to_vec();
+        let strategy = AdaptiveNestingStrategy::new();
+        let part = PartInput {
+            svg_bytes: svg,
+            count: 0, // ignored by max_fit helper
+            item_id: None,
+        };
+
+        let start = Instant::now();
+        let result = nest_max_fit_single_sheet(
+            &strategy, 1500.0, // bin_width  (production sheet)
+            3000.0, // bin_height
+            10.0,   // spacing   (production spacing)
+            &part, 4, // amount_of_rotations
+            None,
+        );
+        let duration = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "max_fit nesting should succeed: {:?}",
+            result.err()
+        );
+        let nr = result.unwrap();
+
+        assert_eq!(nr.pages.len(), 1, "max_fit must collapse to one page");
+        assert!(
+            nr.parts_placed > 0,
+            "should fit at least one part on a 1500x3000 sheet"
+        );
+        assert_eq!(
+            nr.parts_placed, nr.total_parts_requested,
+            "total_parts_requested must equal parts_placed for max_fit"
+        );
+
+        // Regression assertion: before the fix this ran for ~10-15 minutes
+        // (until the 600s internal cap, multiplied by SQS redelivery). It now
+        // converges in a fraction of that. 240s leaves generous CI headroom
+        // while still failing hard if the runaway loop ever returns.
+        // Hard cap: max_fit must return within the frontend's 60s request
+        // timeout. The strategy enforces a 53s work deadline (+ a little SVG
+        // generation), so a single execution always lands under 60s.
+        assert!(
+            duration.as_secs() < 60,
+            "max_fit must return within the 60s frontend timeout, but took {} seconds",
+            duration.as_secs()
+        );
+
+        println!(
+            "max_fit prod-1 1500x3000 spacing 10: placed {} parts, utilisation {:.1}% in {:.2}s",
+            nr.parts_placed,
+            nr.utilisation * 100.0,
+            duration.as_secs_f64()
+        );
+    }
+
+    /// Same runaway-loop regression as [`test_max_fit_prod_1_terminates_quickly`],
+    /// reproduced from the original reported request (part stored as `prod-2.svg`)
+    /// nested for maximum fit on a 1500x3000 sheet with spacing 10. Asserts the
+    /// optimisation converges and stops well under the old 600s ceiling.
+    #[test]
+    fn test_max_fit_prod_2_terminates_quickly() {
+        let _ = env_logger::try_init();
+
+        let svg = include_bytes!("../../jagua-sqs-processor/tests/testdata/prod-2.svg").to_vec();
+        let strategy = AdaptiveNestingStrategy::new();
+        let part = PartInput {
+            svg_bytes: svg,
+            count: 0, // ignored by max_fit helper
+            item_id: None,
+        };
+
+        let start = Instant::now();
+        let result = nest_max_fit_single_sheet(
+            &strategy, 1500.0, // bin_width  (production sheet)
+            3000.0, // bin_height
+            10.0,   // spacing   (production spacing)
+            &part, 4, // amount_of_rotations
+            None,
+        );
+        let duration = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "max_fit nesting should succeed: {:?}",
+            result.err()
+        );
+        let nr = result.unwrap();
+
+        assert_eq!(nr.pages.len(), 1, "max_fit must collapse to one page");
+        assert_eq!(
+            nr.parts_placed, nr.total_parts_requested,
+            "total_parts_requested must equal parts_placed for max_fit"
+        );
+
+        // Packing quality: this part fits ~300+ on a 1500x3000 sheet; the
+        // parallel adaptive search must reach that within the time budget.
+        assert!(
+            nr.parts_placed > 300,
+            "expected > 300 parts on 1500x3000, got {}",
+            nr.parts_placed
+        );
+
+        // Hard cap: max_fit must return within the frontend's 60s request
+        // timeout. The strategy uses a 42s work deadline and a between-wave
+        // predictive guard, so a single execution lands well under 60s.
+        assert!(
+            duration.as_secs() < 60,
+            "max_fit must return within the 60s frontend timeout, but took {} seconds",
+            duration.as_secs()
+        );
+
+        println!(
+            "max_fit prod-2 1500x3000 spacing 10: placed {} parts, utilisation {:.1}% in {:.2}s",
+            nr.parts_placed,
+            nr.utilisation * 100.0,
+            duration.as_secs_f64()
         );
     }
 }

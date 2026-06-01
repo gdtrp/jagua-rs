@@ -138,7 +138,7 @@ pub fn post_process_svg(svg_str: &str, holes: &[Vec<Point>]) -> String {
 
     let mut matches_found = 0;
     result = re_item
-        .replace_all(&result, |caps: &regex::Captures| -> String {
+        .replace_all(&result, |caps: &regex::Captures<'_>| -> String {
             matches_found += 1;
             let item_start = caps.get(1).unwrap().as_str();
             let outer_path = caps.get(2).unwrap().as_str();
@@ -349,7 +349,7 @@ pub fn post_process_svg_multi(svg_str: &str, item_id_to_holes: &[&[Vec<Point>]])
     let re_item = Regex::new(r##"(<g id="item_(\d+)">\s*<path d=")([^"]+)(" [^>]*/>)"##).unwrap();
 
     result = re_item
-        .replace_all(&result, |caps: &regex::Captures| -> String {
+        .replace_all(&result, |caps: &regex::Captures<'_>| -> String {
             let item_start = caps.get(1).unwrap().as_str();
             let item_id: usize = caps.get(2).unwrap().as_str().parse().unwrap_or(0);
             let outer_path = caps.get(3).unwrap().as_str();

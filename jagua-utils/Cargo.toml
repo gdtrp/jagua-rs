@@ -16,6 +16,7 @@ anyhow = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 regex = "1"
+rayon = { workspace = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }
@@ -23,7 +24,10 @@ serde_json = { workspace = true }
 
 [lints.rust]
 warnings = "deny"
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
 
 [lints.clippy]
+all = { level = "warn", priority = -1 }
 too_many_arguments = "allow"
 type_complexity = "allow"

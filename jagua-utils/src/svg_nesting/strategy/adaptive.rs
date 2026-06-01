@@ -26,7 +26,73 @@ use lbf::config::LBFConfig;
 use lbf::opt::lbf_bpp::LBFOptimizerBP;
 use rand::SeedableRng;
 use rand::prelude::SmallRng;
-use std::time::Instant;
+use rayon::prelude::*;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// Process-wide ceiling on the number of optimization routines (parallel seed
+/// runs) executing concurrently across ALL in-flight nesting executions.
+///
+/// Each execution fans a wave of independent runs out across CPU cores. Without
+/// a global cap, a burst of simultaneous requests (e.g. many `max_fit` SQS
+/// messages) would each try to fan out, flooding the shared rayon pool with far
+/// more queued work than there are cores and slowing every request down. This
+/// bounds the total in-flight fan-out so the machine stays responsive under
+/// load.
+const MAX_GLOBAL_ROUTINES: usize = 100;
+
+/// Per-execution reserved routine counts, keyed by a unique execution id. The
+/// sum of the values is held at or below [`MAX_GLOBAL_ROUTINES`]. An execution
+/// reserves before each wave and releases (via [`RoutineReservation`]'s `Drop`)
+/// once the wave completes, so the budget is shared fairly over time.
+static GLOBAL_ROUTINES: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+
+/// Accessor for the lazily-initialised global routine map.
+fn global_routines() -> &'static Mutex<HashMap<u64, usize>> {
+    GLOBAL_ROUTINES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Monotonic source of unique execution ids (one per `nest_inner` call).
+static EXECUTION_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// RAII reservation of a slice of the global routine budget. Holds the granted
+/// count for the lifetime of one wave; releases it on drop so a panic or early
+/// return can't leak the reservation and starve later executions.
+struct RoutineReservation {
+    execution_id: u64,
+    /// Number of routines actually granted (>= 1, may be < requested when the
+    /// global budget is contended).
+    granted: usize,
+}
+
+impl Drop for RoutineReservation {
+    fn drop(&mut self) {
+        if let Ok(mut map) = global_routines().lock() {
+            map.remove(&self.execution_id);
+        }
+    }
+}
+
+/// Reserve up to `desired` routines for `execution_id` from the shared global
+/// budget. Grants `min(desired, remaining)` but always at least 1, so an
+/// execution can never be starved into making zero progress even when the
+/// budget is fully subscribed.
+fn reserve_routines(execution_id: u64, desired: usize) -> RoutineReservation {
+    let mut map = global_routines().lock().unwrap_or_else(|e| e.into_inner());
+    // This execution's previous wave (if any) is released before the next wave
+    // reserves, but guard against a stale entry just in case.
+    map.remove(&execution_id);
+    let in_use: usize = map.values().copied().sum();
+    let available = MAX_GLOBAL_ROUTINES.saturating_sub(in_use);
+    let granted = desired.min(available).max(1);
+    map.insert(execution_id, granted);
+    RoutineReservation {
+        execution_id,
+        granted,
+    }
+}
 
 /// Adaptive nesting strategy that starts with lower parameters and adaptively increases them
 /// based on results. Sends intermediate improvements via callback.
@@ -124,7 +190,10 @@ impl AdaptiveNestingStrategy {
             let mut optimizer =
                 LBFOptimizerBP::new(instance.clone(), lbf_config, SmallRng::seed_from_u64(seed));
 
-            // Use solve_with_cancellation to allow early termination within the LBF optimizer
+            // Let each run complete fully (cutting LBF mid-solve yields a sparse
+            // partial layout). The wall-clock cap is honoured *between* waves by
+            // the predictive guard in nest_inner, which refuses to start a wave
+            // that the running average says won't finish before the deadline.
             let cancellation_fn = || self.is_cancelled();
             let solution = optimizer.solve_with_cancellation(Some(&cancellation_fn));
 
@@ -149,6 +218,58 @@ impl AdaptiveNestingStrategy {
             Some(solution) => Ok((best_placed, solution)),
             None => anyhow::bail!("No items could be placed in the bin"),
         }
+    }
+
+    /// Run `wave_size` independent optimizations concurrently and return the
+    /// best `(placed, solution)` among them.
+    ///
+    /// Each run is fully independent (its own cloned instance + RNG seed), so
+    /// they parallelise cleanly across CPU cores via rayon's global pool. This
+    /// lets the adaptive search explore many seeds within a tight wall-clock
+    /// budget instead of one-at-a-time (~20s each for dense max_fit inputs).
+    /// `ls_frac` is varied per run within the wave, same {0.3, 0.5, 0.7} cycle
+    /// as the sequential path.
+    fn run_parallel_wave(
+        &self,
+        instance: &BPInstance,
+        cde_config: &CDEConfig,
+        spacing: f32,
+        loops: usize,
+        placements: usize,
+        base_seed: usize,
+        wave_size: usize,
+    ) -> Result<(usize, BPSolution)> {
+        let results: Vec<(usize, BPSolution)> = (0..wave_size)
+            .into_par_iter()
+            .filter_map(|i| {
+                let run_no = base_seed + i;
+                let ls_frac = match run_no % 3 {
+                    1 => 0.3,
+                    2 => 0.5,
+                    _ => 0.7,
+                };
+                self.run_single_optimization(
+                    instance, cde_config, spacing, loops, placements, run_no, ls_frac,
+                )
+                .ok()
+            })
+            .collect();
+
+        // Best = most parts placed, ties broken by fewer pages.
+        let mut best: Option<(usize, BPSolution)> = None;
+        for (placed, solution) in results {
+            let pages = solution.layout_snapshots.len();
+            let better = match &best {
+                None => true,
+                Some((bp, bsol)) => {
+                    placed > *bp || (placed == *bp && pages < bsol.layout_snapshots.len())
+                }
+            };
+            if better {
+                best = Some((placed, solution));
+            }
+        }
+        best.ok_or_else(|| anyhow::anyhow!("No items could be placed in the bin"))
     }
 
     /// Generate SVG from solution
@@ -317,24 +438,42 @@ impl AdaptiveNestingStrategy {
             item_id: part.item_id.clone(),
         };
         let parts = std::slice::from_ref(&saturated);
-        // Wrap the user callback so intermediate improvements report
-        // truncated single-page numbers (otherwise subscribers see
-        // parts_placed=71 / total=10000 + a giant unplaced grid SVG).
-        let wrapped_callback: Option<crate::svg_nesting::strategy::ImprovementCallback> =
+
+        // Hard wall-clock cap: the frontend aborts the request at 60s and we
+        // promise ≤55s end-to-end. Waves run to completion (cutting LBF
+        // mid-solve yields a sparse layout), so the cap is enforced *between*
+        // waves: nest_inner's predictive guard refuses to start a wave that the
+        // running per-wave average says won't finish before this deadline. The
+        // budget is set under 55s so that the last wave it does start, plus final
+        // SVG generation, still lands under the frontend timeout. (One wave can
+        // exceed it on unusually slow hardware — a single saturated wave is
+        // ~40s here; lower this if prod machines are slower.)
+        const MAX_FIT_TIME_BUDGET_SECS: u64 = 42;
+        let deadline = Instant::now() + Duration::from_secs(MAX_FIT_TIME_BUDGET_SECS);
+
+        // Single fixed orientation for now; the parallel adaptive search inside
+        // nest_inner explores many seeds within the deadline and keeps the best.
+        let rotations = if amount_of_rotations == 0 { 0 } else { 1 };
+
+        // Wrap the user callback so streamed intermediate improvements report
+        // truncated single-page numbers.
+        let wrapped_cb: Option<crate::svg_nesting::strategy::ImprovementCallback> =
             improvement_callback.map(|cb| {
                 Box::new(move |mut intermediate: NestingResult| -> Result<()> {
                     truncate_to_first_page(&mut intermediate);
                     cb(intermediate)
                 }) as crate::svg_nesting::strategy::ImprovementCallback
             });
+
         let mut result = self.nest_inner(
             bin_width,
             bin_height,
             spacing,
             parts,
-            amount_of_rotations,
-            wrapped_callback,
+            rotations,
+            wrapped_cb,
             Some(1), // bin_stock = 1: forces single-bin packing
+            Some(deadline),
         )?;
         truncate_to_first_page(&mut result);
         Ok(result)
@@ -358,6 +497,7 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             parts,
             amount_of_rotations,
             improvement_callback,
+            None,
             None,
         )
     }
@@ -398,6 +538,7 @@ impl AdaptiveNestingStrategy {
         amount_of_rotations: usize,
         improvement_callback: Option<crate::svg_nesting::strategy::ImprovementCallback>,
         bin_stock_override: Option<usize>,
+        deadline: Option<Instant>,
     ) -> Result<NestingResult> {
         // Parse all part SVGs and build per-part data
         struct ParsedPart {
@@ -467,6 +608,27 @@ impl AdaptiveNestingStrategy {
                 count: part.count,
                 item_id: part.item_id.clone(),
             });
+        }
+
+        // For max_fit the caller saturates the count (e.g. 10_000 copies) and
+        // lets the optimizer place as many as fit. But LbfOptimizer::solve() does
+        // work proportional to the *requested* quantity: every copy that can't
+        // fit still burns a full sampling pass (and is rendered into the unplaced
+        // grid). With thousands of impossible copies, each run takes minutes and
+        // the optimization appears to hang.
+        //
+        // The number of parts that can physically fit is bounded by
+        // bin_area / part_area (a strict upper bound: real packing with spacing
+        // and geometric waste always places fewer). Clamp each part's count to
+        // that bound plus a small margin so the optimizer still has more copies
+        // than it can ever place, without churning through impossible extras.
+        if bin_stock_override.is_some() {
+            let bin_area = bin_width * bin_height;
+            for parsed in parsed_parts.iter_mut() {
+                let part_area = parsed.item_shape.shape.area.max(f32::MIN_POSITIVE);
+                let upper_bound = ((bin_area / part_area).ceil() as usize).saturating_add(2);
+                parsed.count = parsed.count.min(upper_bound);
+            }
         }
 
         let total_parts_requested: usize = parsed_parts.iter().map(|p| p.count).sum();
@@ -581,6 +743,9 @@ impl AdaptiveNestingStrategy {
 
         // Adaptive optimization loop
         let optimization_start = Instant::now();
+        // Unique id for this execution, used to track its share of the global
+        // routine budget (see [`GLOBAL_ROUTINES`]).
+        let execution_id = EXECUTION_ID_SEQ.fetch_add(1, Ordering::Relaxed);
         let is_max_fit = bin_stock_override.is_some();
         // For high item counts, scale down loops and samples to keep total work per run manageable.
         // max_fit gets a 2x budget since the user explicitly asked for the
@@ -617,17 +782,63 @@ impl AdaptiveNestingStrategy {
         let mut best_placed = 0;
         let mut best_pages = usize::MAX;
         let mut total_runs = 0;
+        let mut batches_without_improvement = 0;
+        // Slowest single run observed so far — feeds the predictive time guard
+        // below, which uses the previous waves' durations to decide whether
+        // there is room for another wave before the deadline is exhausted.
+        let mut max_single_run_secs: u64 = 0;
+        // Number of independent runs explored concurrently per wave. Defaults to
+        // the machine's parallelism (override via NEST_RUN_PARALLELISM), clamped
+        // so a single request can't spawn an unbounded fan-out.
+        let run_parallelism: usize = std::env::var("NEST_RUN_PARALLELISM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+            .clamp(1, 32);
+        // Wall-clock safety ceiling for the whole optimization. The search
+        // normally stops far earlier via convergence (no improvement across
+        // several parallel waves); this cap only bounds pathological inputs and
+        // is kept under the SQS visibility timeout so a job can never overrun
+        // into redelivery (which spawned the duplicate concurrent runs we saw in
+        // production). max_fit and regular nesting share the same ceiling — the
+        // user wants the densest achievable packing, so we let it explore as long
+        // as it keeps finding better results.
+        let time_budget_secs: u64 = MAX_TOTAL_OPTIMIZATION_SECONDS;
+        // Absolute wall-clock deadline. max_fit supplies a tight one (its 55s
+        // frontend cap); otherwise we derive it from this call's start and the
+        // 600s safety ceiling.
+        let deadline =
+            deadline.unwrap_or_else(|| optimization_start + Duration::from_secs(time_budget_secs));
         // Wider exploration budget for max_fit: extra adaptive iterations can
         // find seeds/orderings that interlock the last few parts.
         let max_total_runs: usize = if is_max_fit { 100 } else { 60 };
         const MAX_RUNS_WITHOUT_IMPROVEMENT: usize = 15;
+        // Stop once several consecutive parallel waves fail to improve the best
+        // result: each non-improving batch bumps the parameters and retries;
+        // after this many in a row the search has converged. This guarantees
+        // termination instead of grinding to the time cap. Since each wave now
+        // explores `run_parallelism` seeds at once, a non-improving wave is
+        // strong evidence of a plateau — but the user wants the densest packing,
+        // so we keep exploring for a few waves before declaring convergence.
+        const MAX_BATCHES_WITHOUT_IMPROVEMENT: usize = 5;
+        // Cap how far the escalation grows `loops`. Without this, every quiet
+        // batch keeps adding +2 loops, making each subsequent run progressively
+        // slower; capping keeps the extra exploration batches affordable.
+        const MAX_ESCALATED_LOOPS: usize = 7;
         const MAX_RUN_DURATION_SECONDS: u64 = 120;
+        // Wall-clock safety ceiling, shared by max_fit and regular nesting. Kept
+        // under the SQS visibility timeout so a job can't overrun into redelivery.
         const MAX_TOTAL_OPTIMIZATION_SECONDS: u64 = 600;
         const HIGH_DENSITY_THRESHOLD: f32 = 0.65;
 
         'outer: loop {
             let elapsed_total = optimization_start.elapsed().as_secs();
-            if elapsed_total >= MAX_TOTAL_OPTIMIZATION_SECONDS {
+            if Instant::now() >= deadline {
                 log::info!(
                     "Reached maximum optimization time ({} seconds), stopping with {} parts placed",
                     elapsed_total,
@@ -660,6 +871,27 @@ impl AdaptiveNestingStrategy {
                     break;
                 }
 
+                // Predictive time guard: if the slowest run so far would push the
+                // total past the budget, return the best result we already have
+                // instead of starting another long run. This keeps execution time
+                // bounded well under the SQS visibility window so a slow request
+                // can't overrun and trigger redelivery (which spawns duplicate
+                // concurrent optimizations).
+                let elapsed_now = optimization_start.elapsed().as_secs();
+                if Instant::now() + Duration::from_secs(max_single_run_secs) >= deadline
+                    && let Some(best) = best_result.take()
+                {
+                    log::info!(
+                        "Projected next run (~{}s) would exceed the deadline at {}s elapsed; \
+                         returning best result early ({} parts on {} pages)",
+                        max_single_run_secs,
+                        elapsed_now,
+                        best_placed,
+                        best_pages
+                    );
+                    return Ok(best);
+                }
+
                 let run_start = Instant::now();
                 total_runs += 1;
 
@@ -686,20 +918,53 @@ impl AdaptiveNestingStrategy {
                     ls_frac
                 );
 
-                let optimization_result = self.run_single_optimization(
+                // Explore several independent seeds concurrently and keep the
+                // best. The wave is bounded two ways: locally so cumulative runs
+                // never exceed `max_total_runs`, and globally by reserving a
+                // slice of the shared routine budget so concurrent executions
+                // can't collectively oversubscribe the machine under heavy load.
+                let desired_wave = run_parallelism
+                    .min(max_total_runs.saturating_sub(total_runs).saturating_add(1))
+                    .max(1);
+                let reservation = reserve_routines(execution_id, desired_wave);
+                let wave_size = reservation.granted;
+                if wave_size < desired_wave {
+                    log::debug!(
+                        "Global routine budget contended: wanted {} routines, granted {}",
+                        desired_wave,
+                        wave_size
+                    );
+                }
+                let optimization_result = self.run_parallel_wave(
                     &instance,
                     &cde_config,
                     spacing,
                     loops,
                     placements,
                     total_runs,
-                    ls_frac,
+                    wave_size,
                 );
+                drop(reservation);
+                total_runs += wave_size.saturating_sub(1);
+                let _ = ls_frac;
 
                 let (_placed, solution) = match optimization_result {
                     Ok(r) => r,
                     Err(e) => {
-                        log::warn!("No items could be placed: {}", e);
+                        // A wave only errors when every run in it placed nothing.
+                        // If an earlier wave already produced a packing, never
+                        // throw it away — return the stored best instead of an
+                        // empty result. Only the very first wave (no best yet)
+                        // returns the empty placeholder.
+                        log::warn!("Wave placed no items: {}", e);
+                        if let Some(best) = best_result.take() {
+                            log::info!(
+                                "Returning previous best result ({} parts on {} pages) after a barren wave",
+                                best_placed,
+                                best_pages
+                            );
+                            return Ok(best);
+                        }
                         return Ok(NestingResult {
                             combined_svg: Vec::new(),
                             page_svgs: Vec::new(),
@@ -713,6 +978,7 @@ impl AdaptiveNestingStrategy {
                 };
 
                 let run_duration = run_start.elapsed();
+                max_single_run_secs = max_single_run_secs.max(run_duration.as_secs());
                 let run_exceeded_time_limit = run_duration.as_secs() > MAX_RUN_DURATION_SECONDS;
                 if run_exceeded_time_limit {
                     log::warn!(
@@ -885,7 +1151,23 @@ impl AdaptiveNestingStrategy {
             }
 
             if !improved_this_batch {
-                loops += 2;
+                batches_without_improvement += 1;
+                // Once the best solution stops improving across whole batches the
+                // search has converged — keep escalating once, then stop. Without
+                // this the loop grinds through every remaining run / the 600s cap
+                // with ever-larger (slower) parameters even though it already
+                // found its best answer, which is what made max_fit "run forever".
+                if batches_without_improvement >= MAX_BATCHES_WITHOUT_IMPROVEMENT {
+                    log::info!(
+                        "No improvement for {} consecutive batches, optimization converged \
+                         ({} parts placed on {} pages), stopping",
+                        batches_without_improvement,
+                        best_placed,
+                        best_pages
+                    );
+                    break 'outer;
+                }
+                loops = (loops + 2).min(MAX_ESCALATED_LOOPS);
                 // Cap placements so total work per run stays bounded
                 let max_placements = if effective_count > 50 {
                     ( high_count_sample_budget / (effective_count * loops).max(1))
@@ -900,6 +1182,8 @@ impl AdaptiveNestingStrategy {
                     loops,
                     placements
                 );
+            } else {
+                batches_without_improvement = 0;
             }
         }
 

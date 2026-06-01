@@ -1909,6 +1909,7 @@ dependencies = [
  "lbf",
  "log",
  "rand",
+ "rayon",
  "regex",
  "serde",
  "serde_json",
