@@ -1,6 +1,7 @@
 //! Adaptive nesting strategy that starts with lower parameters and adaptively increases them
 
 use crate::svg_nesting::{
+    offcut::{OffcutPolicy, apply_offcuts},
     parsing::{
         calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
         sanitize_polygon,
@@ -99,6 +100,11 @@ fn reserve_routines(execution_id: u64, desired: usize) -> RoutineReservation {
 pub struct AdaptiveNestingStrategy {
     /// Optional function to check if optimization should be cancelled
     cancellation_checker: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// When set, the final layout is scanned for reusable offcuts.
+    offcut_policy: Option<OffcutPolicy>,
+    /// Optional per-request wall-clock budget. When set, overrides the default time budget
+    /// (42s for max_fit, 600s for normal nesting).
+    time_budget: Option<Duration>,
 }
 
 impl AdaptiveNestingStrategy {
@@ -106,6 +112,8 @@ impl AdaptiveNestingStrategy {
     pub fn new() -> Self {
         Self {
             cancellation_checker: None,
+            offcut_policy: None,
+            time_budget: None,
         }
     }
 
@@ -115,6 +123,36 @@ impl AdaptiveNestingStrategy {
     ) -> Self {
         Self {
             cancellation_checker: Some(cancellation_checker),
+            offcut_policy: None,
+            time_budget: None,
+        }
+    }
+
+    /// Enable offcut detection on the final layout using `policy`.
+    pub fn with_offcut_policy(mut self, policy: OffcutPolicy) -> Self {
+        self.offcut_policy = Some(policy);
+        self
+    }
+
+    /// Override the optimization wall-clock budget (caps both the normal and max_fit paths).
+    pub fn with_time_budget(mut self, budget: Duration) -> Self {
+        self.time_budget = Some(budget);
+        self
+    }
+
+    /// Populate per-page offcuts on a final result from the solution that produced it.
+    /// No-op when no offcut policy is set. Called only at the final return sites so that
+    /// streamed intermediate results keep empty offcuts.
+    fn finalize_offcuts(
+        &self,
+        result: &mut NestingResult,
+        solution: &BPSolution,
+        bin_width: f32,
+        bin_height: f32,
+        spacing: f32,
+    ) {
+        if let Some(policy) = self.offcut_policy {
+            apply_offcuts(result, solution, &policy, bin_width, bin_height, spacing);
         }
     }
 
@@ -363,6 +401,10 @@ impl AdaptiveNestingStrategy {
                 svg_url: None,
                 parts_placed: page_placements.len(),
                 placements: page_placements,
+                // Offcuts stay empty here: this runs for every candidate (incl. streamed
+                // intermediates). They are populated only on the final result via the
+                // finalize pass in `nest_inner`.
+                offcuts: Vec::new(),
             });
         }
 
@@ -439,17 +481,12 @@ impl AdaptiveNestingStrategy {
         };
         let parts = std::slice::from_ref(&saturated);
 
-        // Hard wall-clock cap: the frontend aborts the request at 60s and we
-        // promise ≤55s end-to-end. Waves run to completion (cutting LBF
-        // mid-solve yields a sparse layout), so the cap is enforced *between*
-        // waves: nest_inner's predictive guard refuses to start a wave that the
-        // running per-wave average says won't finish before this deadline. The
-        // budget is set under 55s so that the last wave it does start, plus final
-        // SVG generation, still lands under the frontend timeout. (One wave can
-        // exceed it on unusually slow hardware — a single saturated wave is
-        // ~40s here; lower this if prod machines are slower.)
-        const MAX_FIT_TIME_BUDGET_SECS: u64 = 42;
-        let deadline = Instant::now() + Duration::from_secs(MAX_FIT_TIME_BUDGET_SECS);
+        // Wall-clock cap comes solely from the per-request time budget (e.g. the SQS
+        // `maxSeconds` field). When unset, nest_inner applies its default (600s) — there is
+        // no separate max_fit-specific cap. The cap is enforced *between* waves: nest_inner's
+        // predictive guard refuses to start a wave the running per-wave average says won't
+        // finish before the deadline (cutting LBF mid-solve yields a sparse layout).
+        let deadline = self.time_budget.map(|b| Instant::now() + b);
 
         // Single fixed orientation for now; the parallel adaptive search inside
         // nest_inner explores many seeds within the deadline and keeps the best.
@@ -473,7 +510,7 @@ impl AdaptiveNestingStrategy {
             rotations,
             wrapped_cb,
             Some(1), // bin_stock = 1: forces single-bin packing
-            Some(deadline),
+            deadline,
         )?;
         truncate_to_first_page(&mut result);
         Ok(result)
@@ -490,6 +527,8 @@ impl NestingStrategy for AdaptiveNestingStrategy {
         amount_of_rotations: usize,
         improvement_callback: Option<crate::svg_nesting::strategy::ImprovementCallback>,
     ) -> Result<NestingResult> {
+        // A per-request time budget overrides the default 600s internal deadline.
+        let deadline = self.time_budget.map(|b| Instant::now() + b);
         self.nest_inner(
             bin_width,
             bin_height,
@@ -498,7 +537,7 @@ impl NestingStrategy for AdaptiveNestingStrategy {
             amount_of_rotations,
             improvement_callback,
             None,
-            None,
+            deadline,
         )
     }
 }
@@ -779,6 +818,9 @@ impl AdaptiveNestingStrategy {
         }
 
         let mut best_result: Option<NestingResult> = None;
+        // The solution that produced `best_result`, retained so offcuts can be computed on
+        // the final layout only (see `finalize_offcuts`).
+        let mut best_solution: Option<BPSolution> = None;
         let mut best_placed = 0;
         let mut best_pages = usize::MAX;
         let mut total_runs = 0;
@@ -879,7 +921,7 @@ impl AdaptiveNestingStrategy {
                 // concurrent optimizations).
                 let elapsed_now = optimization_start.elapsed().as_secs();
                 if Instant::now() + Duration::from_secs(max_single_run_secs) >= deadline
-                    && let Some(best) = best_result.take()
+                    && let Some(mut best) = best_result.take()
                 {
                     log::info!(
                         "Projected next run (~{}s) would exceed the deadline at {}s elapsed; \
@@ -889,6 +931,9 @@ impl AdaptiveNestingStrategy {
                         best_placed,
                         best_pages
                     );
+                    if let Some(sol) = best_solution.as_ref() {
+                        self.finalize_offcuts(&mut best, sol, bin_width, bin_height, spacing);
+                    }
                     return Ok(best);
                 }
 
@@ -957,12 +1002,15 @@ impl AdaptiveNestingStrategy {
                         // empty result. Only the very first wave (no best yet)
                         // returns the empty placeholder.
                         log::warn!("Wave placed no items: {}", e);
-                        if let Some(best) = best_result.take() {
+                        if let Some(mut best) = best_result.take() {
                             log::info!(
                                 "Returning previous best result ({} parts on {} pages) after a barren wave",
                                 best_placed,
                                 best_pages
                             );
+                            if let Some(sol) = best_solution.as_ref() {
+                                self.finalize_offcuts(&mut best, sol, bin_width, bin_height, spacing);
+                            }
                             return Ok(best);
                         }
                         return Ok(NestingResult {
@@ -1098,6 +1146,10 @@ impl AdaptiveNestingStrategy {
                     best_placed = result.parts_placed;
                     best_pages = num_pages;
                     best_result = Some(result.clone());
+                    // Retain the producing solution so the final result (and only it) can
+                    // be scanned for offcuts. The streamed `result.clone()` below keeps its
+                    // empty offcuts.
+                    best_solution = Some(solution.clone());
 
                     log::info!(
                         "New best result: {} parts placed on {} pages",
@@ -1124,7 +1176,10 @@ impl AdaptiveNestingStrategy {
                         num_pages,
                         result.utilisation * 100.0
                     );
-                    return Ok(best_result.unwrap_or(result));
+                    let mut final_result = best_result.take().unwrap_or(result);
+                    let final_solution = best_solution.as_ref().unwrap_or(&solution);
+                    self.finalize_offcuts(&mut final_result, final_solution, bin_width, bin_height, spacing);
+                    return Ok(final_result);
                 }
 
                 if run_exceeded_time_limit {
@@ -1187,14 +1242,22 @@ impl AdaptiveNestingStrategy {
             }
         }
 
-        Ok(best_result.unwrap_or_else(|| NestingResult {
-            combined_svg: Vec::new(),
-            page_svgs: Vec::new(),
-            parts_placed: 0,
-            total_parts_requested,
-            unplaced_parts_svg: None,
-            utilisation: 0.0,
-            pages: Vec::new(),
-        }))
+        match best_result.take() {
+            Some(mut best) => {
+                if let Some(sol) = best_solution.as_ref() {
+                    self.finalize_offcuts(&mut best, sol, bin_width, bin_height, spacing);
+                }
+                Ok(best)
+            }
+            None => Ok(NestingResult {
+                combined_svg: Vec::new(),
+                page_svgs: Vec::new(),
+                parts_placed: 0,
+                total_parts_requested,
+                unplaced_parts_svg: None,
+                utilisation: 0.0,
+                pages: Vec::new(),
+            }),
+        }
     }
 }

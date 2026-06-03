@@ -62,6 +62,12 @@ M -1.41797,31.7402 L -2.99414,30.6523 L -3.88379,28.957 L -3.88379,27.043 L -2.9
             max_parts_placed
         );
 
+        // Regression: no offcut policy ⇒ offcuts stay empty (backwards-compatible).
+        assert!(
+            result.pages.iter().all(|p| p.offcuts.is_empty()),
+            "offcuts must be empty without an offcut policy"
+        );
+
         let svg_string = String::from_utf8(result.combined_svg.clone())?;
         debug!(
             "Best placement SVG ({} parts placed):\n{}",

@@ -6,6 +6,6 @@
 pub mod svg_nesting;
 
 pub use svg_nesting::{
-    AdaptiveNestingStrategy, NestingResult, NestingStrategy, PageResult, PartInput, PlacedPartInfo,
-    SimpleNestingStrategy, nest_svg_parts,
+    AdaptiveNestingStrategy, NestingResult, NestingStrategy, Offcut, OffcutPolicy, OffcutShape,
+    OffcutVertex, PageResult, PartInput, PlacedPartInfo, SimpleNestingStrategy, nest_svg_parts,
 };

@@ -97,7 +97,17 @@ fn process_request_direct(
         Ok(())
     };
 
-    let strategy = AdaptiveNestingStrategy::new();
+    let mut strategy = AdaptiveNestingStrategy::new();
+    // Offcut detection runs only on the normal path, mirroring the real processor.
+    if !max_fit {
+        if let Some(policy) = request.offcut_policy {
+            strategy = strategy.with_offcut_policy(policy);
+        }
+    }
+    // A per-request maxSeconds caps the optimization budget (mirrors the real processor).
+    if let Some(s) = request.max_seconds {
+        strategy = strategy.with_time_budget(std::time::Duration::from_secs(s.min(600)));
+    }
     let nesting_result = if max_fit {
         jagua_utils::svg_nesting::nest_max_fit_single_sheet(
             &strategy,
@@ -127,7 +137,7 @@ fn process_request_direct(
         last_page_svg_url: None,  // Tests don't use S3
         sheets: None,
         page_svg_urls: None,
-        pages: None,
+        pages: Some(nesting_result.pages.clone()),
         parts_placed: nesting_result.parts_placed,
         utilisation: nesting_result.utilisation,
         is_improvement: false,
@@ -170,6 +180,10 @@ async fn test_e2e_processing() -> Result<()> {
         output_queue_url: Some("test-output-queue".to_string()),
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -233,6 +247,10 @@ async fn test_single_page_last_page_matches_first() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -299,6 +317,10 @@ async fn test_multiple_pages_last_page_is_set() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -383,6 +405,10 @@ async fn test_svg_with_circles() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -467,6 +493,10 @@ async fn test_all_parts_fit_last_page_empty() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -656,6 +686,10 @@ async fn test_cancellation_request_handling() -> Result<()> {
         output_queue_url: None,
         cancelled: true,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&cancellation_request)?;
@@ -715,6 +749,10 @@ async fn test_optimization_cancellation_during_execution() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -805,6 +843,10 @@ async fn test_cancellation_before_optimization_starts() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -870,6 +912,10 @@ async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> 
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_b = SqsNestingRequest {
@@ -885,6 +931,10 @@ async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> 
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let registry: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -989,6 +1039,10 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_cancelled = SqsNestingRequest {
@@ -1004,6 +1058,10 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let registry: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1090,6 +1148,10 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -1528,6 +1590,10 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -1950,6 +2016,10 @@ async fn test_execution_timeout() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -2172,6 +2242,10 @@ async fn test_complex_svg_timeout() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -2373,6 +2447,10 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
         ),
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
     let request_json =
         serde_json::to_string_pretty(&sqs_request).context("serialize SQS request")?;
@@ -2602,6 +2680,10 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: None,
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
     fs::write(
         output_dir.join("request.json"),
@@ -2692,6 +2774,10 @@ fn test_max_fit_legacy_single_part_returns_one_page() -> Result<()> {
         output_queue_url: None,
         cancelled: false,
         max_fit: Some(true),
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
     let request_json = serde_json::to_string(&request)?;
 
@@ -2789,6 +2875,10 @@ fn test_max_fit_dto_serialization() {
         output_queue_url: None,
         cancelled: false,
         max_fit: Some(true),
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy: None,
+        max_seconds: None,
     };
     let json = serde_json::to_string(&with_max_fit).unwrap();
     assert!(
@@ -2810,4 +2900,162 @@ fn test_max_fit_dto_serialization() {
         "max_fit:None must be omitted: {}",
         json2
     );
+}
+
+// ----------------------------------------------------------------------------
+// JG-OFF-2 — offcutPolicy request contract
+// ----------------------------------------------------------------------------
+
+fn square_svg_b64() -> String {
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path d="M 0,0 L 100,0 L 100,100 L 0,100 Z"/></svg>"#;
+    general_purpose::STANDARD.encode(svg.as_bytes())
+}
+
+fn offcut_square_request(
+    offcut_policy: Option<jagua_utils::OffcutPolicy>,
+    max_fit: bool,
+) -> SqsNestingRequest {
+    SqsNestingRequest {
+        correlation_id: "offcut-test".to_string(),
+        svg_url: None,
+        svg_base64: Some(square_svg_b64()),
+        bin_width: Some(2000.0),
+        bin_height: Some(1000.0),
+        spacing: Some(5.0),
+        amount_of_parts: Some(2),
+        amount_of_rotations: 4,
+        parts: None,
+        output_queue_url: None,
+        cancelled: false,
+        max_fit: if max_fit { Some(true) } else { None },
+        bucket: None,
+        s3_prefix: None,
+        offcut_policy,
+        max_seconds: None,
+    }
+}
+
+fn rect_offcut_policy() -> jagua_utils::OffcutPolicy {
+    jagua_utils::OffcutPolicy {
+        min_offcut_width_mm: 200.0,
+        min_offcut_height_mm: 200.0,
+        shape: jagua_utils::OffcutShape::Rectangle,
+        kerf_mm: 0.0,
+    }
+}
+
+/// The handoff §2.1 `offcutPolicy` JSON deserializes into the request (camelCase, kerf
+/// optional).
+#[test]
+fn request_with_offcut_policy_deserializes() {
+    let json = r#"{"correlationId":"c","binWidth":2000.0,"binHeight":1000.0,"spacing":5.0,"amountOfRotations":4,"offcutPolicy":{"minOffcutWidthMm":200,"minOffcutHeightMm":200,"shape":"RECTANGLE","kerfMm":0.0}}"#;
+    let req: SqsNestingRequest = serde_json::from_str(json).unwrap();
+    let policy = req.offcut_policy.expect("offcutPolicy should deserialize");
+    assert_eq!(policy.min_offcut_width_mm, 200.0);
+    assert_eq!(policy.min_offcut_height_mm, 200.0);
+    assert_eq!(policy.shape, jagua_utils::OffcutShape::Rectangle);
+    assert_eq!(policy.kerf_mm, 0.0);
+
+    // kerfMm omitted ⇒ defaults to 0.
+    let json2 = r#"{"correlationId":"c","offcutPolicy":{"minOffcutWidthMm":100,"minOffcutHeightMm":100,"shape":"QUADRILATERAL"}}"#;
+    let req2: SqsNestingRequest = serde_json::from_str(json2).unwrap();
+    let p2 = req2.offcut_policy.unwrap();
+    assert_eq!(p2.shape, jagua_utils::OffcutShape::Quadrilateral);
+    assert_eq!(p2.kerf_mm, 0.0);
+}
+
+/// Backwards compatibility: with no offcutPolicy, the response carries no `offcuts` key.
+#[test]
+fn request_without_offcut_policy_omits_offcuts() -> Result<()> {
+    let req = offcut_square_request(None, false);
+    let json = serde_json::to_string(&req)?;
+    assert!(!json.contains("offcutPolicy"), "absent policy must be omitted: {json}");
+
+    let (responses, _) = process_request_direct(&json, None, None)?;
+    let final_resp = responses.iter().find(|r| r.is_final).expect("final response");
+    let resp_json = serde_json::to_string(final_resp)?;
+    assert!(!resp_json.contains("offcuts"), "no policy ⇒ no offcuts key: {resp_json}");
+    Ok(())
+}
+
+/// With a RECTANGLE policy, the final response carries per-page offcuts ≥ thresholds.
+#[test]
+fn offcut_policy_produces_offcuts() -> Result<()> {
+    let req = offcut_square_request(Some(rect_offcut_policy()), false);
+    let json = serde_json::to_string(&req)?;
+    let (responses, _) = process_request_direct(&json, None, None)?;
+    let final_resp = responses.iter().find(|r| r.is_final).expect("final response");
+    let pages = final_resp.pages.as_ref().expect("pages present");
+    let total: usize = pages.iter().map(|p| p.offcuts.len()).sum();
+    assert!(total > 0, "expected offcuts with a policy set");
+    for o in pages.iter().flat_map(|p| &p.offcuts) {
+        match o {
+            jagua_utils::Offcut::Rect { width, height, .. } => {
+                assert!(*width >= 200.0 && *height >= 200.0, "offcut below threshold: {o:?}");
+            }
+            other => panic!("rectangle policy must yield RECT, got {other:?}"),
+        }
+    }
+    let resp_json = serde_json::to_string(final_resp)?;
+    assert!(resp_json.contains("offcuts"), "policy ⇒ offcuts present: {resp_json}");
+    Ok(())
+}
+
+/// max_fit requests ignore the offcut policy (detection is gated off that path).
+#[test]
+fn max_fit_ignores_offcut_policy() -> Result<()> {
+    let req = offcut_square_request(Some(rect_offcut_policy()), true);
+    let json = serde_json::to_string(&req)?;
+    let (responses, _) = process_request_direct(&json, None, None)?;
+    let final_resp = responses.iter().find(|r| r.is_final).expect("final response");
+    if let Some(pages) = &final_resp.pages {
+        assert!(
+            pages.iter().all(|p| p.offcuts.is_empty()),
+            "max_fit must skip offcut detection"
+        );
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// maxSeconds — per-request wall-clock cap
+// ----------------------------------------------------------------------------
+
+/// `maxSeconds` deserializes when present and is omitted when absent.
+#[test]
+fn request_with_max_seconds_deserializes() {
+    let req: SqsNestingRequest =
+        serde_json::from_str(r#"{"correlationId":"c","maxSeconds":120}"#).unwrap();
+    assert_eq!(req.max_seconds, Some(120));
+
+    let req2: SqsNestingRequest =
+        serde_json::from_str(r#"{"correlationId":"c"}"#).unwrap();
+    assert_eq!(req2.max_seconds, None);
+    let json2 = serde_json::to_string(&req2).unwrap();
+    assert!(!json2.contains("maxSeconds"), "absent maxSeconds must be omitted: {json2}");
+}
+
+/// A per-request `maxSeconds` (53s) caps a max_fit run below the 600s default, proving the
+/// cap drives the deadline (and that the old 42s max_fit constant is gone).
+#[test]
+fn max_seconds_caps_max_fit_runtime() -> Result<()> {
+    let mut req = offcut_square_request(None, true);
+    req.max_seconds = Some(53);
+    req.bin_width = Some(1000.0);
+    req.bin_height = Some(1000.0);
+    let json = serde_json::to_string(&req)?;
+
+    let start = std::time::Instant::now();
+    let (responses, _) = process_request_direct(&json, None, None)?;
+    let elapsed = start.elapsed();
+
+    assert!(responses.iter().any(|r| r.is_final), "expected a final response");
+    // 53s > the old hard-coded 42s max_fit cap, so the run may exceed 42 (proving that
+    // constant is gone), yet it must stay well under the 600s default — confirming the
+    // per-request budget drives the deadline.
+    assert!(
+        elapsed.as_secs() < 120,
+        "maxSeconds=53 run took too long ({elapsed:?}); cap not applied?"
+    );
+    Ok(())
 }

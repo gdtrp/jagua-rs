@@ -1,9 +1,11 @@
 //! SVG nesting module
 
+mod offcut;
 mod parsing;
 mod strategy;
 mod svg_generation;
 
+pub use offcut::{Offcut, OffcutPolicy, OffcutShape, OffcutVertex};
 pub use parsing::*;
 pub use strategy::{
     AdaptiveNestingStrategy, ImprovementCallback, NestingStrategy, PartInput,

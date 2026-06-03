@@ -105,6 +105,16 @@ pub struct SqsNestingRequest {
     /// Key prefix under `bucket`; None ⇒ fall back to `nesting/{correlation_id}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_prefix: Option<String>,
+    /// Optional offcut (free-space) detection policy (JG-OFF-2). Absent ⇒ detection skipped
+    /// and the response is byte-identical to today. Ignored for `maxFit` requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offcut_policy: Option<jagua_utils::OffcutPolicy>,
+    /// Optional per-request wall-clock cap (seconds) for the nesting optimization. When set,
+    /// it overrides the strategy's default time budget (the 42s max_fit budget / 600s normal
+    /// budget) and the cooperative execution timeout. Clamped to a 600s ceiling. Absent ⇒
+    /// today's behaviour (max 600s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seconds: Option<u64>,
 }
 
 /// Generate an empty page SVG (used when all parts are placed)
@@ -985,8 +995,15 @@ impl SqsProcessor {
             }
 
             // Create cancellation checker closure using the helper method
-            // The checker also monitors for execution timeout
-            let execution_timeout = get_execution_timeout();
+            // The checker also monitors for execution timeout.
+            // A per-request `maxSeconds` (clamped to a 600s ceiling) overrides both the
+            // cooperative execution timeout and the strategy's internal time budget; absent
+            // ⇒ today's behaviour (the env default, max 600s).
+            let max_seconds = request.max_seconds.map(|s| s.min(600));
+            let execution_timeout = match max_seconds {
+                Some(s) => Duration::from_secs(s),
+                None => get_execution_timeout(),
+            };
             let execution_start = Instant::now();
             let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let timed_out_for_checker = timed_out.clone();
@@ -1150,7 +1167,20 @@ impl SqsProcessor {
             // Use adaptive nesting strategy with cancellation checker
             info!("Creating AdaptiveNestingStrategy with cancellation checker");
             let strategy_start = Instant::now();
-            let strategy = AdaptiveNestingStrategy::with_cancellation_checker(Box::new(cancellation_checker));
+            let mut strategy = AdaptiveNestingStrategy::with_cancellation_checker(Box::new(cancellation_checker));
+            // Offcut detection (JG-OFF-2) runs only on the normal nesting path; it is
+            // deliberately omitted for max_fit (a maximally-packed sheet has little free
+            // space and runs under a tight wall-clock budget).
+            if !max_fit {
+                if let Some(policy) = request.offcut_policy {
+                    strategy = strategy.with_offcut_policy(policy);
+                    info!("Offcut detection enabled: {:?}", policy);
+                }
+            }
+            if let Some(s) = max_seconds {
+                strategy = strategy.with_time_budget(Duration::from_secs(s));
+                info!("Time budget overridden to {}s via maxSeconds", s);
+            }
             info!("Strategy created (took {:?})", strategy_start.elapsed());
 
             // Clone cancellation_check_count for logging after spawn_blocking
@@ -1848,6 +1878,10 @@ mod tests {
             output_queue_url: None,
             cancelled: true,
             max_fit: None,
+            bucket: None,
+            s3_prefix: None,
+            offcut_policy: None,
+            max_seconds: None,
         };
         let cancellation_body =
             serde_json::to_string(&cancellation_request).expect("serialize cancellation");

@@ -46,6 +46,11 @@ pub struct PageResult {
     pub parts_placed: usize,
     /// Placements on this page.
     pub placements: Vec<PlacedPartInfo>,
+    /// Reusable free-space regions detected on this page (JG-OFF-2). Populated only on the
+    /// final layout when an offcut policy is set; empty (and omitted from JSON) otherwise,
+    /// keeping the response byte-identical when detection is off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offcuts: Vec<crate::svg_nesting::offcut::Offcut>,
 }
 
 /// Result data returned after nesting SVG parts.
@@ -65,6 +70,87 @@ pub struct NestingResult {
     pub utilisation: f32,
     /// Per-page results: utilisation and placements grouped by page.
     pub pages: Vec<PageResult>,
+}
+
+/// Overlays detected offcuts onto a page SVG as a dashed green `<g id="offcuts">` group,
+/// injected just before the closing `</svg>`. Offcuts are in bin coordinates — the same
+/// frame as the container outline and placements — so they align directly. Returns the SVG
+/// unchanged when there are no offcuts (keeping no-policy output byte-identical).
+pub(crate) fn overlay_offcuts_svg(
+    svg: &str,
+    offcuts: &[crate::svg_nesting::offcut::Offcut],
+    kerf_bands: &[String],
+    stroke_width: f32,
+) -> String {
+    use crate::svg_nesting::offcut::Offcut;
+
+    if offcuts.is_empty() {
+        return svg.to_string();
+    }
+
+    let mut group = format!(
+        "  <g id=\"offcuts\" fill=\"#00C2A8\" fill-opacity=\"0.15\" stroke=\"#00897B\" \
+         stroke-width=\"{sw}\" stroke-dasharray=\"{dash} {gap}\" stroke-linejoin=\"round\">\n",
+        sw = stroke_width,
+        dash = stroke_width * 3.0,
+        gap = stroke_width * 2.0,
+    );
+    for o in offcuts {
+        match o {
+            Offcut::Rect {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                group.push_str(&format!(
+                    "    <rect x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\"/>\n"
+                ));
+            }
+            Offcut::Poly { vertices, holes } => {
+                // Exterior + holes as one path with even-odd fill so holes punch through.
+                let ring_path = |ring: &[crate::svg_nesting::offcut::OffcutVertex]| -> String {
+                    let mut d = String::new();
+                    for (i, v) in ring.iter().enumerate() {
+                        d.push_str(if i == 0 { "M " } else { " L " });
+                        d.push_str(&format!("{},{}", v.x, v.y));
+                    }
+                    d.push_str(" Z");
+                    d
+                };
+                let mut d = ring_path(vertices);
+                for hole in holes {
+                    d.push(' ');
+                    d.push_str(&ring_path(hole));
+                }
+                group.push_str(&format!("    <path d=\"{d}\" fill-rule=\"evenodd\"/>\n"));
+            }
+        }
+    }
+    group.push_str("  </g>\n");
+
+    // Kerf band: shaded ring inside each offcut marking the cut allowance. Drawn after the
+    // offcut group so it sits on top; warm colour so it reads as "not reusable".
+    if !kerf_bands.is_empty() {
+        group.push_str(
+            "  <g id=\"offcut_kerf\" fill=\"#FF7043\" fill-opacity=\"0.35\" stroke=\"none\">\n",
+        );
+        for d in kerf_bands {
+            group.push_str(&format!("    <path d=\"{d}\" fill-rule=\"evenodd\"/>\n"));
+        }
+        group.push_str("  </g>\n");
+    }
+
+    match svg.rfind("</svg>") {
+        Some(idx) => {
+            let mut out = String::with_capacity(svg.len() + group.len());
+            out.push_str(&svg[..idx]);
+            out.push_str(&group);
+            out.push_str(&svg[idx..]);
+            out
+        }
+        None => svg.to_string(),
+    }
 }
 
 /// Converts points to SVG path data

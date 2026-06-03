@@ -5,6 +5,7 @@ use crate::svg_nesting::{
         calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
         sanitize_polygon,
     },
+    offcut::{OffcutPolicy, apply_offcuts},
     strategy::{NestingStrategy, PartInput, is_single_part_type},
     svg_generation::{
         NestingResult, PageResult, PlacedPartInfo, combine_svg_documents, post_process_svg_multi,
@@ -28,17 +29,21 @@ use rand::SeedableRng;
 use rand::prelude::SmallRng;
 
 /// Simple nesting strategy that runs the optimizer once with default parameters
-pub struct SimpleNestingStrategy;
+#[derive(Default)]
+pub struct SimpleNestingStrategy {
+    /// When set, the final layout is scanned for reusable offcuts.
+    offcut_policy: Option<OffcutPolicy>,
+}
 
 impl SimpleNestingStrategy {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
-}
 
-impl Default for SimpleNestingStrategy {
-    fn default() -> Self {
-        Self::new()
+    /// Enable offcut detection on the final layout using `policy`.
+    pub fn with_offcut_policy(mut self, policy: OffcutPolicy) -> Self {
+        self.offcut_policy = Some(policy);
+        self
     }
 }
 
@@ -348,6 +353,7 @@ impl NestingStrategy for SimpleNestingStrategy {
                 svg_url: None,
                 parts_placed: page_placements.len(),
                 placements: page_placements,
+                offcuts: Vec::new(),
             });
         }
 
@@ -425,7 +431,7 @@ impl NestingStrategy for SimpleNestingStrategy {
             pages.iter().map(|p| p.utilisation).sum::<f32>() / pages.len() as f32
         };
 
-        Ok(NestingResult {
+        let mut result = NestingResult {
             combined_svg: combined_svg.into_bytes(),
             page_svgs,
             parts_placed: corrected_count,
@@ -433,6 +439,13 @@ impl NestingStrategy for SimpleNestingStrategy {
             unplaced_parts_svg,
             utilisation,
             pages,
-        })
+        };
+
+        // Final layout — detect offcuts and draw them onto the SVGs (no-op without a policy).
+        if let Some(policy) = self.offcut_policy {
+            apply_offcuts(&mut result, &solution, &policy, bin_width, bin_height, spacing);
+        }
+
+        Ok(result)
     }
 }
