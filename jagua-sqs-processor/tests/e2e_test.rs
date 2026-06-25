@@ -49,6 +49,7 @@ fn process_request_direct(
         svg_bytes: svg_bytes.clone(),
         count: amount_of_parts,
         item_id: None,
+        allowed_rotations: None,
     }];
 
     let max_fit = request.max_fit.unwrap_or(false);
@@ -577,6 +578,7 @@ fn process_request_with_cancellation(
         svg_bytes: svg_bytes.clone(),
         count: amount_of_parts,
         item_id: None,
+        allowed_rotations: None,
     }];
 
     let improvements: Arc<Mutex<Vec<SqsNestingResponse>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2108,6 +2110,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
         svg_bytes: svg_bytes.clone(),
         count: amount_of_parts,
         item_id: None,
+        allowed_rotations: None,
     }];
 
     // Get timeout from env var (same as production code)
@@ -2319,16 +2322,19 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
             svg_bytes: dr_svg,
             count: 12,
             item_id: None,
+            allowed_rotations: None,
         },
         PartInput {
             svg_bytes: fireman_svg,
             count: 15,
             item_id: None,
+            allowed_rotations: None,
         },
         PartInput {
             svg_bytes: fork_svg,
             count: 12,
             item_id: None,
+            allowed_rotations: None,
         },
     ];
 
@@ -2429,16 +2435,19 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
                 item_id: "dr-part".to_string(),
                 svg_url: "https://s3.example.com/svgs/dr.svg".to_string(),
                 amount_of_parts: 12,
+                allowed_rotations: None,
             },
             SvgPartSpec {
                 item_id: "fireman-part".to_string(),
                 svg_url: "https://s3.example.com/svgs/fireman.svg".to_string(),
                 amount_of_parts: 15,
+                allowed_rotations: None,
             },
             SvgPartSpec {
                 item_id: "fork-part".to_string(),
                 svg_url: "https://s3.example.com/svgs/fork.svg".to_string(),
                 amount_of_parts: 12,
+                allowed_rotations: None,
             },
         ]),
         amount_of_rotations: 4,
@@ -2538,16 +2547,19 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
             svg_bytes: dnishche_svg,
             count: 24,
             item_id: Some(item_id_dnishche.to_string()),
+            allowed_rotations: None,
         },
         PartInput {
             svg_bytes: bokovaya_svg,
             count: 48,
             item_id: Some(item_id_bokovaya.to_string()),
+            allowed_rotations: None,
         },
         PartInput {
             svg_bytes: prodolnaya_svg,
             count: 48,
             item_id: Some(item_id_prodolnaya.to_string()),
+            allowed_rotations: None,
         },
     ];
 
@@ -2664,16 +2676,19 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
                 item_id: item_id_dnishche.to_string(),
                 svg_url: "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/18502bca-89ce-4fd8-8102-41182ddeae22/result.svg".to_string(),
                 amount_of_parts: 24,
+                allowed_rotations: None,
             },
             SvgPartSpec {
                 item_id: item_id_bokovaya.to_string(),
                 svg_url: "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/d490d094-8659-48b9-af3d-8cca28b52fdf/result.svg".to_string(),
                 amount_of_parts: 48,
+                allowed_rotations: None,
             },
             SvgPartSpec {
                 item_id: item_id_prodolnaya.to_string(),
                 svg_url: "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/07295e53-e6a6-48ed-948b-901214aa3ceb/result.svg".to_string(),
                 amount_of_parts: 48,
+                allowed_rotations: None,
             },
         ]),
         amount_of_rotations: rotations,
@@ -2827,11 +2842,13 @@ fn test_max_fit_errors_on_multiple_part_types() {
         svg_bytes: include_bytes!("testdata/fork.svg").to_vec(),
         count: 1,
         item_id: None,
+        allowed_rotations: None,
     };
     let part_b = PartInput {
         svg_bytes: include_bytes!("testdata/fireman.svg").to_vec(),
         count: 1,
         item_id: None,
+        allowed_rotations: None,
     };
     let part_inputs = [part_a, part_b];
 
@@ -2969,12 +2986,21 @@ fn request_with_offcut_policy_deserializes() {
 fn request_without_offcut_policy_omits_offcuts() -> Result<()> {
     let req = offcut_square_request(None, false);
     let json = serde_json::to_string(&req)?;
-    assert!(!json.contains("offcutPolicy"), "absent policy must be omitted: {json}");
+    assert!(
+        !json.contains("offcutPolicy"),
+        "absent policy must be omitted: {json}"
+    );
 
     let (responses, _) = process_request_direct(&json, None, None)?;
-    let final_resp = responses.iter().find(|r| r.is_final).expect("final response");
+    let final_resp = responses
+        .iter()
+        .find(|r| r.is_final)
+        .expect("final response");
     let resp_json = serde_json::to_string(final_resp)?;
-    assert!(!resp_json.contains("offcuts"), "no policy ⇒ no offcuts key: {resp_json}");
+    assert!(
+        !resp_json.contains("offcuts"),
+        "no policy ⇒ no offcuts key: {resp_json}"
+    );
     Ok(())
 }
 
@@ -2984,20 +3010,29 @@ fn offcut_policy_produces_offcuts() -> Result<()> {
     let req = offcut_square_request(Some(rect_offcut_policy()), false);
     let json = serde_json::to_string(&req)?;
     let (responses, _) = process_request_direct(&json, None, None)?;
-    let final_resp = responses.iter().find(|r| r.is_final).expect("final response");
+    let final_resp = responses
+        .iter()
+        .find(|r| r.is_final)
+        .expect("final response");
     let pages = final_resp.pages.as_ref().expect("pages present");
     let total: usize = pages.iter().map(|p| p.offcuts.len()).sum();
     assert!(total > 0, "expected offcuts with a policy set");
     for o in pages.iter().flat_map(|p| &p.offcuts) {
         match o {
             jagua_utils::Offcut::Rect { width, height, .. } => {
-                assert!(*width >= 200.0 && *height >= 200.0, "offcut below threshold: {o:?}");
+                assert!(
+                    *width >= 200.0 && *height >= 200.0,
+                    "offcut below threshold: {o:?}"
+                );
             }
             other => panic!("rectangle policy must yield RECT, got {other:?}"),
         }
     }
     let resp_json = serde_json::to_string(final_resp)?;
-    assert!(resp_json.contains("offcuts"), "policy ⇒ offcuts present: {resp_json}");
+    assert!(
+        resp_json.contains("offcuts"),
+        "policy ⇒ offcuts present: {resp_json}"
+    );
     Ok(())
 }
 
@@ -3007,7 +3042,10 @@ fn max_fit_ignores_offcut_policy() -> Result<()> {
     let req = offcut_square_request(Some(rect_offcut_policy()), true);
     let json = serde_json::to_string(&req)?;
     let (responses, _) = process_request_direct(&json, None, None)?;
-    let final_resp = responses.iter().find(|r| r.is_final).expect("final response");
+    let final_resp = responses
+        .iter()
+        .find(|r| r.is_final)
+        .expect("final response");
     if let Some(pages) = &final_resp.pages {
         assert!(
             pages.iter().all(|p| p.offcuts.is_empty()),
@@ -3028,11 +3066,13 @@ fn request_with_max_seconds_deserializes() {
         serde_json::from_str(r#"{"correlationId":"c","maxSeconds":120}"#).unwrap();
     assert_eq!(req.max_seconds, Some(120));
 
-    let req2: SqsNestingRequest =
-        serde_json::from_str(r#"{"correlationId":"c"}"#).unwrap();
+    let req2: SqsNestingRequest = serde_json::from_str(r#"{"correlationId":"c"}"#).unwrap();
     assert_eq!(req2.max_seconds, None);
     let json2 = serde_json::to_string(&req2).unwrap();
-    assert!(!json2.contains("maxSeconds"), "absent maxSeconds must be omitted: {json2}");
+    assert!(
+        !json2.contains("maxSeconds"),
+        "absent maxSeconds must be omitted: {json2}"
+    );
 }
 
 /// A per-request `maxSeconds` (53s) caps a max_fit run below the 600s default, proving the
@@ -3049,7 +3089,10 @@ fn max_seconds_caps_max_fit_runtime() -> Result<()> {
     let (responses, _) = process_request_direct(&json, None, None)?;
     let elapsed = start.elapsed();
 
-    assert!(responses.iter().any(|r| r.is_final), "expected a final response");
+    assert!(
+        responses.iter().any(|r| r.is_final),
+        "expected a final response"
+    );
     // 53s > the old hard-coded 42s max_fit cap, so the run may exceed 42 (proving that
     // constant is gone), yet it must stay well under the 600s default — confirming the
     // per-request budget drives the deadline.

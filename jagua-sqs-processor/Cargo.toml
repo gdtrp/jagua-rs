@@ -27,6 +27,16 @@ base64 = "0.21"
 env_logger = "0.11"
 async-trait = "0.1"
 
+[build-dependencies]
+# Wire types are generated at build time from the vendored AsyncAPI spec
+# (asyncapi/jagua-rs.yaml) by build.rs. typify needs schemars 0.8 (its pinned major).
+typify = "0.7"
+schemars = "0.8.22"
+serde_yaml = "0.9"
+serde_json = { workspace = true }
+prettyplease = "0.2"
+syn = "2"
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.12"
