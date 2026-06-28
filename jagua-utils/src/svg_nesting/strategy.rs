@@ -8,6 +8,7 @@ pub use simple::SimpleNestingStrategy;
 
 use crate::svg_nesting::svg_generation::NestingResult;
 use anyhow::Result;
+use jagua_rs::geometry::geo_enums::RotationRange;
 
 /// A single part type with its SVG bytes and count
 #[derive(Debug, Clone)]
@@ -18,6 +19,66 @@ pub struct PartInput {
     pub count: usize,
     /// Optional user-provided correlation ID for this part type
     pub item_id: Option<String>,
+    /// Optional grain-direction constraint: the exact set of rotations (in **degrees**)
+    /// this part may be placed at. When `Some`, only these orientations are allowed,
+    /// overriding the global `amount_of_rotations`. When `None`, the part follows the
+    /// global rotation setting (today's behaviour). An empty list or a single `0` means
+    /// "0° only" (no rotation), matching the core `ExtItem::allowed_orientations` semantics.
+    pub allowed_rotations: Option<Vec<f32>>,
+}
+
+/// Resolve the rotation constraint for a single part.
+///
+/// When `allowed_rotations` is set (grain-direction control), only those angles are
+/// permitted: the values are interpreted as **degrees** and converted into a
+/// [`RotationRange::Discrete`]. An empty list, or a single `0`, means "0° only",
+/// matching the core `ExtItem` import semantics. When `allowed_rotations` is `None`,
+/// the supplied `fallback` (derived from the global `amount_of_rotations`) is used,
+/// preserving today's behaviour.
+pub(crate) fn resolve_rotation_range(
+    allowed_rotations: &Option<Vec<f32>>,
+    fallback: &RotationRange,
+) -> RotationRange {
+    match allowed_rotations {
+        Some(angles) => {
+            if angles.is_empty() || (angles.len() == 1 && angles[0] == 0.0) {
+                RotationRange::None
+            } else {
+                RotationRange::Discrete(angles.iter().map(|deg| deg.to_radians()).collect())
+            }
+        }
+        None => fallback.clone(),
+    }
+}
+
+/// For the bounding-box fit pre-check: decide which of the two axis-aligned
+/// orientations a part may use — original (`w×h`) and/or 90°-swapped (`h×w`) —
+/// given its optional grain constraint. Returns `(allow_original, allow_swapped)`.
+///
+/// Unconstrained parts (`None`) may use both. A grain-locked part may only use an
+/// orientation its allowed-angle set actually reaches. Non-cardinal angles (e.g. 45°)
+/// can't be judged by an axis-aligned bbox, so we stay permissive there and let the
+/// optimiser decide rather than wrongly rejecting the part up front.
+pub(crate) fn fit_orientations(allowed_rotations: &Option<Vec<f32>>) -> (bool, bool) {
+    let angles = match allowed_rotations {
+        None => return (true, true),
+        Some(a) if a.is_empty() => return (true, false), // 0° only
+        Some(a) => a,
+    };
+    let (mut allow_original, mut allow_swapped) = (false, false);
+    for &deg in angles {
+        let norm = deg.rem_euclid(180.0);
+        if norm < 1.0 || norm > 179.0 {
+            allow_original = true; // ~0° / ~180°
+        } else if (norm - 90.0).abs() < 1.0 {
+            allow_swapped = true; // ~90° / ~270°
+        } else {
+            // Non-cardinal grain angle: not judgeable via axis-aligned bbox.
+            allow_original = true;
+            allow_swapped = true;
+        }
+    }
+    (allow_original, allow_swapped)
 }
 
 /// Callback function type for sending intermediate improvements

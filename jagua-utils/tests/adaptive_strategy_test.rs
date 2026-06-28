@@ -25,6 +25,7 @@ mod tests {
             svg_bytes: svg.as_bytes().to_vec(),
             count: 1,
             item_id: None,
+            allowed_rotations: None,
         }];
         let result = strategy.nest(
             500.0, // bin_width - large enough to fit the part
@@ -75,6 +76,7 @@ mod tests {
             svg_bytes: svg.as_bytes().to_vec(),
             count: 4,
             item_id: None,
+            allowed_rotations: None,
         }];
         let result = strategy.nest(500.0, 500.0, 5.0, &parts, 4, Some(Box::new(callback)));
 
@@ -181,6 +183,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg.as_bytes().to_vec(),
             count: 6,
             item_id: None,
+            allowed_rotations: None,
         }];
         let result = strategy.nest(
             1200.0, // bin_width
@@ -255,6 +258,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg.as_bytes().to_vec(),
             count: 1,
             item_id: None,
+            allowed_rotations: None,
         }];
         let result = strategy.nest(
             100.0, // bin_width - smaller than the part
@@ -292,6 +296,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg.as_bytes().to_vec(),
             count: 1,
             item_id: None,
+            allowed_rotations: None,
         }];
         let result = strategy.nest(
             1.25, // bin_width - way too small for this shape
@@ -347,16 +352,19 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
                 svg_bytes: svg_circle.as_bytes().to_vec(),
                 count: 10,
                 item_id: None,
+                allowed_rotations: None,
             },
             PartInput {
                 svg_bytes: svg_square.as_bytes().to_vec(),
                 count: 15,
                 item_id: None,
+                allowed_rotations: None,
             },
             PartInput {
                 svg_bytes: svg_lshape.as_bytes().to_vec(),
                 count: 12,
                 item_id: None,
+                allowed_rotations: None,
             },
         ];
 
@@ -473,6 +481,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg.as_bytes().to_vec(),
             count: 100,
             item_id: None,
+            allowed_rotations: None,
         }];
         let result = strategy.nest(
             1500.0, // Large bin
@@ -522,6 +531,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg.as_bytes().to_vec(),
             count: 50,
             item_id: None,
+            allowed_rotations: None,
         }];
 
         let result = strategy
@@ -596,6 +606,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg.as_bytes().to_vec(),
             count: 24,
             item_id: None,
+            allowed_rotations: None,
         }];
 
         let result = strategy.nest(
@@ -678,11 +689,13 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
                 svg_bytes: svg_square.as_bytes().to_vec(),
                 count: 25,
                 item_id: None,
+                allowed_rotations: None,
             },
             PartInput {
                 svg_bytes: svg_rect.as_bytes().to_vec(),
                 count: 25,
                 item_id: None,
+                allowed_rotations: None,
             },
         ];
 
@@ -754,6 +767,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: guitar_svg,
             count: 600,
             item_id: None,
+            allowed_rotations: None,
         }];
 
         let result = strategy.nest(
@@ -811,6 +825,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg.as_bytes().to_vec(),
             count: 0, // ignored by max_fit helper
             item_id: None,
+            allowed_rotations: None,
         };
 
         let result = nest_max_fit_single_sheet(
@@ -862,6 +877,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg,
             count: 0,
             item_id: None,
+            allowed_rotations: None,
         };
 
         let result = nest_max_fit_single_sheet(&strategy, 1000.0, 1000.0, 5.0, &part, 4, None);
@@ -900,6 +916,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg,
             count: 0,
             item_id: None,
+            allowed_rotations: None,
         };
 
         let result =
@@ -972,6 +989,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg,
             count: 0, // ignored by max_fit helper
             item_id: None,
+            allowed_rotations: None,
         };
 
         let start = Instant::now();
@@ -1037,6 +1055,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             svg_bytes: svg,
             count: 0, // ignored by max_fit helper
             item_id: None,
+            allowed_rotations: None,
         };
 
         let start = Instant::now();
@@ -1085,5 +1104,71 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             nr.utilisation * 100.0,
             duration.as_secs_f64()
         );
+    }
+
+    /// A clearly non-square part so rotation is observable in the output.
+    const TALL_RECT_SVG: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+    <path d="M 10,10 L 50,10 L 50,180 L 10,180 Z" fill="black"/>
+</svg>"#;
+
+    /// Returns true if `deg` is within 0.5° of `target` (modulo 360).
+    fn approx_angle(deg: f32, target: f32) -> bool {
+        let d = (deg - target).rem_euclid(360.0);
+        d < 0.5 || d > 359.5
+    }
+
+    /// Grain locked to a single orientation (`[0]`): every placement must be at 0°,
+    /// even though `amount_of_rotations` would otherwise allow 4 orientations.
+    #[test]
+    fn test_grain_direction_locks_single_orientation() {
+        let strategy = AdaptiveNestingStrategy::new();
+        let parts = vec![PartInput {
+            svg_bytes: TALL_RECT_SVG.as_bytes().to_vec(),
+            count: 8,
+            item_id: None,
+            allowed_rotations: Some(vec![0.0]),
+        }];
+        let result = strategy
+            .nest(500.0, 500.0, 5.0, &parts, 4, None)
+            .expect("nesting should succeed");
+
+        assert!(result.parts_placed > 0, "should place at least one part");
+        for page in &result.pages {
+            for p in &page.placements {
+                assert!(
+                    approx_angle(p.rotation, 0.0),
+                    "grain [0] must keep every placement at 0°, got {}",
+                    p.rotation
+                );
+            }
+        }
+    }
+
+    /// Grain on a fixed axis but flip allowed (`[0, 180]`): every placement must be at
+    /// 0° or 180° — never the 90°/270° cross-grain orientations.
+    #[test]
+    fn test_grain_direction_allows_only_flip() {
+        let strategy = AdaptiveNestingStrategy::new();
+        let parts = vec![PartInput {
+            svg_bytes: TALL_RECT_SVG.as_bytes().to_vec(),
+            count: 8,
+            item_id: None,
+            allowed_rotations: Some(vec![0.0, 180.0]),
+        }];
+        let result = strategy
+            .nest(500.0, 500.0, 5.0, &parts, 4, None)
+            .expect("nesting should succeed");
+
+        assert!(result.parts_placed > 0, "should place at least one part");
+        for page in &result.pages {
+            for p in &page.placements {
+                assert!(
+                    approx_angle(p.rotation, 0.0) || approx_angle(p.rotation, 180.0),
+                    "grain [0,180] must avoid cross-grain orientations, got {}",
+                    p.rotation
+                );
+            }
+        }
     }
 }

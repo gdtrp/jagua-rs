@@ -63,6 +63,7 @@ impl NestingStrategy for SimpleNestingStrategy {
             processed_holes: Vec<Vec<jagua_rs::geometry::primitives::Point>>,
             count: usize,
             item_id: Option<String>,
+            allowed_rotations: Option<Vec<f32>>,
         }
 
         let cde_config = CDEConfig {
@@ -130,6 +131,7 @@ impl NestingStrategy for SimpleNestingStrategy {
                 processed_holes,
                 count: part.count,
                 item_id: part.item_id.clone(),
+                allowed_rotations: part.allowed_rotations.clone(),
             });
         }
 
@@ -160,9 +162,14 @@ impl NestingStrategy for SimpleNestingStrategy {
                 .map(|id| format!("'{}'", id))
                 .unwrap_or_else(|| format!("#{}", part_idx));
 
-            // Check if item fits in at least one orientation (original or rotated 90°)
-            let fits_original = item_w <= effective_bin_w && item_h <= effective_bin_h;
-            let fits_rotated = item_h <= effective_bin_w && item_w <= effective_bin_h;
+            // Check if item fits in at least one orientation its grain constraint
+            // permits (original or rotated 90°).
+            let (allow_original, allow_swapped) =
+                crate::svg_nesting::strategy::fit_orientations(&parsed.allowed_rotations);
+            let fits_original =
+                allow_original && item_w <= effective_bin_w && item_h <= effective_bin_h;
+            let fits_rotated =
+                allow_swapped && item_h <= effective_bin_w && item_w <= effective_bin_h;
             if !fits_original && !fits_rotated {
                 anyhow::bail!(
                     "Part {} (size {:.2} x {:.2}) is too large to fit in the bin ({:.2} x {:.2}) \
@@ -217,10 +224,15 @@ impl NestingStrategy for SimpleNestingStrategy {
         let mut item_id_to_part_idx: Vec<usize> = Vec::with_capacity(parsed_parts.len());
         let mut item_id_to_part_id: Vec<Option<String>> = Vec::with_capacity(parsed_parts.len());
         for (part_idx, parsed) in parsed_parts.iter().enumerate() {
+            // Per-part grain constraint overrides the global rotation range when set.
+            let item_rotation_range = crate::svg_nesting::strategy::resolve_rotation_range(
+                &parsed.allowed_rotations,
+                &rotation_range,
+            );
             let item = Item::new(
                 part_idx,
                 parsed.item_shape.clone(),
-                rotation_range.clone(),
+                item_rotation_range,
                 None,
                 cde_config.item_surrogate_config,
             )?;

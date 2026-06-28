@@ -49,6 +49,7 @@ mod tests {
             svg_bytes: SQUARE_SVG.as_bytes().to_vec(),
             count,
             item_id: None,
+            allowed_rotations: None,
         }]
     }
 
@@ -145,6 +146,7 @@ mod tests {
             svg_bytes: BIG_SQUARE_SVG.as_bytes().to_vec(),
             count: 1,
             item_id: None,
+            allowed_rotations: None,
         }];
         let strategy = AdaptiveNestingStrategy::new().with_offcut_policy(policy);
         // No spacing so the 1000x1000 part hugs the bottom-left corner and three edges.
@@ -183,6 +185,7 @@ mod tests {
             svg_bytes: FORK_SVG.to_vec(),
             count: 1,
             item_id: None,
+            allowed_rotations: None,
         }];
         let strategy = AdaptiveNestingStrategy::new().with_offcut_policy(policy);
         let result = strategy
@@ -264,6 +267,7 @@ mod tests {
             svg_bytes: PROD1_SVG.to_vec(),
             count: 30,
             item_id: Some("prod-1".into()),
+            allowed_rotations: None,
         }];
         let policy = OffcutPolicy {
             min_offcut_width_mm: 100.0,
@@ -314,6 +318,7 @@ mod tests {
             svg_bytes: PROD1_SVG.to_vec(),
             count: 30,
             item_id: Some("prod-1".into()),
+            allowed_rotations: None,
         }];
         let policy = OffcutPolicy {
             min_offcut_width_mm: 100.0,
@@ -385,16 +390,19 @@ mod tests {
                 svg_bytes: OFFCUT_PART_A.to_vec(),
                 count: 5,
                 item_id: Some("A".into()),
+                allowed_rotations: None,
             },
             PartInput {
                 svg_bytes: OFFCUT_PART_B.to_vec(),
                 count: 5,
                 item_id: Some("B".into()),
+                allowed_rotations: None,
             },
             PartInput {
                 svg_bytes: OFFCUT_PART_C.to_vec(),
                 count: 5,
                 item_id: Some("C".into()),
+                allowed_rotations: None,
             },
         ];
         let policy = OffcutPolicy {
@@ -490,16 +498,19 @@ mod tests {
                 svg_bytes: OFFCUT_PART_A.to_vec(),
                 count: 5,
                 item_id: Some("A".into()),
+                allowed_rotations: None,
             },
             PartInput {
                 svg_bytes: OFFCUT_PART_B.to_vec(),
                 count: 5,
                 item_id: Some("B".into()),
+                allowed_rotations: None,
             },
             PartInput {
                 svg_bytes: OFFCUT_PART_C.to_vec(),
                 count: 5,
                 item_id: Some("C".into()),
+                allowed_rotations: None,
             },
         ];
         let policy = OffcutPolicy {

@@ -6,7 +6,6 @@ use jagua_utils::svg_nesting::{
     AdaptiveNestingStrategy, NestingResult, NestingStrategy, PageResult, PartInput,
 };
 use log::{debug, error, info, warn};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -31,9 +30,11 @@ const CANCELLATION_REGISTRY_TTL_SECS: u64 = 300; // 5 minutes
 /// Default execution timeout for nesting operations (in seconds)
 const DEFAULT_EXECUTION_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
-/// A single part specification in a multi-part nesting request
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
+/// A single part specification in a multi-part nesting request.
+///
+/// Ergonomic view of the generated `NestingRequestPart`; (de)serialization is governed by the
+/// generated wire types via [`crate::wire`].
+#[derive(Debug, Clone)]
 pub struct SvgPartSpec {
     /// User-provided correlation ID for this part type
     pub item_id: String,
@@ -41,6 +42,13 @@ pub struct SvgPartSpec {
     pub svg_url: String,
     /// Number of copies of this part to nest
     pub amount_of_parts: usize,
+    /// Optional grain-direction constraint: the exact set of rotations (in **whole
+    /// degrees**) this part may be placed at, e.g. `[0, 180]` to keep the grain on one
+    /// axis while allowing a 180° flip, or `[0]` to lock it fully. When present, only
+    /// these orientations are used for this part, overriding the request-level
+    /// `amount_of_rotations`. Absent ⇒ the part follows `amount_of_rotations` (today's
+    /// behaviour).
+    pub allowed_rotations: Option<Vec<i32>>,
 }
 
 /// Trait for downloading SVG bytes from a URL.
@@ -52,68 +60,54 @@ pub trait SvgDownloader: Send + Sync {
     async fn download(&self, url: &str) -> Result<Vec<u8>>;
 }
 
-/// Request message structure for SQS queue
+/// Request message structure for SQS queue.
+///
+/// Ergonomic view of the generated `NestingRequest` (engine-friendly `f32`/`usize` widths, worker
+/// defaults applied). (De)serialization is governed by the generated wire type via [`crate::wire`]:
+/// the JSON contract lives in the AsyncAPI spec, not in this struct.
+///
 /// For cancellation requests, only `correlation_id` and `cancelled: true` are required.
 /// All other fields are required only when `cancelled` is false or not present.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct SqsNestingRequest {
     /// Unique identifier for tracking the request
     pub correlation_id: String,
     /// Base64-encoded SVG payload (deprecated, use svg_url instead)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub svg_base64: Option<String>,
     /// S3 URL to the input SVG file (format: s3://bucket/key or https://bucket.s3.region.amazonaws.com/key)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub svg_url: Option<String>,
     /// Bin width for nesting (required if not cancelled)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin_width: Option<f32>,
     /// Bin height for nesting (required if not cancelled)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin_height: Option<f32>,
     /// Spacing between parts (required if not cancelled)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacing: Option<f32>,
     /// Number of parts to nest (required for legacy single-part format, ignored if `parts` is set)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount_of_parts: Option<usize>,
     /// Multi-part specification: array of different SVG parts with counts.
     /// When present and non-empty, takes precedence over legacy svg_url/svg_base64 + amount_of_parts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parts: Option<Vec<SvgPartSpec>>,
-    /// Number of rotations to try (default: 8)
-    #[serde(
-        default = "default_rotations",
-        deserialize_with = "deserialize_rotations_or_default"
-    )]
+    /// Number of rotations to try (absent / null ⇒ default 8, applied in [`crate::wire`])
     pub amount_of_rotations: usize,
     /// Output queue URL for results (falls back to default if omitted)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_queue_url: Option<String>,
     /// Whether this is a cancellation request
-    #[serde(default)]
     pub cancelled: bool,
     /// When `Some(true)`, compute the maximum number of copies of a single part
     /// that fit on one sheet. Requires exactly one part type in the request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fit: Option<bool>,
     /// Bucket the worker must write outputs into. None ⇒ legacy default
     /// bucket (BE data-CDN path disabled).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
     /// Key prefix under `bucket`; None ⇒ fall back to `nesting/{correlation_id}`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_prefix: Option<String>,
     /// Optional offcut (free-space) detection policy (JG-OFF-2). Absent ⇒ detection skipped
     /// and the response is byte-identical to today. Ignored for `maxFit` requests.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offcut_policy: Option<jagua_utils::OffcutPolicy>,
     /// Optional per-request wall-clock cap (seconds) for the nesting optimization. When set,
     /// it overrides the strategy's default time budget (the 42s max_fit budget / 600s normal
     /// budget) and the cooperative execution timeout. Clamped to a 600s ceiling. Absent ⇒
     /// today's behaviour (max 600s).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_seconds: Option<u64>,
 }
 
@@ -129,19 +123,6 @@ fn current_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn default_rotations() -> usize {
-    8
-}
-
-/// Deserializes `amount_of_rotations` treating both absent and explicit `null` as the default (8).
-/// Needed because cancellation requests send `"amountOfRotations": null` rather than omitting the field.
-fn deserialize_rotations_or_default<'de, D>(deserializer: D) -> Result<usize, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<usize>::deserialize(deserializer).map(|opt| opt.unwrap_or_else(default_rotations))
 }
 
 /// Helper to safely lock a mutex, recovering from poison errors
@@ -241,41 +222,35 @@ pub(crate) struct CancellationEntry {
     pub(crate) created_at: Instant,
 }
 
-/// Response message structure for SQS queue
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-#[serde(rename_all = "camelCase")]
+/// Response message structure for SQS queue.
+///
+/// Ergonomic view of the generated `NestingResponse`; serialization is governed by the generated
+/// wire type via [`crate::wire`] (camelCase, `improvement`/`final` literals, spec numeric widths).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SqsNestingResponse {
     /// Correlation ID from request
     pub correlation_id: String,
     /// S3 URL to the first page SVG (format: s3://bucket/nesting/{requestId}/first-page.svg)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub first_page_svg_url: Option<String>,
     /// S3 URL to the last page SVG (format: s3://bucket/nesting/{requestId}/last-page.svg)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_page_svg_url: Option<String>,
     /// Number of sheets/pages used
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sheets: Option<usize>,
     /// S3 URLs to all page SVGs (ordered by page index)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub page_svg_urls: Option<Vec<String>>,
     /// Per-page results: utilisation and placements grouped by page
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub pages: Option<Vec<PageResult>>,
     /// Number of parts placed
     pub parts_placed: usize,
     /// Average bin utilisation ratio (0.0 to 1.0) across all pages
     pub utilisation: f32,
     /// Whether this is an intermediate improvement (always false for simple strategy)
-    #[serde(rename = "improvement")]
     pub is_improvement: bool,
     /// Whether this is the final result (always true for simple strategy)
-    #[serde(rename = "final")]
     pub is_final: bool,
     /// Timestamp in seconds since epoch
     pub timestamp: u64,
     /// Error message if processing failed
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 }
 
@@ -954,6 +929,11 @@ impl SqsProcessor {
                             svg_bytes,
                             count: spec.amount_of_parts,
                             item_id: Some(spec.item_id.clone()),
+                            // Integer request degrees → f32 degrees for the geometry layer.
+                            allowed_rotations: spec
+                                .allowed_rotations
+                                .as_ref()
+                                .map(|angles| angles.iter().map(|&d| d as f32).collect()),
                         });
                     }
                     inputs
@@ -975,6 +955,8 @@ impl SqsProcessor {
                     svg_bytes,
                     count: amount_of_parts,
                     item_id: None,
+                    // Legacy single-part format has no per-part grain field.
+                    allowed_rotations: None,
                 }]
             };
 

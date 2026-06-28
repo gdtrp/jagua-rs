@@ -44,6 +44,7 @@ pub fn nest_svg_parts(
         svg_bytes: svg_part_bytes.to_vec(),
         count: amount_of_parts,
         item_id: None,
+        allowed_rotations: None,
     }];
     strategy.nest(
         bin_width,

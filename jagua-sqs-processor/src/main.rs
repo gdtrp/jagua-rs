@@ -1,11 +1,9 @@
-mod processor;
-
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_sqs::Client as SqsClient;
+use jagua_sqs_processor::SqsProcessor;
 use log::info;
-use processor::SqsProcessor;
 use std::env;
 use tokio::signal;
 

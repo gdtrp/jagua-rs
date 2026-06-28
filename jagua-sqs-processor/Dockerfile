@@ -17,6 +17,13 @@ COPY jagua-utils/Cargo.toml ./jagua-utils/
 COPY lbf/Cargo.toml ./lbf/
 COPY jagua-sqs-processor/Cargo.toml ./jagua-sqs-processor/
 
+# build.rs generates the SQS wire types from the vendored AsyncAPI spec at compile time, so both
+# must be present in every build phase (the dummy dep-build below runs build.rs too — it compiles
+# the heavy build-deps like typify/syn into the cached layer). They live at the crate root /
+# asyncapi dir, NOT under src/, so they need their own COPY.
+COPY jagua-sqs-processor/build.rs ./jagua-sqs-processor/build.rs
+COPY jagua-sqs-processor/asyncapi ./jagua-sqs-processor/asyncapi
+
 # Create dummy source files so cargo can resolve and build dependencies only
 RUN mkdir -p jagua-rs/src jagua-utils/src lbf/src lbf/benches jagua-sqs-processor/src && \
     echo "pub fn _dummy() {}" > jagua-rs/src/lib.rs && \
