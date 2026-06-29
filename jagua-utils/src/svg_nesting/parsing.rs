@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use jagua_rs::geometry::geo_traits::CollidesWith;
-use jagua_rs::geometry::primitives::{Edge, Point};
+use jagua_rs::geometry::primitives::{Edge, Point, SPolygon};
+use jagua_rs::geometry::shape_modification::{ShapeModifyConfig, ShapeModifyMode};
+use jagua_rs::geometry::{DTransformation, OriginalShape};
 
 /// Number of segments to use when linearizing curves
 const CURVE_SEGMENTS: usize = 16;
@@ -1085,6 +1087,89 @@ pub fn sanitize_polygon(points: Vec<Point>) -> Vec<Point> {
         log::warn!("Could not fully repair self-intersecting boundary; returning original points");
         original
     }
+}
+
+/// Builds an [`OriginalShape`] whose spacing inflation is guaranteed to convert
+/// to a valid (simple) internal polygon.
+///
+/// jagua-rs bakes part separation in by inflating each part's boundary by
+/// `modify_config.offset` (half the requested spacing) when converting it to its
+/// internal collision shape. For a part with a narrow concavity, inflating by the
+/// full amount can fold the boundary onto itself, so
+/// [`OriginalShape::convert_to_internal`] fails with a self-intersection error —
+/// which would otherwise abort the entire nesting job over a single awkward part
+/// (e.g. densely-tessellated "dr" parts whose throat is narrower than the
+/// spacing).
+///
+/// Instead, we reduce the inflation for *this part only* until the result is
+/// geometrically valid, preserving as much separation as the geometry allows
+/// (down to none as a last resort). Every other part keeps the full spacing. The
+/// validation runs once per distinct part, so the extra work is negligible.
+pub fn build_inflatable_shape(
+    shape: SPolygon,
+    pre_transform: DTransformation,
+    modify_mode: ShapeModifyMode,
+    modify_config: ShapeModifyConfig,
+) -> Result<OriginalShape> {
+    let make = |cfg: ShapeModifyConfig| OriginalShape {
+        shape: shape.clone(),
+        pre_transform,
+        modify_mode,
+        modify_config: cfg,
+    };
+
+    // Fast path: the configured inflation already yields a valid internal shape.
+    let candidate = make(modify_config);
+    if candidate.convert_to_internal().is_ok() {
+        return Ok(candidate);
+    }
+
+    let full_offset = modify_config.offset.unwrap_or(0.0);
+    if full_offset != 0.0 {
+        // Back the inflation off geometrically until the conversion is valid,
+        // keeping the largest separation that does not self-intersect.
+        let mut offset = full_offset;
+        for _ in 0..16 {
+            offset *= 0.75;
+            let cfg = ShapeModifyConfig {
+                offset: Some(offset),
+                ..modify_config
+            };
+            let candidate = make(cfg);
+            if candidate.convert_to_internal().is_ok() {
+                log::warn!(
+                    "Reduced part inflation from {:.3} to {:.3} to avoid a self-intersection \
+                     (narrow concavity); this part keeps less separation than requested.",
+                    full_offset,
+                    offset
+                );
+                return Ok(candidate);
+            }
+        }
+        // Last resort: place the part with no baked-in separation.
+        let cfg = ShapeModifyConfig {
+            offset: Some(0.0),
+            ..modify_config
+        };
+        let candidate = make(cfg);
+        if candidate.convert_to_internal().is_ok() {
+            log::warn!(
+                "Disabled part inflation (could not inflate by {:.3} without self-intersection); \
+                 this part is placed with no baked-in separation.",
+                full_offset
+            );
+            return Ok(candidate);
+        }
+    }
+
+    // Even with no inflation the shape is invalid — surface jagua-rs's descriptive
+    // error rather than swallowing it.
+    let candidate = make(ShapeModifyConfig {
+        offset: Some(0.0),
+        ..modify_config
+    });
+    candidate.convert_to_internal()?;
+    Ok(candidate)
 }
 
 #[cfg(test)]

@@ -68,7 +68,7 @@ pub(crate) fn fit_orientations(allowed_rotations: &Option<Vec<f32>>) -> (bool, b
     let (mut allow_original, mut allow_swapped) = (false, false);
     for &deg in angles {
         let norm = deg.rem_euclid(180.0);
-        if norm < 1.0 || norm > 179.0 {
+        if !(1.0..=179.0).contains(&norm) {
             allow_original = true; // ~0° / ~180°
         } else if (norm - 90.0).abs() < 1.0 {
             allow_swapped = true; // ~90° / ~270°

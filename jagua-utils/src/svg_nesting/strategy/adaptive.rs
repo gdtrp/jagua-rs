@@ -3,8 +3,8 @@
 use crate::svg_nesting::{
     offcut::{OffcutPolicy, apply_offcuts},
     parsing::{
-        calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
-        sanitize_polygon,
+        build_inflatable_shape, calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path,
+        reverse_winding, sanitize_polygon,
     },
     strategy::{NestingStrategy, PartInput, is_single_part_type},
     svg_generation::{
@@ -636,12 +636,12 @@ impl AdaptiveNestingStrategy {
             let centroid = polygon.centroid();
             let pre_transform = DTransformation::new(0.0, (-centroid.x(), -centroid.y()));
 
-            let item_shape = OriginalShape {
-                shape: polygon,
+            let item_shape = build_inflatable_shape(
+                polygon,
                 pre_transform,
-                modify_mode: ShapeModifyMode::Inflate,
-                modify_config: importer.shape_modify_config,
-            };
+                ShapeModifyMode::Inflate,
+                importer.shape_modify_config,
+            )?;
 
             parsed_parts.push(ParsedPart {
                 item_shape,
@@ -1022,7 +1022,9 @@ impl AdaptiveNestingStrategy {
                                 best_pages
                             );
                             if let Some(sol) = best_solution.as_ref() {
-                                self.finalize_offcuts(&mut best, sol, bin_width, bin_height, spacing);
+                                self.finalize_offcuts(
+                                    &mut best, sol, bin_width, bin_height, spacing,
+                                );
                             }
                             return Ok(best);
                         }
@@ -1191,7 +1193,13 @@ impl AdaptiveNestingStrategy {
                     );
                     let mut final_result = best_result.take().unwrap_or(result);
                     let final_solution = best_solution.as_ref().unwrap_or(&solution);
-                    self.finalize_offcuts(&mut final_result, final_solution, bin_width, bin_height, spacing);
+                    self.finalize_offcuts(
+                        &mut final_result,
+                        final_solution,
+                        bin_width,
+                        bin_height,
+                        spacing,
+                    );
                     return Ok(final_result);
                 }
 
@@ -1238,7 +1246,7 @@ impl AdaptiveNestingStrategy {
                 loops = (loops + 2).min(MAX_ESCALATED_LOOPS);
                 // Cap placements so total work per run stays bounded
                 let max_placements = if effective_count > 50 {
-                    ( high_count_sample_budget / (effective_count * loops).max(1))
+                    (high_count_sample_budget / (effective_count * loops).max(1))
                         .clamp(1000, 500000)
                 } else {
                     500000

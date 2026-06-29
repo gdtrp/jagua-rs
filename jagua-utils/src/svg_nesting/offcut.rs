@@ -177,9 +177,12 @@ pub(crate) fn detect_offcuts(
 ) -> Vec<Offcut> {
     match policy.shape {
         OffcutShape::Rectangle => detect_rect_offcuts(bin_bbox, placed_bboxes, policy, spacing),
-        OffcutShape::RectangleMerged => {
-            merge_rect_offcuts(detect_rect_offcuts(bin_bbox, placed_bboxes, policy, spacing))
-        }
+        OffcutShape::RectangleMerged => merge_rect_offcuts(detect_rect_offcuts(
+            bin_bbox,
+            placed_bboxes,
+            policy,
+            spacing,
+        )),
         OffcutShape::Quadrilateral => detect_poly_offcuts(bin_bbox, placed_polys, policy, spacing),
     }
 }
@@ -455,10 +458,7 @@ pub(crate) fn kerf_band_paths(offcuts: &[Offcut], kerf: f32) -> Vec<String> {
     if kerf <= 0.0 {
         return Vec::new();
     }
-    offcuts
-        .iter()
-        .map(|o| kerf_band_path(o, kerf))
-        .collect()
+    offcuts.iter().map(|o| kerf_band_path(o, kerf)).collect()
 }
 
 fn kerf_band_path(offcut: &Offcut, kerf: f32) -> String {
@@ -546,7 +546,10 @@ fn offcut_poly_to_geo(vertices: &[OffcutVertex], holes: &[Vec<OffcutVertex>]) ->
         }
         LineString::from(c)
     };
-    Polygon::new(to_ring(vertices), holes.iter().map(|h| to_ring(h)).collect())
+    Polygon::new(
+        to_ring(vertices),
+        holes.iter().map(|h| to_ring(h)).collect(),
+    )
 }
 
 /// Convert a `geo` polygon to an [`Offcut::Poly`]: exterior ring (CCW) plus interior rings
@@ -656,8 +659,14 @@ mod tests {
             width: 500.0,
             height: 600.0,
         };
-        assert!(offcuts.contains(&right), "missing right column: {offcuts:?}");
-        assert!(offcuts.contains(&top_left), "missing top-left block: {offcuts:?}");
+        assert!(
+            offcuts.contains(&right),
+            "missing right column: {offcuts:?}"
+        );
+        assert!(
+            offcuts.contains(&top_left),
+            "missing top-left block: {offcuts:?}"
+        );
         // The two offcuts must not overlap.
         assert!(!rects_overlap(&offcuts));
     }
@@ -701,7 +710,10 @@ mod tests {
     fn rect_full_sheet_zero_offcuts() {
         let full = Rect::try_new(0.0, 0.0, 2000.0, 1000.0).unwrap();
         let offcuts = detect_rect_offcuts(BIN(), &[full], &rect_policy(10.0, 10.0, 0.0), 0.0);
-        assert!(offcuts.is_empty(), "full sheet should yield no offcuts: {offcuts:?}");
+        assert!(
+            offcuts.is_empty(),
+            "full sheet should yield no offcuts: {offcuts:?}"
+        );
     }
 
     #[test]
@@ -813,12 +825,8 @@ mod tests {
     #[test]
     fn poly_difference_basic() {
         // A single triangular item near the bottom-left; bin minus its hull is non-empty.
-        let tri = SPolygon::new(vec![
-            Point(0.0, 0.0),
-            Point(800.0, 0.0),
-            Point(0.0, 600.0),
-        ])
-        .unwrap();
+        let tri =
+            SPolygon::new(vec![Point(0.0, 0.0), Point(800.0, 0.0), Point(0.0, 600.0)]).unwrap();
         let offcuts = detect_poly_offcuts(BIN(), &[&tri], &poly_policy(50.0, 50.0, 0.0), 0.0);
         assert!(!offcuts.is_empty(), "expected polygon offcuts");
         for o in &offcuts {
@@ -904,7 +912,10 @@ mod tests {
             .map(|v| v.x)
             .fold(f32::INFINITY, f32::min);
         // Free region reaches the deflated part edge (~500), proving the inflate was undone.
-        assert!(min_x <= 501.0, "offcut left edge {min_x} did not reach true part edge");
+        assert!(
+            min_x <= 501.0,
+            "offcut left edge {min_x} did not reach true part edge"
+        );
     }
 
     #[test]

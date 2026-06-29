@@ -155,7 +155,10 @@ mod tests {
             .expect("nesting should succeed");
 
         let polys: Vec<&Offcut> = result.pages.iter().flat_map(|p| p.offcuts.iter()).collect();
-        assert!(!polys.is_empty(), "expected polygon offcuts beside the part");
+        assert!(
+            !polys.is_empty(),
+            "expected polygon offcuts beside the part"
+        );
         for o in polys {
             match o {
                 Offcut::Poly { vertices, .. } => {
@@ -245,7 +248,10 @@ mod tests {
             .nest(BIN_W, BIN_H, 5.0, &square_parts(1), 4, None)
             .expect("nesting should succeed");
         let total: usize = result.pages.iter().map(|p| p.offcuts.len()).sum();
-        assert!(total > 0, "simple strategy should produce offcuts with a policy");
+        assert!(
+            total > 0,
+            "simple strategy should produce offcuts with a policy"
+        );
 
         // Without a policy: none.
         let without = SimpleNestingStrategy::new();
@@ -285,7 +291,11 @@ mod tests {
 
         let out_dir = std::path::Path::new("test_output/offcuts");
         std::fs::create_dir_all(out_dir).unwrap();
-        std::fs::write(out_dir.join("prod1_rect_combined.svg"), &result.combined_svg).unwrap();
+        std::fs::write(
+            out_dir.join("prod1_rect_combined.svg"),
+            &result.combined_svg,
+        )
+        .unwrap();
         for (i, svg) in result.page_svgs.iter().enumerate() {
             std::fs::write(out_dir.join(format!("prod1_rect_page{i}.svg")), svg).unwrap();
         }
@@ -301,7 +311,10 @@ mod tests {
                     width,
                     height,
                 } => {
-                    assert!(*width >= 100.0 && *height >= 100.0, "offcut below threshold: {o:?}");
+                    assert!(
+                        *width >= 100.0 && *height >= 100.0,
+                        "offcut below threshold: {o:?}"
+                    );
                     assert!(within_bin(*x, *y) && within_bin(x + width, y + height));
                 }
                 other => panic!("rectangle policy must yield RECT, got {other:?}"),
@@ -335,7 +348,11 @@ mod tests {
 
         let out_dir = std::path::Path::new("test_output/offcuts");
         std::fs::create_dir_all(out_dir).unwrap();
-        std::fs::write(out_dir.join("prod1_quad_combined.svg"), &result.combined_svg).unwrap();
+        std::fs::write(
+            out_dir.join("prod1_quad_combined.svg"),
+            &result.combined_svg,
+        )
+        .unwrap();
         for (i, svg) in result.page_svgs.iter().enumerate() {
             std::fs::write(out_dir.join(format!("prod1_quad_page{i}.svg")), svg).unwrap();
         }
@@ -422,7 +439,11 @@ mod tests {
 
         let out_dir = std::path::Path::new("test_output/offcuts");
         std::fs::create_dir_all(out_dir).unwrap();
-        std::fs::write(out_dir.join("report_repro_combined.svg"), &result.combined_svg).unwrap();
+        std::fs::write(
+            out_dir.join("report_repro_combined.svg"),
+            &result.combined_svg,
+        )
+        .unwrap();
         for (i, svg) in result.page_svgs.iter().enumerate() {
             std::fs::write(out_dir.join(format!("report_repro_page{i}.svg")), svg).unwrap();
         }
@@ -443,7 +464,10 @@ mod tests {
                     width,
                     height,
                 } => {
-                    assert!(*width >= 100.0 && *height >= 100.0, "below threshold: {o:?}");
+                    assert!(
+                        *width >= 100.0 && *height >= 100.0,
+                        "below threshold: {o:?}"
+                    );
                     assert!(*x >= -1e-2 && *y >= -1e-2, "offcut outside sheet: {o:?}");
                     assert!(
                         x + width <= W + 1e-2 && y + height <= H + 1e-2,
@@ -535,7 +559,11 @@ mod tests {
         )
         .unwrap();
         for (i, svg) in result.page_svgs.iter().enumerate() {
-            std::fs::write(out_dir.join(format!("report_repro_merged_page{i}.svg")), svg).unwrap();
+            std::fs::write(
+                out_dir.join(format!("report_repro_merged_page{i}.svg")),
+                svg,
+            )
+            .unwrap();
         }
 
         let offcuts: Vec<&Offcut> = result.pages.iter().flat_map(|p| p.offcuts.iter()).collect();
@@ -555,7 +583,10 @@ mod tests {
             Offcut::Poly { vertices, .. } => {
                 assert!(vertices.len() >= 4, "degenerate polygon: {:?}", offcuts[0]);
                 for v in vertices {
-                    assert!(within_repro_sheet(v.x, v.y, W, H), "vertex outside sheet: {v:?}");
+                    assert!(
+                        within_repro_sheet(v.x, v.y, W, H),
+                        "vertex outside sheet: {v:?}"
+                    );
                     max_right = max_right.max(v.x);
                     max_top = max_top.max(v.y);
                     min_bottom = min_bottom.min(v.y);
@@ -563,7 +594,10 @@ mod tests {
             }
             other => panic!("RECTANGLE_MERGED must yield POLY, got {other:?}"),
         }
-        assert!(max_right >= W - 1.0, "offcut doesn't reach right edge ({max_right})");
+        assert!(
+            max_right >= W - 1.0,
+            "offcut doesn't reach right edge ({max_right})"
+        );
         assert!(
             max_top >= H - 1.0 && min_bottom <= 1.0,
             "offcut doesn't reach true top/bottom (top={max_top}, bottom={min_bottom})"

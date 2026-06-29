@@ -1418,7 +1418,9 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
             "  combined_svg length: {}",
             final_nesting_result.combined_svg.len()
         );
-        println!("  This suggests the solution had placed items but layout_snapshots was empty during SVG generation");
+        println!(
+            "  This suggests the solution had placed items but layout_snapshots was empty during SVG generation"
+        );
 
         // Try to generate a minimal SVG showing that parts were placed
         if final_nesting_result.parts_placed > 0 {
@@ -2158,14 +2160,43 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
 
     let strategy =
         AdaptiveNestingStrategy::with_cancellation_checker(Box::new(cancellation_checker));
-    let nesting_result = strategy.nest(
-        bin_width,
-        bin_height,
-        spacing,
-        &part_inputs,
-        request.amount_of_rotations,
-        Some(Box::new(callback)),
-    );
+
+    // Mirror the production processor's failsafe. The cooperative cancellation
+    // checker is the *primary* timeout, but a single LBF solve only polls it every
+    // ~100 placements, so on slow hardware or very large instances one batch can
+    // overshoot the budget. Production bounds this by running nest() in a blocking
+    // task wrapped in `tokio::time::timeout(execution_timeout + 60s)`; we reproduce
+    // that bound here with a worker thread + `recv_timeout`, returning the best
+    // intermediate improvement captured so far instead of blocking indefinitely.
+    let failsafe = timeout + Duration::from_secs(60);
+    let amount_of_rotations = request.amount_of_rotations;
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = strategy.nest(
+            bin_width,
+            bin_height,
+            spacing,
+            &part_inputs,
+            amount_of_rotations,
+            Some(Box::new(callback)),
+        );
+        // Map the error to a String so it can cross the thread boundary.
+        let _ = done_tx.send(result.map_err(|e| e.to_string()));
+    });
+
+    let nesting_result = match done_rx.recv_timeout(failsafe) {
+        Ok(result) => {
+            let _ = worker.join();
+            result.map_err(|e| anyhow::anyhow!(e))
+        }
+        Err(_) => {
+            // Failsafe fired: cooperative cancellation did not return in time. The
+            // worker keeps running until its checker trips, but we return now so the
+            // caller is bounded by `execution_timeout + 60s`.
+            timed_out.store(true, Ordering::SeqCst);
+            Err(anyhow::anyhow!("execution timeout (failsafe)"))
+        }
+    };
 
     // Check if we timed out
     if timed_out.load(Ordering::SeqCst) {
@@ -2619,8 +2650,7 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
                 .entry(p.item_id.clone())
                 .or_insert((p.centroid_x, p.centroid_y));
             assert!(
-                (entry.0 - p.centroid_x).abs() < 1e-3
-                    && (entry.1 - p.centroid_y).abs() < 1e-3,
+                (entry.0 - p.centroid_x).abs() < 1e-3 && (entry.1 - p.centroid_y).abs() < 1e-3,
                 "Centroid for item {} varies across placements: expected ({}, {}), got ({}, {}) — the fix should make this a per-part constant",
                 p.item_id,
                 entry.0,
