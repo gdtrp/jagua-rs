@@ -51,7 +51,10 @@ fn rewrite_refs(v: &mut Value) {
 fn main() {
     println!("cargo:rerun-if-changed={SPEC_PATH}");
 
-    let yaml = fs::read_to_string(SPEC_PATH).expect("read AsyncAPI spec");
+    let yaml = fs::read_to_string(SPEC_PATH).unwrap_or_else(|_| {
+        panic!("AsyncAPI spec not found at {SPEC_PATH} — it is sourced from cutl-schemas, not vendored. \
+                Run ./scripts/sync-schema.sh (needs gh auth) before building.")
+    });
     let doc: Value = serde_yaml::from_str(&yaml).expect("parse AsyncAPI YAML");
 
     let schemas = doc

@@ -59,6 +59,12 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      # The AsyncAPI wire spec is sourced from cutl-schemas (single source of truth), not vendored.
+      # Fetch it into the build context before the Docker build (build.rs/typify reads it).
+      - name: Sync AsyncAPI spec from cutl-schemas
+        env:
+          GH_TOKEN: ${{ secrets.CUTL_SCHEMAS_TOKEN }}
+        run: ./scripts/sync-schema.sh
       - uses: docker/setup-buildx-action@v3
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -144,6 +150,12 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      # The AsyncAPI wire spec is sourced from cutl-schemas (single source of truth), not vendored.
+      # Fetch it into the build context before the Docker build (build.rs/typify reads it).
+      - name: Sync AsyncAPI spec from cutl-schemas
+        env:
+          GH_TOKEN: ${{ secrets.CUTL_SCHEMAS_TOKEN }}
+        run: ./scripts/sync-schema.sh
       - uses: docker/setup-buildx-action@v3
       - uses: aws-actions/configure-aws-credentials@v4
         with:

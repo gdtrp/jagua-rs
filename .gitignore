@@ -28,3 +28,5 @@ input/
 *.log
 *.pid
 *.env
+# Sourced from cutl-schemas at build time (scripts/sync-schema.sh), not vendored.
+jagua-sqs-processor/asyncapi/jagua-rs.yaml
