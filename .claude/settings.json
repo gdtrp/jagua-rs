@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CFG=\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"; SLUG=$(printf '%s' \"$CLAUDE_PROJECT_DIR\" | sed 's#/#-#g'); T=\"$CFG/projects/$SLUG/memory\"; mkdir -p \"$(dirname \"$T\")\"; [ -L \"$T\" ] || rm -rf \"$T\"; ln -sfn \"$CLAUDE_PROJECT_DIR/.claude/memory\" \"$T\""
+          }
+        ]
+      }
+    ]
+  }
+}
