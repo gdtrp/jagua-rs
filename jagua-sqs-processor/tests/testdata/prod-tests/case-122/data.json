@@ -1,0 +1,16 @@
+{
+  "description": "prod row 168",
+  "csvRow": 168,
+  "binWidth": 1250.0,
+  "binHeight": 2500.0,
+  "spacing": 0.1,
+  "amountOfRotations": 4,
+  "items": [
+    {
+      "url": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/61290340-1360-408c-935a-d182e7e7b113/result.svg",
+      "count": 21,
+      "dxfUrl": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculations/61290340-1360-408c-935a-d182e7e7b113/Optima-A8,%20%201%20%D0%BC%D0%BC,%20%D1%85%D0%BA.dxf",
+      "itemId": "9b59c524-b810-4852-a3f2-eaa92bda43fd"
+    }
+  ]
+}

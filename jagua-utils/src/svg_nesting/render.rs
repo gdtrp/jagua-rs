@@ -276,10 +276,22 @@ fn render_one_page(
     }
     let snapshot = layout.save();
 
+    // Draw only the real part outlines — no collision-shape overlay or fail-fast surrogate poles.
+    // Those debug overlays render a *second*, inflated dashed outline around every part, which reads
+    // as phantom extra spacing (the parts are exactly `spacing` apart; the overlay just looked like
+    // "2mm + 2mm").
+    let draw_options = SvgDrawOptions {
+        quadtree: false,
+        surrogate: false,
+        highlight_collisions: false,
+        draw_cd_shapes: false,
+        highlight_cd_shapes: false,
+        ..SvgDrawOptions::default()
+    };
     let svg_doc = s_layout_to_svg(
         &snapshot,
         &ctx.instance,
-        SvgDrawOptions::default(),
+        draw_options,
         &format!("Page {} - {} items", page_index, placements.len()),
     );
     let holes_refs: Vec<&[Vec<Point>]> = ctx.holes.iter().map(|h| h.as_slice()).collect();

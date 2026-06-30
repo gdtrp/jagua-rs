@@ -58,15 +58,23 @@ impl CDEngine {
 
     /// Registers a new hazard in the CDE.
     pub fn register_hazard(&mut self, hazard: Hazard) {
+        // LOCAL PATCH (jagua-utils): both asserts scan every hazard, so unconditionally they make
+        // bulk fills (thousands of registered parts on one layout, as in periodic rendering) O(n²)
+        // and minutes-slow in debug/test builds. Size-gate them: still checked for the small CDEs
+        // that correctness tests use (the invariants are size-independent), skipped once the hazard
+        // set grows into bulk territory. Preserve across upstream syncs (see CLAUDE.md).
         debug_assert!(
-            !self.hazards_map.values().any(|h| h.entity == hazard.entity),
+            self.hazards_map.len() > 32
+                || !self.hazards_map.values().any(|h| h.entity == hazard.entity),
             "Hazard with an identical entity already registered"
         );
         let hkey = self.hazards_map.insert(hazard);
         let qt_hazard = QTHazard::from_root(self.bbox(), &self.hazards_map[hkey], hkey);
         self.quadtree.register_hazard(qt_hazard, &self.hazards_map);
 
-        debug_assert!(assertions::qt_contains_no_dangling_hazards(self));
+        debug_assert!(
+            self.hazards_map.len() > 32 || assertions::qt_contains_no_dangling_hazards(self)
+        );
     }
 
     /// Removes a hazard from the CDE.

@@ -4,12 +4,14 @@
 //! cheapest correct packer, falling back to the general LBF strategy (`AdaptiveNestingStrategy`)
 //! for anything the fast paths don't (yet) handle. The General path is byte-for-byte unchanged.
 
+use crate::svg_nesting::lattice::nest_max_fit_lattice;
 use crate::svg_nesting::mixed::nest_mixed;
-use crate::svg_nesting::pairing::nest_pairing;
+use crate::svg_nesting::pairing::{nest_max_fit_pairing, nest_pairing};
 use crate::svg_nesting::periodic::{nest_max_fit_grid, nest_periodic_grid};
 use crate::svg_nesting::render::measure_part;
 use crate::svg_nesting::strategy::{
-    AdaptiveNestingStrategy, ImprovementCallback, NestingStrategy, PartInput, fit_orientations,
+    AdaptiveNestingStrategy, ImprovementCallback, NestingStrategy, PartInput, effective_allowed,
+    fit_orientations,
 };
 use crate::svg_nesting::svg_generation::NestingResult;
 use anyhow::Result;
@@ -151,17 +153,41 @@ pub fn nest_auto(
             let allow_swap = single_part_allow_swap(&parts[0], amount_of_rotations);
             nest_periodic_grid(bin_width, bin_height, spacing, &parts[0], allow_swap)
         }
-        // Pairing needs free rotation (0°+180°): only route here when the part is unconstrained.
+        // Pairing needs the grain-preserving 0°+180° flip; allowed when the part is unconstrained
+        // (`None` or `[]` ⇒ any rotation). `allow_swap` lets the pair-rectangle also use the 90°
+        // orientation when the part permits it (denser on some bins).
         PackingClass::SinglePairable
-            if amount_of_rotations != 0 && parts[0].allowed_rotations.is_none() =>
+            if amount_of_rotations != 0
+                && effective_allowed(&parts[0].allowed_rotations).is_none() =>
         {
-            nest_pairing(bin_width, bin_height, spacing, &parts[0])
+            let allow_swap = fit_orientations(&parts[0].allowed_rotations).1;
+            nest_pairing(bin_width, bin_height, spacing, &parts[0], allow_swap)
         }
         // Mixed rectangular types: per-type identical sheets + shelf-packed shared remainder.
-        // Only when every type is unconstrained; otherwise fall through to General. Falls back to
-        // General if a part doesn't fit (nest_mixed errors).
-        PackingClass::MixedFewTypes if parts.iter().all(|p| p.allowed_rotations.is_none()) => {
+        // nest_mixed is grain-aware (per-part 90° permission), so grain-locked parts
+        // (`allowedRotations: []` ⇒ 0° only) still grid-pack. Requires every part to be placeable
+        // at 0° (the grid's primary orientation); otherwise fall through to General, as does a
+        // part that doesn't fit (nest_mixed errors).
+        PackingClass::MixedFewTypes if parts.iter().all(single_part_allow_original) => {
             match nest_mixed(bin_width, bin_height, spacing, parts, amount_of_rotations) {
+                Ok(r) => Ok(r),
+                Err(_) => general(improvement_callback),
+            }
+        }
+        // Single irregular (trapezoid / parallelogram / L-shape / concave / notched …) → the lattice
+        // packer: densest periodic packing via the no-fit-polygon double lattice, with a bbox-grid
+        // floor inside (so all parts are always placed). Replaces the slow/inconsistent LBF for
+        // single irregular parts; falls back to General only if the part can't fit at all.
+        PackingClass::SingleIrregular if parts.len() == 1 => {
+            let (rots, allow_double) = lattice_rotations(&parts[0], amount_of_rotations);
+            match crate::svg_nesting::lattice::nest_lattice(
+                bin_width,
+                bin_height,
+                spacing,
+                &parts[0],
+                &rots,
+                allow_double,
+            ) {
                 Ok(r) => Ok(r),
                 Err(_) => general(improvement_callback),
             }
@@ -176,9 +202,35 @@ pub fn nest_auto(
     }
 }
 
-/// max_fit ("max copies on one sheet") with auto routing: rectangular/high-fill single parts use
-/// the deterministic grid stencil (so the reported max equals the periodic full-sheet count, fixing
-/// the #4 bug); everything else uses the LBF `nest_max_fit`.
+/// Base orientations (radians) + whether the 180° double lattice is allowed, for the lattice packer.
+/// Unconstrained parts try {0°, 90°} (the double lattice covers 180°/270° and the interlock); a
+/// grain list uses its angles, enabling the double lattice only when 180° is permitted.
+fn lattice_rotations(part: &PartInput, amount_of_rotations: usize) -> (Vec<f32>, bool) {
+    use std::f32::consts::FRAC_PI_2;
+    match effective_allowed(&part.allowed_rotations) {
+        None => {
+            if amount_of_rotations == 0 {
+                (vec![0.0], false)
+            } else {
+                (vec![0.0, FRAC_PI_2], true)
+            }
+        }
+        Some(angles) => {
+            let rots: Vec<f32> = angles.iter().map(|d| d.to_radians()).collect();
+            let allow_double = angles
+                .iter()
+                .any(|&d| (d.rem_euclid(360.0) - 180.0).abs() < 1.0);
+            (if rots.is_empty() { vec![0.0] } else { rots }, allow_double)
+        }
+    }
+}
+
+/// max_fit ("max copies on one sheet") with auto routing. Mirrors [`nest_auto`]'s per-class routing
+/// so the reported "max parts per sheet" is the **same deterministic single-sheet stencil** the real
+/// nest repeats — grid (rectangles/high-fill), pairing (half-bbox), or the lattice (everything else
+/// irregular). They share each path's stencil builder, so max-fit can never disagree with the
+/// periodic full-sheet count for any deterministic class (the general WS-7 guarantee). The LBF
+/// `nest_max_fit` is only a last resort for parts no deterministic path accepts (or `General` mode).
 #[allow(clippy::too_many_arguments)]
 pub fn nest_max_fit_auto(
     strategy: &AdaptiveNestingStrategy,
@@ -191,14 +243,55 @@ pub fn nest_max_fit_auto(
     improvement_callback: Option<ImprovementCallback>,
 ) -> Result<NestingResult> {
     if mode != PackingMode::General {
-        let class = classify(std::slice::from_ref(part), bin_width, bin_height);
-        let grid_ok = matches!(
-            class,
-            PackingClass::SingleHighFill | PackingClass::SingleRectangle
-        ) || matches!(mode, PackingMode::Grid | PackingMode::Periodic);
-        if grid_ok && single_part_allow_original(part) {
-            let allow_swap = single_part_allow_swap(part, amount_of_rotations);
-            return nest_max_fit_grid(bin_width, bin_height, spacing, part, allow_swap);
+        // Forced grid/periodic: deterministic grid stencil (single part that can sit at 0°).
+        if matches!(mode, PackingMode::Grid | PackingMode::Periodic) {
+            if single_part_allow_original(part) {
+                let allow_swap = single_part_allow_swap(part, amount_of_rotations);
+                return nest_max_fit_grid(bin_width, bin_height, spacing, part, allow_swap);
+            }
+            // forced mode but part can't sit at 0° → fall through to LBF below
+        } else {
+            // Auto: route by class exactly like `nest_auto`, each via the matching stencil builder.
+            let class = classify(std::slice::from_ref(part), bin_width, bin_height);
+            let det: Option<Result<NestingResult>> = match class {
+                PackingClass::SingleHighFill | PackingClass::SingleRectangle
+                    if single_part_allow_original(part) =>
+                {
+                    let allow_swap = single_part_allow_swap(part, amount_of_rotations);
+                    Some(nest_max_fit_grid(
+                        bin_width, bin_height, spacing, part, allow_swap,
+                    ))
+                }
+                PackingClass::SinglePairable
+                    if amount_of_rotations != 0
+                        && effective_allowed(&part.allowed_rotations).is_none() =>
+                {
+                    let allow_swap = fit_orientations(&part.allowed_rotations).1;
+                    Some(nest_max_fit_pairing(
+                        bin_width, bin_height, spacing, part, allow_swap,
+                    ))
+                }
+                PackingClass::SingleHighFill
+                | PackingClass::SingleRectangle
+                | PackingClass::SinglePairable
+                | PackingClass::SingleIrregular => {
+                    let (rots, allow_double) = lattice_rotations(part, amount_of_rotations);
+                    Some(nest_max_fit_lattice(
+                        bin_width,
+                        bin_height,
+                        spacing,
+                        part,
+                        &rots,
+                        allow_double,
+                    ))
+                }
+                PackingClass::MixedFewTypes | PackingClass::General => None,
+            };
+            // A deterministic path that succeeds wins; if it errors (e.g. part doesn't fit) fall
+            // through to LBF, which reports the same impossibility.
+            if let Some(Ok(r)) = det {
+                return Ok(r);
+            }
         }
     }
     strategy.nest_max_fit(

@@ -1,0 +1,34 @@
+{
+  "description": "prod row 173",
+  "csvRow": 173,
+  "binWidth": 1200.0,
+  "binHeight": 800.0,
+  "spacing": 2.0,
+  "amountOfRotations": 4,
+  "items": [
+    {
+      "url": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/cdfcf1f1-5a40-499f-8c22-28daae19695b/result.svg",
+      "count": 80,
+      "dxfUrl": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/90e641c5-83f9-496c-86c7-d97d78581b2d/projectParts/cd6fd3de-0475-4afe-8a11-6e7288ecccf5/project_part_dxf.dxf",
+      "itemId": "cd6fd3de-0475-4afe-8a11-6e7288ecccf5"
+    },
+    {
+      "url": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/755cf1d6-6a74-4f06-ad1c-77e86d2d266d/result.svg",
+      "count": 80,
+      "dxfUrl": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/90e641c5-83f9-496c-86c7-d97d78581b2d/projectParts/3ab0bd5f-a366-4653-bbd5-1367a632efc1/project_part_dxf.dxf",
+      "itemId": "3ab0bd5f-a366-4653-bbd5-1367a632efc1"
+    },
+    {
+      "url": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/335b193f-ad37-4738-bf8d-21c5a31c72e3/result.svg",
+      "count": 40,
+      "dxfUrl": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/90e641c5-83f9-496c-86c7-d97d78581b2d/projectParts/cc6fb569-2d37-44f9-9e6a-fdb4c6bf780c/project_part_dxf.dxf",
+      "itemId": "cc6fb569-2d37-44f9-9e6a-fdb4c6bf780c"
+    },
+    {
+      "url": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/c28ff63d-c2b6-485c-ae30-f157e6d2e572/result.svg",
+      "count": 80,
+      "dxfUrl": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/90e641c5-83f9-496c-86c7-d97d78581b2d/projectParts/68e34f18-9226-443f-ab54-181d015e5979/project_part_dxf.dxf",
+      "itemId": "68e34f18-9226-443f-ab54-181d015e5979"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "description": "prod row 178",
+  "csvRow": 178,
+  "binWidth": 1500.0,
+  "binHeight": 1500.0,
+  "spacing": 2.0,
+  "amountOfRotations": 4,
+  "items": [
+    {
+      "url": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/c3b362ca-5bfb-4d2c-afa7-0d5e285debb3/result.svg",
+      "count": 21,
+      "dxfUrl": null,
+      "itemId": "e2a214df-e86f-4818-a073-4c544c5f50ea"
+    }
+  ]
+}

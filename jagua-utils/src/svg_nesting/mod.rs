@@ -2,6 +2,7 @@
 
 mod classify;
 mod grid;
+mod lattice;
 mod mixed;
 mod offcut;
 mod pairing;

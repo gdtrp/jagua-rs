@@ -31,6 +31,43 @@ with fast deterministic packers. No per-bin "repeat stencil" concept exists in t
 29-different-sheets (img7), triangle 300×100 area=½bbox (img8/11, 66.7%), max/sheet bug (img10),
 indeterminate progress bar (img3).
 
+**SPACING / RENDER DECISIONS (2026-06-30, from prod-case review):**
+- `allowedRotations: []` = **any rotation** (contract: empty array = unconstrained, NOT 0°-lock).
+  Fixed in `strategy.rs::effective_allowed` (empty→treated as None); `resolve_rotation_range`/
+  `fit_orientations` use it. `[0]` (explicit) still = 0°-lock. Pairing/mixed routing & swap now use it.
+- Spacing model = **single 2mm kerf between every pair of adjacent parts** (one gap per cut, NOT
+  2mm-per-side and NOT abut/0). Grid pitch = bbox + spacing already gives this. **No border gap** —
+  parts sit flush to the sheet edge (user: "remove gaps from borders, not needed").
+- Pairing: the two paired triangles are **separate parts** → held a full 2mm apart on the shared
+  hypotenuse too (perpendicular push by spacing/2 each along the hypotenuse normal; pair-cell grown
+  by spacing*|normal| so neighbour kerf stays 2mm). Measured: all triangle gaps uniformly 2.0mm.
+- **Render overlay was the "looks doubled / 4mm" confusion:** `SvgDrawOptions::default()` drew the
+  inflated collision-shape outline + fail-fast surrogate poles (a 2nd dashed outline + green dots per
+  part), reading as phantom spacing. `render_one_page` now sets quadtree/surrogate/highlight_*/
+  draw_cd_shapes = false → only the real part outline. Actual gaps were always exactly 2mm.
+- Abut (0-gap shared cut) was tried then REVERTED: it undersizes parts by kerf/2; the 2mm gap is
+  required for exact-size parts.
+
+**PRODUCTION E2E HARNESS (2026-06-30):** `jagua-utils/tests/cutl160_prod.rs` is data-driven over
+`jagua-sqs-processor/tests/testdata/prod-tests/<case>/` (each: `data.json` =
+{binWidth,binHeight,spacing,amountOfRotations,items:[{itemId,count,allowedRotations,...}]} + one
+`<itemId>.svg` per item). SVGs come from the request's PRIVATE S3 url — fetch with
+`aws s3 cp s3://cutl-data-production/<key> ...` (anon curl 403s; aws creds present, acct 597312200625).
+Cases load at RUNTIME (no include_bytes → drop a new folder, no recompile). Outputs written to
+**`<case>/out/`** (user's chosen location, next to the data): `combined.svg`, `sheets/run*.svg`
+(one per run of identical sheets, self-describing names), `index.md` (run table), `summary.json`.
+User has 10 prod cases, drip-feeding; I download SVGs per case. **case-01** = QA "НПЭ 45": 3 rect
+frames 310²/265²/295×200, counts 2000/600/4000=6600, grain-locked `allowedRotations:[]` →
+**6600/6600 placed, 288 sheets (111+28+148 identical + 1 remainder), 83% util, ~170ms, deterministic**
+(was slow LBF / 178 mixed sheets). **BUG FOUND VIA PROD DATA + FIXED:** mixed router gated on
+`allowed_rotations.is_none()` so grain-locked parts (`[]`) wrongly fell to LBF; made `nest_mixed`
+grain-aware (per-part allow_swap via `fit_orientations`), gate now `parts.iter().all(single_part_allow_original)`.
+OPEN Q for backend: is `allowedRotations:[]` truly 0°-lock (current grain contract) or "use global
+rotations"? If the latter these frames could rotate 90° and pack denser.
+
+NOTE: repo remounted `/Volumes/USB`→`/Volumes/Projects` mid-session; memory lives in-repo at
+`.claude/memory/` (the `~/.claude/projects/<key>/memory` symlink to the old USB path is dead).
+
 **STATUS 2026-06-30: IMPLEMENTED on branch `chore/consume-cutl-schemas`** (plan approved via
 `/plan`, file `~/.claude/plans/floofy-hatching-pretzel.md`). All WS done, all tests green, `make check`
 clean. New jagua-utils modules: `render.rs` (shared deterministic-render infra: `prepare`,

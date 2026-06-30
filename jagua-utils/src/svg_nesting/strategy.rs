@@ -27,27 +27,36 @@ pub struct PartInput {
     pub allowed_rotations: Option<Vec<f32>>,
 }
 
+/// An **empty** `allowedRotations` (`[]`) means "any rotation" — i.e. unconstrained, the same as
+/// absent (`None`). Per the request contract, an empty array does NOT lock to 0°; only an explicit
+/// non-empty list constrains the part. Returns the effective constraint (`None` ⇒ unconstrained).
+pub(crate) fn effective_allowed(allowed_rotations: &Option<Vec<f32>>) -> Option<&Vec<f32>> {
+    match allowed_rotations {
+        Some(a) if !a.is_empty() => Some(a),
+        _ => None,
+    }
+}
+
 /// Resolve the rotation constraint for a single part.
 ///
-/// When `allowed_rotations` is set (grain-direction control), only those angles are
+/// When `allowed_rotations` is a non-empty list (grain-direction control), only those angles are
 /// permitted: the values are interpreted as **degrees** and converted into a
-/// [`RotationRange::Discrete`]. An empty list, or a single `0`, means "0° only",
-/// matching the core `ExtItem` import semantics. When `allowed_rotations` is `None`,
-/// the supplied `fallback` (derived from the global `amount_of_rotations`) is used,
-/// preserving today's behaviour.
+/// [`RotationRange::Discrete`]. A single `0` means "0° only". An **empty** list (`[]`) or `None`
+/// means unconstrained — the supplied `fallback` (derived from the global `amount_of_rotations`)
+/// is used.
 pub(crate) fn resolve_rotation_range(
     allowed_rotations: &Option<Vec<f32>>,
     fallback: &RotationRange,
 ) -> RotationRange {
-    match allowed_rotations {
+    match effective_allowed(allowed_rotations) {
+        None => fallback.clone(),
         Some(angles) => {
-            if angles.is_empty() || (angles.len() == 1 && angles[0] == 0.0) {
+            if angles.len() == 1 && angles[0] == 0.0 {
                 RotationRange::None
             } else {
                 RotationRange::Discrete(angles.iter().map(|deg| deg.to_radians()).collect())
             }
         }
-        None => fallback.clone(),
     }
 }
 
@@ -60,9 +69,9 @@ pub(crate) fn resolve_rotation_range(
 /// can't be judged by an axis-aligned bbox, so we stay permissive there and let the
 /// optimiser decide rather than wrongly rejecting the part up front.
 pub(crate) fn fit_orientations(allowed_rotations: &Option<Vec<f32>>) -> (bool, bool) {
-    let angles = match allowed_rotations {
+    // `None` or `[]` (empty ⇒ any rotation) → both orientations permitted.
+    let angles = match effective_allowed(allowed_rotations) {
         None => return (true, true),
-        Some(a) if a.is_empty() => return (true, false), // 0° only
         Some(a) => a,
     };
     let (mut allow_original, mut allow_swapped) = (false, false);

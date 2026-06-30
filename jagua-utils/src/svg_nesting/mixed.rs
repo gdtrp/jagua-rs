@@ -12,7 +12,7 @@
 
 use crate::svg_nesting::grid::grid_single_sheet;
 use crate::svg_nesting::render::{Placement, prepare, render_page_list};
-use crate::svg_nesting::strategy::PartInput;
+use crate::svg_nesting::strategy::{PartInput, fit_orientations};
 use crate::svg_nesting::svg_generation::NestingResult;
 use anyhow::Result;
 use jagua_rs::geometry::geo_enums::RotationRange;
@@ -34,13 +34,23 @@ pub(crate) fn nest_mixed(
     parts: &[PartInput],
     amount_of_rotations: usize,
 ) -> Result<NestingResult> {
-    let allow_swap = amount_of_rotations != 0;
-    let rot_range = if allow_swap {
-        RotationRange::Discrete(vec![0.0, FRAC_PI_2])
-    } else {
-        RotationRange::Discrete(vec![0.0])
-    };
-    let ranges = vec![rot_range; parts.len()];
+    // Per-part 90° permission: honour each part's grain constraint (`allowedRotations`), not just
+    // the global rotation count — production frames arrive grain-locked (`allowedRotations: []` ⇒
+    // 0° only) and must still grid-pack rather than fall back to LBF.
+    let allow_swaps: Vec<bool> = parts
+        .iter()
+        .map(|p| amount_of_rotations != 0 && fit_orientations(&p.allowed_rotations).1)
+        .collect();
+    let ranges: Vec<RotationRange> = allow_swaps
+        .iter()
+        .map(|&swap| {
+            if swap {
+                RotationRange::Discrete(vec![0.0, FRAC_PI_2])
+            } else {
+                RotationRange::Discrete(vec![0.0])
+            }
+        })
+        .collect();
     let (prepared, ctx) = prepare(parts, &ranges, bin_width, bin_height, 1)?;
 
     let total: usize = parts.iter().map(|p| p.count).sum();
@@ -49,7 +59,13 @@ pub(crate) fn nest_mixed(
 
     for (idx, (part, p)) in parts.iter().zip(prepared.iter()).enumerate() {
         let stencil = grid_single_sheet(
-            p.bbox_w, p.bbox_h, bin_width, bin_height, spacing, idx, allow_swap,
+            p.bbox_w,
+            p.bbox_h,
+            bin_width,
+            bin_height,
+            spacing,
+            idx,
+            allow_swaps[idx],
         );
         let cap = stencil.len();
         if cap == 0 {

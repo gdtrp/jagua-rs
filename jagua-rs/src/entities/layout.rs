@@ -82,7 +82,16 @@ impl Layout {
 
         self.cde.register_hazard(hazard);
 
-        debug_assert!(assertions::layout_qt_matches_fresh_qt(self));
+        // LOCAL PATCH (jagua-utils): `layout_qt_matches_fresh_qt` rebuilds a fresh quadtree from ALL
+        // placed items on every insert, so an unconditional debug_assert is O(n²) over a layout's
+        // lifetime — bulk periodic rendering (thousands of identical parts on one sheet) then takes
+        // minutes in debug/test builds. Gate it by size: the check still runs for the small layouts
+        // that correctness tests exercise (it is size-independent in practice), but is skipped once a
+        // layout grows into bulk-fill territory where it only adds quadratic overhead. Preserve across
+        // upstream syncs (see CLAUDE.md "over-eager debug_assert").
+        debug_assert!(
+            self.placed_items.len() > 32 || assertions::layout_qt_matches_fresh_qt(self)
+        );
 
         pk
     }
@@ -97,7 +106,10 @@ impl Layout {
         // update the collision detection engine
         self.cde.deregister_hazard_by_entity((pk, &pi).into());
 
-        debug_assert!(assertions::layout_qt_matches_fresh_qt(self));
+        // LOCAL PATCH (jagua-utils): size-gated to avoid O(n²) bulk-render cost — see place_item.
+        debug_assert!(
+            self.placed_items.len() > 32 || assertions::layout_qt_matches_fresh_qt(self)
+        );
 
         pi
     }
