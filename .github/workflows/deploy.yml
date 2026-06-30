@@ -27,7 +27,7 @@ env:
   # conditions (GitHub Actions does not expose `env.*` to job-level `if:`
   # expressions — only `needs.*.outputs.*` works there). The `on.push.branches`
   # trigger above matches `**` so renames here take effect with no other edits.
-  STAGING_BRANCH: api-first
+  STAGING_BRANCH: chore/consume-cutl-schemas
 
 jobs:
   # ---------------------------------------------------------------------------
