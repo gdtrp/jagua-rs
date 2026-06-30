@@ -444,6 +444,7 @@ impl AdaptiveNestingStrategy {
             unplaced_parts_svg: None,
             utilisation,
             pages,
+            sheets_total_estimate: None,
         })
     }
 }
@@ -1036,6 +1037,7 @@ impl AdaptiveNestingStrategy {
                             unplaced_parts_svg: None,
                             utilisation: 0.0,
                             pages: Vec::new(),
+                            sheets_total_estimate: None,
                         });
                     }
                 };
@@ -1278,6 +1280,7 @@ impl AdaptiveNestingStrategy {
                 unplaced_parts_svg: None,
                 utilisation: 0.0,
                 pages: Vec::new(),
+                sheets_total_estimate: None,
             }),
         }
     }

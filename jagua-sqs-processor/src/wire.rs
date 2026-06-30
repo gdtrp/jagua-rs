@@ -149,6 +149,7 @@ impl From<&SqsNestingResponse> for generated::NestingResponse {
             first_page_svg_url: r.first_page_svg_url.clone(),
             last_page_svg_url: r.last_page_svg_url.clone(),
             sheets: r.sheets.map(|v| v as i32),
+            sheets_total: r.sheets_total.map(|v| v as i32),
             page_svg_urls: r.page_svg_urls.clone().unwrap_or_default(),
             pages: r.pages.clone().unwrap_or_default(),
             parts_placed: r.parts_placed as i32,
@@ -168,6 +169,7 @@ impl From<generated::NestingResponse> for SqsNestingResponse {
             first_page_svg_url: g.first_page_svg_url,
             last_page_svg_url: g.last_page_svg_url,
             sheets: g.sheets.map(|v| v.max(0) as usize),
+            sheets_total: g.sheets_total.map(|v| v.max(0) as usize),
             page_svg_urls: if g.page_svg_urls.is_empty() {
                 None
             } else {

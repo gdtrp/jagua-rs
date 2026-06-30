@@ -5,3 +5,4 @@
 - [project_offcut_feature.md](project_offcut_feature.md) — CUTL offcuts (JG-OFF-1/2 done, 3 pending): free-space detection in jagua-utils + offcutPolicy request wiring
 - [project_grain_direction.md](project_grain_direction.md) — Grain direction control: per-part allowedRotations (int degrees) in nesting request, implemented in jagua-utils + sqs-processor
 - [project_asyncapi_codegen.md](project_asyncapi_codegen.md) — API-first: SQS wire types generated from AsyncAPI spec via typify in build.rs (vendored spec, make sync-spec, jagua-utils type reuse)
+- [project_cutl160_nesting_rfc.md](project_cutl160_nesting_rfc.md) — CUTL-160 nesting overhaul RFC (docs/rfcs/): classifier + grid/periodic/pairing fast paths, progress contract, max/sheet bug; user to supply SVGs for per-case tests

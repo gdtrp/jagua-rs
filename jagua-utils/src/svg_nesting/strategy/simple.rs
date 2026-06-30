@@ -451,6 +451,7 @@ impl NestingStrategy for SimpleNestingStrategy {
             unplaced_parts_svg,
             utilisation,
             pages,
+            sheets_total_estimate: None,
         };
 
         // Final layout — detect offcuts and draw them onto the SVGs (no-op without a policy).

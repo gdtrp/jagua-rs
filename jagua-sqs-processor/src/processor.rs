@@ -2,9 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_sqs::Client as SqsClient;
 use base64::{engine::general_purpose, Engine as _};
-use jagua_utils::svg_nesting::{
-    AdaptiveNestingStrategy, NestingResult, NestingStrategy, PageResult, PartInput,
-};
+use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, PageResult, PartInput};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -236,6 +234,9 @@ pub struct SqsNestingResponse {
     pub last_page_svg_url: Option<String>,
     /// Number of sheets/pages used
     pub sheets: Option<usize>,
+    /// Estimated total sheets the run will produce, when known up front (deterministic fast paths).
+    /// Absent for the general LBF path. Enables a determinate progress bar (CUTL-160 #1).
+    pub sheets_total: Option<usize>,
     /// S3 URLs to all page SVGs (ordered by page index)
     pub page_svg_urls: Option<Vec<String>>,
     /// Per-page results: utilisation and placements grouped by page
@@ -684,6 +685,7 @@ impl SqsProcessor {
                             first_page_svg_url: None,
                             last_page_svg_url: None,
                             sheets: None,
+                            sheets_total: None,
                             page_svg_urls: None,
                             pages: None,
                             parts_placed: 0,
@@ -776,6 +778,7 @@ impl SqsProcessor {
                 first_page_svg_url: None,
                 last_page_svg_url: None,
                 sheets: None,
+                sheets_total: None,
                 page_svg_urls: None,
                 pages: None,
                 parts_placed: 0,
@@ -804,6 +807,7 @@ impl SqsProcessor {
                 first_page_svg_url: None,
                 last_page_svg_url: None,
                 sheets: None,
+                sheets_total: None,
                 page_svg_urls: None,
                 pages: None,
                 parts_placed: 0,
@@ -836,6 +840,7 @@ impl SqsProcessor {
                     first_page_svg_url: None,
                     last_page_svg_url: None,
                     sheets: None,
+                    sheets_total: None,
                     page_svg_urls: None,
                     pages: None,
                     parts_placed: 0,
@@ -873,6 +878,7 @@ impl SqsProcessor {
                 first_page_svg_url: None,
                 last_page_svg_url: None,
                 sheets: None,
+                sheets_total: None,
                 page_svg_urls: None,
                 pages: None,
                 parts_placed: 0,
@@ -1108,6 +1114,7 @@ impl SqsProcessor {
                         first_page_svg_url,
                         last_page_svg_url,
                         sheets,
+                        sheets_total: result.sheets_total_estimate,
                         page_svg_urls: Some(page_svg_urls),
                         pages: Some(response_pages),
                         parts_placed: result.parts_placed,
@@ -1175,6 +1182,9 @@ impl SqsProcessor {
             let nest_start = Instant::now();
             let part_inputs_for_nest = part_inputs.clone();
             let amount_of_rotations = request.amount_of_rotations;
+            // The packer is chosen by jagua-rs from the incoming part shapes (the classifier),
+            // not by the caller — always AUTO.
+            let packing_mode = jagua_utils::PackingMode::Auto;
             let correlation_id_for_error = request.correlation_id.clone();
             let correlation_id_for_timeout = request.correlation_id.clone();
 
@@ -1185,22 +1195,25 @@ impl SqsProcessor {
                 info!("Inside spawn_blocking: calling strategy.nest() (max_fit={})", max_fit);
                 let nest_call_start = Instant::now();
                 let result = if max_fit {
-                    jagua_utils::svg_nesting::nest_max_fit_single_sheet(
+                    jagua_utils::nest_max_fit_auto(
                         &strategy,
                         bin_width,
                         bin_height,
                         spacing,
                         &part_inputs_for_nest[0],
                         amount_of_rotations,
+                        packing_mode,
                         improvement_callback,
                     )
                 } else {
-                    strategy.nest(
+                    jagua_utils::nest_auto(
+                        &strategy,
                         bin_width,
                         bin_height,
                         spacing,
                         &part_inputs_for_nest,
                         amount_of_rotations,
+                        packing_mode,
                         improvement_callback,
                     )
                 };
@@ -1346,6 +1359,7 @@ impl SqsProcessor {
                 first_page_svg_url,
                 last_page_svg_url,
                 sheets,
+                sheets_total: nesting_result.sheets_total_estimate,
                 page_svg_urls: Some(page_svg_urls),
                 pages: Some(response_pages),
                 parts_placed: nesting_result.parts_placed,

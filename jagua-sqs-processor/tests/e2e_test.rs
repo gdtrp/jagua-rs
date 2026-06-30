@@ -81,6 +81,7 @@ fn process_request_direct(
             first_page_svg_url: None, // Tests don't use S3
             last_page_svg_url: None,  // Tests don't use S3
             sheets: None,
+            sheets_total: None,
             page_svg_urls: None,
             pages: None,
             parts_placed: result.parts_placed,
@@ -137,6 +138,7 @@ fn process_request_direct(
         first_page_svg_url: None, // Tests don't use S3
         last_page_svg_url: None,  // Tests don't use S3
         sheets: None,
+        sheets_total: None,
         page_svg_urls: None,
         pages: Some(nesting_result.pages.clone()),
         parts_placed: nesting_result.parts_placed,
@@ -605,6 +607,7 @@ fn process_request_with_cancellation(
             first_page_svg_url: None, // Tests don't use S3
             last_page_svg_url: None,  // Tests don't use S3
             sheets: None,
+            sheets_total: None,
             page_svg_urls: None,
             pages: None,
             parts_placed: result.parts_placed,
@@ -636,6 +639,7 @@ fn process_request_with_cancellation(
         first_page_svg_url: None, // Tests don't use S3
         last_page_svg_url: None,  // Tests don't use S3
         sheets: None,
+        sheets_total: None,
         page_svg_urls: None,
         pages: None,
         parts_placed: nesting_result.parts_placed,
@@ -1269,6 +1273,7 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         first_page_svg_url: final_responses[0].first_page_svg_url.clone(),
                         last_page_svg_url: final_responses[0].last_page_svg_url.clone(),
                         sheets: final_responses[0].sheets,
+                        sheets_total: None,
                         page_svg_urls: final_responses[0].page_svg_urls.clone(),
                         pages: final_responses[0].pages.clone(),
                         parts_placed: final_responses[0].parts_placed,
@@ -1290,6 +1295,7 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         unplaced_parts_svg: None,
                         utilisation: final_responses[0].utilisation,
                         pages: vec![],
+                        sheets_total_estimate: None,
                     };
                     break (final_responses, nr.unwrap_or(dummy_result));
                 }
@@ -2145,6 +2151,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
             first_page_svg_url: None,
             last_page_svg_url: None,
             sheets: None,
+            sheets_total: None,
             page_svg_urls: None,
             pages: None,
             parts_placed: result.parts_placed,
@@ -2207,6 +2214,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
             first_page_svg_url: None,
             last_page_svg_url: None,
             sheets: None,
+            sheets_total: None,
             page_svg_urls: None,
             pages: None,
             parts_placed: 0,
@@ -2227,6 +2235,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
                 first_page_svg_url: None,
                 last_page_svg_url: None,
                 sheets: None,
+                sheets_total: None,
                 page_svg_urls: None,
                 pages: None,
                 parts_placed: result.parts_placed,
@@ -2511,6 +2520,7 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
         first_page_svg_url: page_svg_urls.first().cloned(),
         last_page_svg_url: page_svg_urls.last().cloned(),
         sheets: Some(response_pages.len()),
+        sheets_total: None,
         page_svg_urls: Some(page_svg_urls),
         pages: Some(response_pages),
         parts_placed: nesting_result.parts_placed,
@@ -2754,6 +2764,7 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
         first_page_svg_url: page_svg_urls.first().cloned(),
         last_page_svg_url: page_svg_urls.last().cloned(),
         sheets: Some(response_pages.len()),
+        sheets_total: None,
         page_svg_urls: Some(page_svg_urls),
         pages: Some(response_pages),
         parts_placed: nesting_result.parts_placed,
