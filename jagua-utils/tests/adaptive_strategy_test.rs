@@ -907,10 +907,8 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         use std::fs;
         use std::path::PathBuf;
 
-        let svg = include_bytes!(
-            "../../jagua-sqs-processor/tests/testdata/maxfit_repro.svg"
-        )
-        .to_vec();
+        let svg =
+            include_bytes!("../../jagua-sqs-processor/tests/testdata/maxfit_repro.svg").to_vec();
         let strategy = AdaptiveNestingStrategy::new();
         let part = PartInput {
             svg_bytes: svg,
@@ -919,8 +917,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
             allowed_rotations: None,
         };
 
-        let result =
-            nest_max_fit_single_sheet(&strategy, 1800.0, 1800.0, 20.0, &part, 4, None);
+        let result = nest_max_fit_single_sheet(&strategy, 1800.0, 1800.0, 20.0, &part, 4, None);
 
         assert!(
             result.is_ok(),
@@ -1115,7 +1112,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
     /// Returns true if `deg` is within 0.5° of `target` (modulo 360).
     fn approx_angle(deg: f32, target: f32) -> bool {
         let d = (deg - target).rem_euclid(360.0);
-        d < 0.5 || d > 359.5
+        !(0.5..=359.5).contains(&d)
     }
 
     /// Grain locked to a single orientation (`[0]`): every placement must be at 0°,

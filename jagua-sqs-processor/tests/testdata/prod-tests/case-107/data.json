@@ -1,0 +1,16 @@
+{
+  "description": "prod row 151",
+  "csvRow": 151,
+  "binWidth": 1500.0,
+  "binHeight": 600.0,
+  "spacing": 3.0,
+  "amountOfRotations": 4,
+  "items": [
+    {
+      "url": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/5dc4a05c-d641-4f83-be1e-e681a2dd8377/result.svg",
+      "count": 350,
+      "dxfUrl": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculations/5dc4a05c-d641-4f83-be1e-e681a2dd8377/lazer1.1_1.6_kontur-350%D1%88%D1%82-0_8%D0%BC%D0%BC%20copy.dxf",
+      "itemId": "bf1f1bd5-1cb7-4fa2-9b19-19dc5d22a409"
+    }
+  ]
+}

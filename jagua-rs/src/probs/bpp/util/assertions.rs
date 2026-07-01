@@ -2,6 +2,7 @@ use crate::entities::Item;
 use crate::probs::bpp::entities::{BPProblem, BPSolution, Bin};
 use crate::util::assertions::snapshot_matches_layout;
 
+#[must_use]
 pub fn problem_matches_solution(bpp: &BPProblem, sol: &BPSolution) -> bool {
     let BPSolution {
         layout_snapshots,
@@ -10,9 +11,10 @@ pub fn problem_matches_solution(bpp: &BPProblem, sol: &BPSolution) -> bool {
 
     let bpp_density = bpp.density();
     let sol_density = sol.density(&bpp.instance);
-    // Handle NaN case: both NaN is valid (e.g., when no items placed)
+    // Handle NaN case: both NaN is valid (e.g., when no items placed); otherwise compare with tolerance.
     assert!(
-        (bpp_density.is_nan() && sol_density.is_nan()) || bpp_density == sol_density,
+        (bpp_density.is_nan() && sol_density.is_nan())
+            || (bpp_density - sol_density).abs() <= f32::EPSILON,
         "density mismatch: bpp={}, sol={}",
         bpp_density,
         sol_density
@@ -29,6 +31,7 @@ pub fn problem_matches_solution(bpp: &BPProblem, sol: &BPSolution) -> bool {
     true
 }
 
+#[must_use]
 pub fn instance_item_bin_ids_correct(items: &[(Item, usize)], bins: &[Bin]) -> bool {
     items.iter().enumerate().all(|(i, (item, _))| item.id == i)
         && bins.iter().enumerate().all(|(i, bin)| bin.id == i)

@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working Constraints (read first)
+
+- **Only modify `jagua-utils/` and `jagua-sqs-processor/`.** `jagua-rs/` and `lbf/` are upstream library crates (synced from `JeroenGar/jagua-rs` via the `upstream` remote) — don't make standalone edits to them. To change packing quality or algorithm behavior, tune parameters, adjust strategies, or add pre/post-processing in the two wrapper crates. (A few load-bearing local patches do exist in the library — e.g. `lbf` cancellation/callback API, a disabled over-eager `debug_assert!`, a NaN-safe density assert, and **size-gated CDE consistency asserts** (search `LOCAL PATCH (jagua-utils)` in `jagua-rs/src`: `layout.rs`, `cd_engine.rs`, `qt_hazard_vec.rs`) — preserve them across upstream syncs.)
+  - The size-gated asserts skip a handful of O(n) internal-consistency `debug_assert!`s (`layout_qt_matches_fresh_qt`, `qt_contains_no_dangling_hazards`, `assert_caches_correct`, duplicate-entity scan) once a layout/CDE grows past 32 placed parts. Unconditionally they are O(n²) over a layout's lifetime, so bulk **periodic rendering** (thousands of identical parts on one sheet, the deterministic fast paths) takes minutes in test/debug builds; release strips them entirely. The invariants are size-independent, so 32 inserts still exercises them for jagua-rs's own tests.
+- **`jagua-sqs-processor` is edition 2021** (no let-chains — use nested `if let`). `jagua-rs`, `lbf`, and `jagua-utils` are edition 2024.
+
 ## Build & Test Commands
 
 ```bash
@@ -35,6 +41,18 @@ cargo clippy
 
 # Build docs locally
 cargo doc --open
+
+# Makefile targets (operate only on the crates we own: jagua-utils + jagua-sqs-processor)
+make fmt          # cargo fmt the two wrapper crates
+make check        # fmt-check + clippy (-D warnings, --no-deps)
+make lint         # clippy only
+make lint-fix     # clippy --fix
+make sync-spec    # Makefile copy of the spec from a local $CUTL_BACKEND checkout (default ../cutl-backend)
+make codegen      # sync-spec + touch the spec + cargo build (forces build.rs to re-run typify)
+make build        # docker build of jagua-sqs-processor (validates the container codegen path)
+
+# Current canonical spec source (preferred over `make sync-spec`): pull from the cutl-schemas repo
+scripts/sync-schema.sh   # gh api gdtrp/cutl-schemas .../jagua-rs.yaml -> jagua-sqs-processor/asyncapi/jagua-rs.yaml (needs gh auth)
 ```
 
 ## Architecture
@@ -48,7 +66,7 @@ jagua-sqs-processor → jagua-utils → lbf → jagua-rs
 - **`jagua-rs`** — Core collision detection engine library (published to crates.io, edition 2024). Feature-gated problem variants: `spp` (strip packing), `bpp` (bin packing), `mspp` (multi strip packing). No default features — downstream crates enable what they need.
 - **`lbf`** — Left-Bottom-Fill reference optimizer (edition 2024). Both a library (`rlib` + `cdylib` for WASM) and a CLI binary. Enables `spp` + `bpp` features on jagua-rs. Not for production use — solution quality is chaotic by nature.
 - **`jagua-utils`** — SVG nesting utilities wrapping lbf (edition 2024). Provides `NestingStrategy` trait with `SimpleNestingStrategy` and `AdaptiveNestingStrategy` implementations. Enables `bpp` feature on jagua-rs (via lbf).
-- **`jagua-sqs-processor`** — AWS SQS/S3 microservice (edition 2021, Tokio async) that receives nesting requests, runs AdaptiveNestingStrategy, uploads result SVGs to S3, and sends responses to output queue. Deployed via Docker to ECS. Deploy workflow in `.github/workflows/deploy.yml` (pushes to ECR, deploys to ECS in eu-north-1).
+- **`jagua-sqs-processor`** — AWS SQS/S3 microservice (edition 2021, Tokio async) that receives nesting requests, runs AdaptiveNestingStrategy, uploads result SVGs to S3, and sends responses to output queue. Deployed via Docker to ECS. Deploy workflow in `.github/workflows/deploy.yml` (pushes to ECR, deploys to ECS in eu-north-1). **API-first**: SQS wire types are code-generated from an AsyncAPI spec (see below), not hand-written.
 
 ### Core jagua-rs Architecture
 
@@ -69,6 +87,15 @@ jagua-sqs-processor → jagua-utils → lbf → jagua-rs
 ### SQS Processor Flow
 
 Request (`SqsNestingRequest`) arrives via SQS → SVG downloaded from S3 (or decoded from base64) → `AdaptiveNestingStrategy.nest()` runs in `spawn_blocking` → intermediate improvements sent to output queue → final result SVGs uploaded to S3 → response sent to output queue. Supports cancellation via `correlation_id` registry and cooperative timeout checking.
+
+### AsyncAPI Wire Codegen (jagua-sqs-processor)
+
+The SQS wire contract is **spec-governed**, not hand-written. The AsyncAPI spec (`jagua-sqs-processor/asyncapi/jagua-rs.yaml`) is the single source of truth, pulled from the `gdtrp/cutl-schemas` repo via `scripts/sync-schema.sh` (the file is **git-ignored** and must be synced before building the processor; CI does this automatically).
+
+- `jagua-sqs-processor/build.rs` reads that spec, lifts `components.schemas` into a draft-07 JSON Schema, and runs **typify** to emit `generated.rs` into `OUT_DIR` (included via `src/generated.rs`). typify pins `schemars 0.8` (not 1.x). It re-runs on spec change (`cargo:rerun-if-changed`).
+- `build.rs` uses typify `with_replacement` so generated types **reuse the jagua-utils serde types** (`OffcutPolicy`/`Offcut`, `NestingResponsePage`→`PageResult`, `NestingPlacement`→`PlacedPartInfo`) — keeping the wire byte-identical to the tested library serde.
+- `src/wire.rs` maps generated wire types ⇄ the ergonomic `SqsNestingRequest`/`SqsNestingResponse`/`SvgPartSpec` used in `processor.rs`, so `processor.rs` is untouched but the wire stays spec-governed.
+- **Dockerfile must `COPY build.rs` and `asyncapi/`** before the dep-build phase (they sit at the crate root, not under `src/`) — the dummy-source `cargo build` runs `build.rs` and needs the spec present, else the container build fails with `OUT_DIR not defined` / missing `NestingRequest`. A host `cargo build` hides this; always verify with `make build` (docker).
 
 ### Key Configuration
 

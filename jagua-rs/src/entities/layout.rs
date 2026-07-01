@@ -21,6 +21,7 @@ pub struct Layout {
 }
 
 impl Layout {
+    #[must_use]
     pub fn new(container: Container) -> Self {
         let cde = container.base_cde.as_ref().clone();
         Layout {
@@ -30,6 +31,7 @@ impl Layout {
         }
     }
 
+    #[must_use]
     pub fn from_snapshot(ls: &LayoutSnapshot) -> Self {
         let mut layout = Layout::new(ls.container.clone());
         layout.restore(ls);
@@ -49,6 +51,7 @@ impl Layout {
     }
 
     /// Saves the current state of the layout to be potentially restored to later.
+    #[must_use]
     pub fn save(&self) -> LayoutSnapshot {
         LayoutSnapshot {
             container: self.container.clone(),
@@ -61,11 +64,11 @@ impl Layout {
     pub fn restore(&mut self, layout_snapshot: &LayoutSnapshot) {
         assert_eq!(self.container.id, layout_snapshot.container.id);
 
-        self.placed_items = layout_snapshot.placed_items.clone();
+        self.placed_items.clone_from(&layout_snapshot.placed_items);
         self.cde.restore(&layout_snapshot.cde_snapshot);
 
         debug_assert!(assertions::layout_qt_matches_fresh_qt(self));
-        debug_assert!(assertions::snapshot_matches_layout(self, layout_snapshot))
+        debug_assert!(assertions::snapshot_matches_layout(self, layout_snapshot));
     }
 
     /// Places an item in the layout at a specific position by applying a transformation.
@@ -79,7 +82,16 @@ impl Layout {
 
         self.cde.register_hazard(hazard);
 
-        debug_assert!(assertions::layout_qt_matches_fresh_qt(self));
+        // LOCAL PATCH (jagua-utils): `layout_qt_matches_fresh_qt` rebuilds a fresh quadtree from ALL
+        // placed items on every insert, so an unconditional debug_assert is O(n²) over a layout's
+        // lifetime — bulk periodic rendering (thousands of identical parts on one sheet) then takes
+        // minutes in debug/test builds. Gate it by size: the check still runs for the small layouts
+        // that correctness tests exercise (it is size-independent in practice), but is skipped once a
+        // layout grows into bulk-fill territory where it only adds quadratic overhead. Preserve across
+        // upstream syncs (see CLAUDE.md "over-eager debug_assert").
+        debug_assert!(
+            self.placed_items.len() > 32 || assertions::layout_qt_matches_fresh_qt(self)
+        );
 
         pk
     }
@@ -94,12 +106,16 @@ impl Layout {
         // update the collision detection engine
         self.cde.deregister_hazard_by_entity((pk, &pi).into());
 
-        debug_assert!(assertions::layout_qt_matches_fresh_qt(self));
+        // LOCAL PATCH (jagua-utils): size-gated to avoid O(n²) bulk-render cost — see place_item.
+        debug_assert!(
+            self.placed_items.len() > 32 || assertions::layout_qt_matches_fresh_qt(self)
+        );
 
         pi
     }
 
     /// True if no items are placed
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.placed_items.is_empty()
     }
@@ -115,16 +131,18 @@ impl Layout {
         self.placed_items
             .iter()
             .map(|(_, pi)| instance.item(pi.item_id))
-            .map(|item| item.area())
+            .map(Item::area)
             .sum::<f32>()
     }
 
     /// Returns the collision detection engine for this layout
+    #[must_use]
     pub fn cde(&self) -> &CDEngine {
         &self.cde
     }
 
     /// Returns true if all the items are placed without colliding
+    #[must_use]
     pub fn is_feasible(&self) -> bool {
         self.placed_items.iter().all(|(pk, pi)| {
             let hkey = self
@@ -159,7 +177,7 @@ impl LayoutSnapshot {
         self.placed_items
             .iter()
             .map(|(_, pi)| instance.item(pi.item_id))
-            .map(|item| item.area())
+            .map(Item::area)
             .sum::<f32>()
     }
 }

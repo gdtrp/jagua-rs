@@ -23,12 +23,16 @@ impl QTHazardVec {
 
     pub fn add(&mut self, haz: QTHazard) {
         debug_assert!(!matches!(haz.presence, QTHazPresence::None));
+        // LOCAL PATCH (jagua-utils): O(h) scan per add ⇒ O(h²) where many parts pile into one node
+        // (bulk periodic rendering). Size-gate it; preserve across upstream syncs (see CLAUDE.md).
         debug_assert!(
-            self.hazards
-                .iter()
-                .filter(|other| other.entity == haz.entity || other.hkey == haz.hkey)
-                .count()
-                == 0,
+            self.hazards.len() > 32
+                || self
+                    .hazards
+                    .iter()
+                    .filter(|other| other.entity == haz.entity || other.hkey == haz.hkey)
+                    .count()
+                    == 0,
             "More than one hazard from same entity or key in the vector! (This should never happen!)"
         );
         match self
@@ -54,11 +58,12 @@ impl QTHazardVec {
         }
     }
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     /// Returns the strongest hazard (if any) (`Entire` > `Partial` > `None`)
     /// Ignores any hazards that are deemed irrelevant by the filter.
     pub fn strongest(&self, filter: &impl HazardFilter) -> Option<&QTHazard> {
-        debug_assert!(assert_caches_correct(self));
+        debug_assert!(self.hazards.len() > 32 || assert_caches_correct(self));
         self.iter().find(|hz| !filter.is_irrelevant(hz.hkey))
     }
 
@@ -81,7 +86,7 @@ impl QTHazardVec {
     }
 
     pub fn n_active_edges(&self) -> usize {
-        debug_assert!(assert_caches_correct(self));
+        debug_assert!(self.hazards.len() > 32 || assert_caches_correct(self));
         self.n_active_edges
     }
 }
@@ -111,7 +116,7 @@ fn assert_caches_correct(qthazard_vec: &QTHazardVec) -> bool {
         qthazard_vec
             .hazards
             .iter()
-            .map(|hz| hz.n_edges())
+            .map(QTHazard::n_edges)
             .sum::<usize>(),
         qthazard_vec.n_active_edges,
         "Active edges count is not correct!"

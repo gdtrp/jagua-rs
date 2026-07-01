@@ -1,11 +1,11 @@
 //! Simple single-run nesting strategy
 
 use crate::svg_nesting::{
-    parsing::{
-        calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path, reverse_winding,
-        sanitize_polygon,
-    },
     offcut::{OffcutPolicy, apply_offcuts},
+    parsing::{
+        build_inflatable_shape, calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path,
+        reverse_winding, sanitize_polygon,
+    },
     strategy::{NestingStrategy, PartInput, is_single_part_type},
     svg_generation::{
         NestingResult, PageResult, PlacedPartInfo, combine_svg_documents, post_process_svg_multi,
@@ -119,12 +119,12 @@ impl NestingStrategy for SimpleNestingStrategy {
             let centroid = polygon.centroid();
             let pre_transform = DTransformation::new(0.0, (-centroid.x(), -centroid.y()));
 
-            let item_shape = OriginalShape {
-                shape: polygon,
+            let item_shape = build_inflatable_shape(
+                polygon,
                 pre_transform,
-                modify_mode: ShapeModifyMode::Inflate,
-                modify_config: importer.shape_modify_config,
-            };
+                ShapeModifyMode::Inflate,
+                importer.shape_modify_config,
+            )?;
 
             parsed_parts.push(ParsedPart {
                 item_shape,
@@ -451,11 +451,19 @@ impl NestingStrategy for SimpleNestingStrategy {
             unplaced_parts_svg,
             utilisation,
             pages,
+            sheets_total_estimate: None,
         };
 
         // Final layout — detect offcuts and draw them onto the SVGs (no-op without a policy).
         if let Some(policy) = self.offcut_policy {
-            apply_offcuts(&mut result, &solution, &policy, bin_width, bin_height, spacing);
+            apply_offcuts(
+                &mut result,
+                &solution,
+                &policy,
+                bin_width,
+                bin_height,
+                spacing,
+            );
         }
 
         Ok(result)

@@ -70,6 +70,10 @@ pub struct NestingResult {
     pub utilisation: f32,
     /// Per-page results: utilisation and placements grouped by page.
     pub pages: Vec<PageResult>,
+    /// Total number of sheets the run expects to produce, when known up front (the deterministic
+    /// fast paths know this immediately, enabling a determinate progress bar — CUTL-160 #1). `None`
+    /// for the general LBF path, where the sheet count is only known once the run finishes.
+    pub sheets_total_estimate: Option<usize>,
 }
 
 /// Overlays detected offcuts onto a page SVG as a dashed green `<g id="offcuts">` group,

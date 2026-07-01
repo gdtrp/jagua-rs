@@ -1,0 +1,22 @@
+{
+  "description": "prod row 92",
+  "csvRow": 92,
+  "binWidth": 2000.0,
+  "binHeight": 1000.0,
+  "spacing": 2.0,
+  "amountOfRotations": 4,
+  "items": [
+    {
+      "url": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/b32af9ee-9f7a-48fa-a9e1-947f556c095c/result.svg",
+      "count": 1,
+      "dxfUrl": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/00dbd39c-9de8-4c61-ba5f-df043bd13fae/projectParts/0cf7f912-5753-4e0d-af77-7a87f74db33f/project_part_dxf.dxf",
+      "itemId": "0cf7f912-5753-4e0d-af77-7a87f74db33f"
+    },
+    {
+      "url": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/calculation/3cd23ceb-0ff0-4849-bd1a-98526be94f41/result.svg",
+      "count": 1,
+      "dxfUrl": "https://cutl-production-uploads.s3.eu-north-1.amazonaws.com/00dbd39c-9de8-4c61-ba5f-df043bd13fae/projectParts/150cb92f-1d68-4ab8-85c8-b64afe49a57e/project_part_dxf.dxf",
+      "itemId": "150cb92f-1d68-4ab8-85c8-b64afe49a57e"
+    }
+  ]
+}

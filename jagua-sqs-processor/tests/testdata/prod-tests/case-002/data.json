@@ -1,0 +1,17 @@
+{
+  "description": "prod row 2",
+  "csvRow": 2,
+  "binWidth": 1500.0,
+  "binHeight": 800.0,
+  "spacing": 2.0,
+  "amountOfRotations": 4,
+  "items": [
+    {
+      "url": "https://cutl-data-production.s3.eu-north-1.amazonaws.com/shared/public/calculation/d438897e-4e69-4c9e-b6eb-893f2191231c/result.svg",
+      "count": 150,
+      "dxfUrl": "https://cutl-data-production.s3.eu-north-1.amazonaws.com/3f3fe3c2-1929-4778-9bae-3cbdcb52f22f/private/project_part_dxf/48e8e317-feb5-4d8e-a373-3ec935f6e94a/project_part_dxf.dxf",
+      "itemId": "48e8e317-feb5-4d8e-a373-3ec935f6e94a",
+      "allowedRotations": []
+    }
+  ]
+}

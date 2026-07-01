@@ -59,6 +59,7 @@ fn final_response_wire_shape() {
         first_page_svg_url: Some("https://s3/first.svg".to_string()),
         last_page_svg_url: None,
         sheets: Some(1),
+        sheets_total: None,
         page_svg_urls: Some(vec!["https://s3/p0.svg".to_string()]),
         pages: Some(vec![PageResult {
             page_index: 0,
@@ -106,6 +107,38 @@ fn final_response_wire_shape() {
         "offcut must be tagged on kind: {json}"
     );
     assert!(json.contains(r#""width":500.0"#), "{json}");
+    // sheetsTotal absent ⇒ omitted from the wire (back-compatible).
+    assert!(
+        !json.contains("sheetsTotal"),
+        "absent estimate must be omitted: {json}"
+    );
+}
+
+/// CUTL-160 WS-6: when the deterministic packers report a sheet-count estimate, it serialises as
+/// `sheetsTotal` and round-trips back to `sheets_total` (enables the determinate progress bar).
+#[test]
+fn sheets_total_round_trips() {
+    let response = SqsNestingResponse {
+        correlation_id: "prog-1".to_string(),
+        first_page_svg_url: None,
+        last_page_svg_url: None,
+        sheets: Some(3),
+        sheets_total: Some(13),
+        page_svg_urls: None,
+        pages: None,
+        parts_placed: 36,
+        utilisation: 0.9,
+        is_improvement: true,
+        is_final: false,
+        timestamp: 1_700_000_000,
+        error_message: None,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains(r#""sheetsTotal":13"#), "{json}");
+
+    let back: SqsNestingResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.sheets_total, Some(13));
+    assert_eq!(back.sheets, Some(3));
 }
 
 /// An error response: the worker always emits correlationId/partsPlaced/utilisation/timestamp,
@@ -117,6 +150,7 @@ fn error_response_round_trips() {
         first_page_svg_url: None,
         last_page_svg_url: None,
         sheets: None,
+        sheets_total: None,
         page_svg_urls: None,
         pages: None,
         parts_placed: 0,
@@ -146,6 +180,7 @@ fn poly_offcut_round_trips_through_response() {
         first_page_svg_url: None,
         last_page_svg_url: None,
         sheets: Some(1),
+        sheets_total: None,
         page_svg_urls: None,
         pages: Some(vec![PageResult {
             page_index: 0,
