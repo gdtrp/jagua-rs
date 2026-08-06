@@ -27,6 +27,26 @@ base64 = "0.21"
 env_logger = "0.11"
 async-trait = "0.1"
 
+# ── Health/readiness endpoints and tracing (VK migration T7) ──
+# This binary had NO HTTP server at all. Kubernetes needs one: without probes a
+# wedged worker keeps its pod Ready forever and simply stops consuming, which is
+# exactly the failure the tws worker documents as a known gap. axum is the
+# smallest thing that serves two routes on the tokio runtime already here.
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
+
+# Tracing from scratch: only `log`/env_logger existed. tracing-subscriber's
+# default `tracing-log` feature bridges the existing log::info! calls into
+# tracing, so this is additive and no call site changes. Do NOT also depend on
+# tracing-log directly and call LogTracer::init() — that claims the global
+# logger and makes subscriber init panic.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client"] }
+opentelemetry-semantic-conventions = "0.27"
+
 [build-dependencies]
 # Wire types are generated at build time from the vendored AsyncAPI spec
 # (asyncapi/jagua-rs.yaml) by build.rs. typify needs schemars 0.8 (its pinned major).

@@ -28,6 +28,18 @@ env:
   # expressions — only `needs.*.outputs.*` works there). The `on.push.branches`
   # trigger above matches `**` so renames here take effect with no other edits.
   STAGING_BRANCH: chore/consume-cutl-schemas
+  # ─────────────── VK Cloud migration (T7) ───────────────
+  # Built once, pushed to BOTH registries for the length of the overlap.
+  #
+  # linux/amd64 ONLY, unlike the backend and frontend which went multi-arch.
+  # Not an oversight: CutlEnvironmentStack.java:1028 records that "Jagua
+  # processor stays on x86_64 due to build issues with ARM", so its ECS task is
+  # already x86_64, and VK worker nodes are amd64 too. Nothing here wants arm64.
+  VK_REGISTRY: registry.staging.cutl.online
+  VK_IMAGE: jagua-sqs-processor
+  # Pushing this branch builds and rolls the VK cluster without touching ECR or
+  # main, so the platform can be exercised before any of it merges.
+  VK_DEPLOY_BRANCH: vk-cloud
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -38,8 +50,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       staging_branch: ${{ env.STAGING_BRANCH }}
+      vk_deploy_branch: ${{ env.VK_DEPLOY_BRANCH }}
     steps:
-      - run: echo "staging branch = $STAGING_BRANCH"
+      - run: echo "staging branch = $STAGING_BRANCH, vk branch = $VK_DEPLOY_BRANCH"
 
   # ===========================================================================
   # STAGING — STAGING_BRANCH only. Builds the artifact and tags it :staging.
@@ -73,6 +86,12 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
       - id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+      - name: docker login to VK registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.VK_REGISTRY }}
+          username: ${{ secrets.VK_REGISTRY_USER }}
+          password: ${{ secrets.VK_REGISTRY_PASSWORD }}
       - name: Build, tag, and push jagua image (staging)
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -88,7 +107,158 @@ jobs:
             --cache-to=type=registry,ref=$ECR_REGISTRY/$ECR_REPOSITORY:buildcache-staging,mode=max,image-manifest=true,oci-mediatypes=true \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:staging \
+            -t $VK_REGISTRY/$VK_IMAGE:$IMAGE_TAG \
+            -t $VK_REGISTRY/$VK_IMAGE:staging \
             --push .
+
+  # ===========================================================================
+  # VK CLOUD build, feature branch only. Pushes to the VK registry and NOTHING
+  # else, so an unmerged branch can never affect an AWS deploy. On main /
+  # live-v* this stays skipped and build-prod's dual-push supplies the image.
+  # ===========================================================================
+  build-vk:
+    name: Build jagua image -> VK registry
+    needs: config
+    if: |
+      github.event_name == 'push'
+      && github.ref == format('refs/heads/{0}', needs.config.outputs.vk_deploy_branch)
+    concurrency:
+      group: jagua-vk-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # The AsyncAPI wire spec is sourced from cutl-schemas, not vendored;
+      # build.rs/typify reads it out of the build context.
+      - name: Sync AsyncAPI spec from cutl-schemas
+        env:
+          GH_TOKEN: ${{ secrets.CUTL_SCHEMAS_TOKEN }}
+        run: ./scripts/sync-schema.sh
+      - uses: docker/setup-buildx-action@v3
+      - name: docker login to VK registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.VK_REGISTRY }}
+          username: ${{ secrets.VK_REGISTRY_USER }}
+          password: ${{ secrets.VK_REGISTRY_PASSWORD }}
+      - name: Build, tag, and push jagua image (VK)
+        run: |
+          # Cache ref lives in the VK registry so the feature branch needs no
+          # ECR credentials at all.
+          docker buildx build --platform linux/amd64 \
+            -f jagua-sqs-processor/Dockerfile \
+            --cache-from=type=registry,ref=$VK_REGISTRY/$VK_IMAGE:buildcache-vk \
+            --cache-to=type=registry,ref=$VK_REGISTRY/$VK_IMAGE:buildcache-vk,mode=max,image-manifest=true,oci-mediatypes=true \
+            -t $VK_REGISTRY/$VK_IMAGE:$IMAGE_TAG \
+            -t $VK_REGISTRY/$VK_IMAGE:staging \
+            --push .
+
+  # ===========================================================================
+  # VK CLOUD deploy. Runs ALONGSIDE the ECS deploys, not instead of them.
+  # cutl-infra owns the cluster, registry and the cutl-env / registry-pull /
+  # kafka-jagua-nesting Secrets; this job needs only auth material.
+  # ===========================================================================
+  deploy-vk-staging:
+    name: Deploy jagua -> VK staging
+    needs: [config, build-vk, build-prod]
+    if: |
+      !failure() && !cancelled()
+      && github.event_name == 'push'
+      && (
+        github.ref == format('refs/heads/{0}', needs.config.outputs.vk_deploy_branch)
+        || github.ref == 'refs/heads/main'
+        || startsWith(github.ref, 'refs/tags/live-v')
+      )
+    concurrency:
+      group: jagua-vk-staging-deploy
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install kubectl
+        run: |
+          set -euo pipefail
+          curl -sSLo /tmp/kubectl https://dl.k8s.io/release/v1.34.2/bin/linux/amd64/kubectl
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+      - name: build kubeconfig from Keystone token
+        env:
+          VKCS_AUTH_URL:   ${{ secrets.VKCS_AUTH_URL }}
+          VKCS_USERNAME:   ${{ secrets.VKCS_USERNAME }}
+          VKCS_PASSWORD:   ${{ secrets.VKCS_PASSWORD }}
+          VKCS_PROJECT_ID: ${{ secrets.VKCS_PROJECT_ID }}
+          VK_K8S_ENDPOINT: ${{ secrets.VK_K8S_ENDPOINT }}
+          VK_K8S_CA:       ${{ secrets.VK_K8S_CA }}
+        run: |
+          set -euo pipefail
+          # A project-scoped VK Keystone token IS the Kubernetes API bearer token.
+          token=$(curl -sS -D - -o /dev/null -X POST "${VKCS_AUTH_URL%/}/auth/tokens" \
+            -H "Content-Type: application/json" \
+            -d "{\"auth\":{\"identity\":{\"methods\":[\"password\"],\"password\":{\"user\":{\"name\":\"${VKCS_USERNAME}\",\"domain\":{\"name\":\"users\"},\"password\":\"${VKCS_PASSWORD}\"}}},\"scope\":{\"project\":{\"id\":\"${VKCS_PROJECT_ID}\"}}}}" \
+            | grep -i '^x-subject-token:' | tr -d '\r' | awk '{print $2}')
+          if [ -z "$token" ]; then
+            echo "::error::Failed to obtain a Keystone token (check VKCS_* secrets)."
+            exit 1
+          fi
+          echo "::add-mask::$token"
+
+          mkdir -p "$HOME/.kube"
+          cat > "$HOME/.kube/config" <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: vk
+            cluster:
+              server: ${VK_K8S_ENDPOINT}
+              certificate-authority-data: ${VK_K8S_CA}
+          contexts:
+          - name: vk
+            context:
+              cluster: vk
+              user: vk
+              namespace: cutl
+          current-context: vk
+          users:
+          - name: vk
+            user:
+              token: ${token}
+          EOF
+          chmod 600 "$HOME/.kube/config"
+
+      - name: render + apply manifests
+        env:
+          IMAGE: ${{ env.VK_REGISTRY }}/${{ env.VK_IMAGE }}:${{ github.sha }}
+          DEPLOYMENT_ENV: staging
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          rendered=/tmp/jagua-manifests.yaml
+          : > "$rendered"
+          for f in deploy/k8s/deployment-staging.yaml deploy/k8s/service-staging.yaml; do
+            envsubst '${IMAGE} ${DEPLOYMENT_ENV} ${GIT_SHA}' < "$f" >> "$rendered"
+            echo '---' >> "$rendered"
+          done
+          kubectl apply --server-side --force-conflicts --dry-run=server -f "$rendered"
+          kubectl apply --server-side --force-conflicts -f "$rendered"
+
+      - name: wait for rollout
+        # Generous: terminationGracePeriodSeconds is 600, so a Recreate rollout
+        # waits for an in-flight nesting job to drain before the new pod starts.
+        run: kubectl -n cutl rollout status deployment/jagua --timeout=15m
+
+      - name: post-deploy snapshot
+        if: always()
+        run: |
+          set +e
+          echo "=== pods ==="
+          kubectl -n cutl get pods -o wide
+          echo "=== warnings ==="
+          kubectl -n cutl get events --field-selector type=Warning --sort-by=.lastTimestamp | tail -30
 
   deploy-staging:
     name: Deploy jagua → staging
@@ -164,6 +334,12 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
       - id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+      - name: docker login to VK registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.VK_REGISTRY }}
+          username: ${{ secrets.VK_REGISTRY_USER }}
+          password: ${{ secrets.VK_REGISTRY_PASSWORD }}
       - name: Build, tag, and push jagua image (production)
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -182,6 +358,8 @@ jobs:
             -t $ECR_REGISTRY/$ECR_REPOSITORY:production \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:staging \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -t $VK_REGISTRY/$VK_IMAGE:$IMAGE_TAG \
+            -t $VK_REGISTRY/$VK_IMAGE:production \
             --push .
 
   deploy-prod:

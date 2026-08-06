@@ -2,20 +2,40 @@ use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_sqs::Client as SqsClient;
+use jagua_sqs_processor::observability::{init_tracing, serve_health, Health};
 use jagua_sqs_processor::SqsProcessor;
 use log::info;
 use std::env;
 use tokio::signal;
 
+/// Must match what the Java services declare, since Grafana joins a trace to
+/// its logs on this exact string.
+const SERVICE_NAME: &str = "jagua-nesting";
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logger (same pattern as e2e tests)
-    // Uses Info level by default, but RUST_LOG env var can override for specific modules
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    // Replaces env_logger (VK migration T7). tracing-log bridges the existing
+    // log::info! call sites, so every line below still works unchanged and
+    // RUST_LOG keeps behaving the same way.
+    let tracer_provider = init_tracing(SERVICE_NAME)?;
 
     info!("Starting jagua-sqs-processor");
+
+    // The shutdown channel is created HERE rather than just before the
+    // processor loop, because the health server needs a receiver and must be
+    // bound before any of the slow startup work below. Binding early is what
+    // makes the probes meaningful: if AWS config or client construction hangs,
+    // /health still answers (the process is alive) while /ready keeps returning
+    // 503, so Kubernetes withholds traffic instead of restarting a pod that a
+    // restart would not fix.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+    let health = Health::new();
+    let health_port: u16 = env::var("HEALTH_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+    let health_server = serve_health(health_port, health.clone(), shutdown_tx.subscribe()).await?;
 
     // Get configuration from environment variables
     let input_queue_url =
@@ -97,9 +117,6 @@ async fn main() -> Result<()> {
         endpoint_url,
     );
 
-    // Create shutdown channel
-    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-
     // Spawn signal handler
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .context("Failed to register SIGTERM handler")?;
@@ -120,11 +137,32 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Everything the processor needs exists; accept traffic.
+    health.set_ready(true);
+
     // Start listening and processing
     let result = processor.listen_and_process(shutdown_rx).await;
 
+    // No longer serving: fail readiness before the pod actually goes away, so
+    // it is removed from any endpoint list while draining.
+    health.set_ready(false);
+
     // Give a moment for any final cleanup
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // Release the health server's graceful-shutdown future. Without this the
+    // task lives until the process exits and the await below never returns.
+    let _ = shutdown_tx.send(());
+    let _ = health_server.await;
+
+    // Flush buffered spans BEFORE returning. Dropping the provider without this
+    // discards whatever is still in the batch queue — which is exactly the
+    // spans from a crash, the ones actually worth having.
+    if let Some(provider) = tracer_provider {
+        if let Err(e) = provider.shutdown() {
+            log::warn!("Failed to flush traces on shutdown: {}", e);
+        }
+    }
 
     if let Err(e) = &result {
         log::warn!("Processor exited with error: {}", e);

@@ -1,4 +1,5 @@
 pub mod generated;
+pub mod observability;
 pub mod processor;
 mod wire;
 

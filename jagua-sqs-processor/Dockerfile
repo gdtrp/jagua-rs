@@ -1,5 +1,16 @@
 # Build stage
-FROM rustlang/rust:nightly-slim AS builder
+#
+# PINNED STABLE, not rustlang/rust:nightly-slim (VK migration T7). The old tag
+# was rolling AND nightly, so the build could break on any given day through no
+# change of ours. `cargo check` across the whole workspace — jagua-rs,
+# jagua-utils, lbf and this crate — passes on stable, so nothing here needs
+# nightly features.
+#
+# The floor is 1.91, not "any stable": the aws-smithy / aws-types crates in the
+# lockfile declare rust-version 1.91, and an older toolchain fails resolution
+# with "requires rustc 1.91" rather than a compile error. Verified by building
+# this image — 1.90 was rejected outright.
+FROM mirror.gcr.io/library/rust:1.97-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -61,7 +72,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /app/target/release/jagua-sqs-processor /app/jagua-sqs-processor-bin
 
 # Runtime stage
-FROM debian:unstable-slim
+#
+# bookworm-slim, NOT debian:unstable-slim. `unstable` is Debian sid: a rolling
+# tag whose contents change continuously, which meant production was tracking an
+# unreleased distribution and a rebuild could pull a different libssl on any
+# day. This is the one base-image change in T7 that fixes a real bug rather than
+# removing an AWS dependency.
+FROM mirror.gcr.io/library/debian:bookworm-slim
 
 WORKDIR /app
 
@@ -79,6 +96,9 @@ ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 ENV INPUT_QUEUE_URL=nesting-request
 ENV OUTPUT_QUEUE_URL=nesting-response
+# Kubernetes /health and /ready (VK migration T7). Overridable via HEALTH_PORT.
+ENV HEALTH_PORT=8080
+EXPOSE 8080
 
 # Run the application
 ENTRYPOINT ["/app/jagua-sqs-processor"]
