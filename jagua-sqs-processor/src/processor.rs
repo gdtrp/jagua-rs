@@ -1,9 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_sqs::Client as SqsClient;
 use base64::{engine::general_purpose, Engine as _};
 use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, PageResult, PartInput};
 use log::{debug, error, info, warn};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::message::{BorrowedMessage, Headers, Message};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::{Offset, TopicPartitionList};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -12,6 +15,10 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tracing::Instrument;
+
+use crate::kafka::{retry_headers, KafkaSettings, OffsetWatermark, RecordHeaders};
+use crate::metrics::metrics;
 
 /// Default maximum concurrent processing tasks
 const DEFAULT_MAX_CONCURRENT_TASKS: usize = 20;
@@ -142,7 +149,13 @@ where
     loop {
         attempts += 1;
         match operation().await {
-            Ok(result) => return Ok(result),
+            Ok(result) => {
+                metrics()
+                    .operation_retries
+                    .with_label_values(&[operation_name, "success"])
+                    .observe(attempts as f64);
+                return Ok(result);
+            }
             Err(e) if attempts < MAX_RETRY_ATTEMPTS => {
                 let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * 2u64.pow(attempts - 1));
                 warn!(
@@ -156,6 +169,15 @@ where
                     "{} failed after {} attempts: {}",
                     operation_name, attempts, e
                 );
+                // Every retried operation in this file funnels through here, so
+                // one instrumentation point covers all of them. This is the
+                // *intra-operation* budget running out (an S3 upload, a produce);
+                // the message-level retry ladder and its
+                // `cutl_retries_exhausted_total` counter sit one level above.
+                metrics()
+                    .operation_retries
+                    .with_label_values(&[operation_name, "exhausted"])
+                    .observe(attempts as f64);
                 return Err(e);
             }
         }
@@ -255,20 +277,29 @@ pub struct SqsNestingResponse {
     pub error_message: Option<String>,
 }
 
-/// SQS Processor for handling SVG nesting requests
+/// Processor for handling SVG nesting requests off Kafka.
+///
+/// Per the T9 directive in `cutl-infra/docs/rfc/001-vk-cloud-migration.md`, the SQS
+/// fields were swapped in place rather than hidden behind a transport trait: the
+/// receive loop's shape is itself load-bearing (see [`Self::listen_and_process`]),
+/// and an abstraction over it would obscure exactly the part that matters.
+///
+/// S3 is untouched by the port. It stays on AWS, reached through a relay in a
+/// region VK can actually see — the payload path is orthogonal to the queue.
 #[derive(Clone)]
-pub struct SqsProcessor {
-    sqs_client: SqsClient,
+pub struct NestingProcessor {
+    producer: FutureProducer,
     s3_client: S3Client,
     s3_bucket: String,
     aws_region: String,
-    input_queue_url: String,
-    output_queue_url: String,
+    /// Topic responses go to unless a request overrides it.
+    response_topic: String,
+    kafka: KafkaSettings,
     endpoint_url: Option<String>,
     cancellation_registry: Arc<Mutex<HashMap<String, CancellationEntry>>>,
 }
 
-impl SqsProcessor {
+impl NestingProcessor {
     /// Mark a correlation_id as cancelled. Returns true if it was already registered.
     fn mark_cancelled(&self, correlation_id: &str) -> bool {
         let mut registry = safe_lock(&self.cancellation_registry);
@@ -339,23 +370,22 @@ impl SqsProcessor {
         }
     }
 
-    /// Create a new SQS processor
+    /// Create a new processor.
     pub fn new(
-        sqs_client: SqsClient,
+        producer: FutureProducer,
         s3_client: S3Client,
         s3_bucket: String,
         aws_region: String,
-        input_queue_url: String,
-        output_queue_url: String,
+        kafka: KafkaSettings,
         endpoint_url: Option<String>,
     ) -> Self {
         Self {
-            sqs_client,
+            producer,
             s3_client,
             s3_bucket,
             aws_region,
-            input_queue_url,
-            output_queue_url,
+            response_topic: kafka.response_topic.clone(),
+            kafka,
             endpoint_url,
             cancellation_registry: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -420,7 +450,7 @@ impl SqsProcessor {
 }
 
 #[async_trait::async_trait]
-impl SvgDownloader for SqsProcessor {
+impl SvgDownloader for NestingProcessor {
     async fn download(&self, url: &str) -> Result<Vec<u8>> {
         self.download_svg_from_s3(url).await
     }
@@ -589,69 +619,92 @@ async fn upload_svg_to_s3_internal(
     Ok(s3_url)
 }
 
-impl SqsProcessor {
-    /// Send message to output queue
-    /// Helper function to send a message to SQS (used by both error and improvement responses)
-    async fn send_message_to_sqs(
-        sqs_client: &SqsClient,
-        queue_url: &str,
+/// Producer-side guard mirroring the broker's `message.max.bytes`.
+///
+/// The old constant was named for SQS's 1 MiB body limit; Kafka's default happens
+/// to be the same order, so the guard survives the port — but it is now a *broker*
+/// limit, and exceeding it fails the produce rather than the API call.
+const KAFKA_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+impl NestingProcessor {
+    /// Publish one response record.
+    ///
+    /// **Keyed by `correlationId`, always.** Keying is what gives a job's responses
+    /// a single partition and therefore real ordering, and on the request side it
+    /// is what makes cancellation work at all. An unkeyed produce here would round-
+    /// robin a job's improvement responses across partitions and let the consumer
+    /// observe them out of order.
+    async fn publish_response(
+        producer: &FutureProducer,
+        topic: &str,
         response: &SqsNestingResponse,
     ) -> Result<()> {
-        let message_body =
-            serde_json::to_string(response).context("Failed to serialize response")?;
+        let payload = serde_json::to_string(response).context("Failed to serialize response")?;
 
-        // Check message size (SQS limit is 1 MiB = 1,048,576 bytes)
-        let message_size_kb = message_body.len() / 1024;
-        const SQS_MAX_SIZE: usize = 1024 * 1024; // 1 MiB
-        if message_body.len() > SQS_MAX_SIZE {
+        let size_kb = payload.len() / 1024;
+        if payload.len() > KAFKA_MAX_MESSAGE_BYTES {
             return Err(anyhow!(
-                "Message size {} KB exceeds SQS limit of {} KB (1 MiB)",
-                message_size_kb,
-                SQS_MAX_SIZE / 1024
+                "Message size {} KB exceeds the broker's message.max.bytes of {} KB",
+                size_kb,
+                KAFKA_MAX_MESSAGE_BYTES / 1024
             ));
         }
 
         debug!(
-            "Sending message to output queue: correlation_id={}, is_final={}, size={} KB",
-            response.correlation_id, response.is_final, message_size_kb
+            "Producing to {}: correlation_id={}, is_final={}, size={} KB",
+            topic, response.correlation_id, response.is_final, size_kb
         );
 
-        sqs_client
-            .send_message()
-            .queue_url(queue_url)
-            .message_body(&message_body)
-            .send()
+        // Carry the current trace out with the response, so the backend's consumer
+        // links back to the job that produced it instead of opening a new trace.
+        let headers = crate::trace_context::inject_current(rdkafka::message::OwnedHeaders::new());
+
+        let record = FutureRecord::to(topic)
+            .key(&response.correlation_id)
+            .payload(&payload)
+            .headers(headers);
+
+        // `Duration::ZERO` is the *enqueue* timeout, not the delivery timeout: it
+        // means "fail immediately if the producer queue is full" rather than
+        // blocking the caller. Delivery itself is bounded by `message.timeout.ms`.
+        producer
+            .send(record, Duration::ZERO)
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to send message to queue {}: correlation_id={}, size={} KB",
-                    queue_url, response.correlation_id, message_size_kb
+            .map_err(|(e, _)| {
+                anyhow!(
+                    "Failed to produce to {}: correlation_id={}, size={} KB, error={}",
+                    topic,
+                    response.correlation_id,
+                    size_kb,
+                    e
                 )
             })?;
 
         Ok(())
     }
 
+    /// Publish a response with retries. Retains the original method name so the
+    /// ~8 call sites in this file are untouched by the transport swap.
     pub async fn send_to_output_queue(
         &self,
-        queue_url: &str,
+        topic: &str,
         response: &SqsNestingResponse,
     ) -> Result<()> {
-        let sqs_client = self.sqs_client.clone();
-        let queue_url_owned = queue_url.to_string();
+        let producer = self.producer.clone();
+        let topic_owned = topic.to_string();
         let response_clone = response.clone();
 
         retry_with_backoff("send_to_output_queue", || {
-            let client = sqs_client.clone();
-            let url = queue_url_owned.clone();
+            let producer = producer.clone();
+            let topic = topic_owned.clone();
             let resp = response_clone.clone();
-            async move { Self::send_message_to_sqs(&client, &url, &resp).await }
+            async move { Self::publish_response(&producer, &topic, &resp).await }
         })
         .await?;
 
         debug!(
             "Emitted response to {}: correlation_id={}, parts_placed={}, is_final={}",
-            queue_url, response.correlation_id, response.parts_placed, response.is_final
+            topic, response.correlation_id, response.parts_placed, response.is_final
         );
 
         Ok(())
@@ -678,7 +731,7 @@ impl SqsProcessor {
                             .get("outputQueueUrl")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string())
-                            .unwrap_or_else(|| self.output_queue_url.clone());
+                            .unwrap_or_else(|| self.response_topic.clone());
 
                         let error_response = SqsNestingResponse {
                             correlation_id: corr_id.to_string(),
@@ -763,7 +816,7 @@ impl SqsProcessor {
         let output_queue_url = request
             .output_queue_url
             .clone()
-            .unwrap_or_else(|| self.output_queue_url.clone());
+            .unwrap_or_else(|| self.response_topic.clone());
 
         // Validate required fields for non-cancellation requests
         let has_multi_parts = request.parts.as_ref().is_some_and(|p| !p.is_empty());
@@ -1018,7 +1071,7 @@ impl SqsProcessor {
 
             // Spawn async task to handle improvement messages
             info!("Spawning async task to handle improvement messages");
-            let sqs_client_for_task = self.sqs_client.clone();
+            let producer_for_task = self.producer.clone();
             let s3_client_for_task = self.s3_client.clone();
             // BE may override bucket / key-prefix per request; fall back to the
             // worker's defaults so legacy callers keep working unchanged.
@@ -1127,16 +1180,18 @@ impl SqsProcessor {
 
                     info!("Sending improvement response: {} parts placed", response.parts_placed);
 
-                    // Send to SQS with retry
-                    if let Err(e) = retry_with_backoff("send improvement to SQS", || {
-                        let client = sqs_client_for_task.clone();
-                        let url = output_queue_url_for_task.clone();
+                    // Produce with retry. A dropped improvement is not fatal — the
+                    // final response still carries the complete layout — so this
+                    // logs and continues rather than failing the job.
+                    if let Err(e) = retry_with_backoff("send improvement to Kafka", || {
+                        let producer = producer_for_task.clone();
+                        let topic = output_queue_url_for_task.clone();
                         let resp = response.clone();
-                        async move { Self::send_message_to_sqs(&client, &url, &resp).await }
+                        async move { Self::publish_response(&producer, &topic, &resp).await }
                     }).await {
-                        error!("Failed to send improvement to queue after retries: {}", e);
+                        error!("Failed to produce improvement after retries: {}", e);
                     } else {
-                        info!("Successfully sent improvement response to queue");
+                        info!("Successfully produced improvement response");
                     }
                 }
                 info!("Improvement task finished (channel closed)");
@@ -1390,28 +1445,55 @@ impl SqsProcessor {
         result
     }
 
-    /// Listen and process messages from the queue (concurrent processing)
-    /// Processes messages concurrently using tokio tasks with semaphore-based concurrency control.
-    /// The maximum number of concurrent tasks is configurable via MAX_CONCURRENT_TASKS env var (default: 20).
-    pub async fn listen_and_process(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
+    /// Consume the request topic and process records concurrently.
+    ///
+    /// **The shape of this loop is load-bearing.** Three things about it are
+    /// mandated by `cutl-infra/docs/kafka-contract.md` and each of them fails
+    /// silently rather than loudly if changed:
+    ///
+    /// - **Fetching never stops while jobs run.** The obvious throttle — pause the
+    ///   partition while busy — is wrong here. Requests are keyed by
+    ///   `correlationId`, so a cancellation lands on the *same partition* as the
+    ///   job it cancels, at a later offset. A paused partition means the cancel is
+    ///   only read once the job has already finished, turning cancellation into a
+    ///   no-op that nothing reports.
+    /// - **Cancellations are handled inline, before the semaphore.** Under SQS the
+    ///   permit was taken first and the cancel dealt with inside the handler; that
+    ///   was survivable because SQS long-polling kept delivering. Here a cancel
+    ///   queued behind twenty running jobs defeats the point of keying.
+    ///   Cancellation is a cheap registry write, so it happens on the poll thread.
+    /// - **Offsets advance through a contiguous watermark, not on completion.** A
+    ///   commit of offset 105 implicitly acknowledges 100..=104, so committing when
+    ///   a job finishes would acknowledge its still-running predecessors. With no
+    ///   DLQ, over-acknowledging is unrecoverable data loss.
+    pub async fn listen_and_process(
+        &self,
+        consumer: StreamConsumer,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> Result<()> {
         let max_concurrent = get_max_concurrent_tasks();
+        let topic = self.kafka.request_topic.clone();
+
+        consumer
+            .subscribe(&[topic.as_str()])
+            .with_context(|| format!("failed to subscribe to {topic}"))?;
+
         info!(
-            "Starting concurrent worker on queue: {} (max {} concurrent tasks)",
-            self.input_queue_url, max_concurrent
+            "Consuming topic {} as group {} (max {} concurrent tasks)",
+            topic, self.kafka.consumer_group, max_concurrent
         );
 
-        // Create semaphore to limit concurrent processing
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
 
-        // Track all spawned tasks for graceful shutdown
-        let mut active_tasks: JoinSet<(String, bool)> = JoinSet::new();
+        // Completion carries the topic-partition-offset so the watermark can be
+        // advanced on the loop thread, where the single mutable copy lives.
+        let mut active_tasks: JoinSet<CompletedRecord> = JoinSet::new();
+        let mut watermark = OffsetWatermark::new();
 
-        // Track last cleanup time for cancellation registry
         let mut last_cleanup = Instant::now();
-        let cleanup_interval = Duration::from_secs(60); // Cleanup every minute
+        let cleanup_interval = Duration::from_secs(60);
 
         loop {
-            // Periodic cleanup of expired cancellation registry entries
             if last_cleanup.elapsed() > cleanup_interval {
                 self.cleanup_expired_entries();
                 last_cleanup = Instant::now();
@@ -1419,151 +1501,416 @@ impl SqsProcessor {
 
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    info!("Received shutdown signal, waiting for {} active tasks to complete...", active_tasks.len());
+                    info!(
+                        "Received shutdown signal, waiting for {} active tasks to complete...",
+                        active_tasks.len()
+                    );
                     break;
                 }
-                // Handle completed tasks (non-blocking check)
-                Some(result) = active_tasks.join_next(), if !active_tasks.is_empty() => {
-                    match result {
-                        Ok((receipt_handle, success)) => {
-                            if success {
-                                debug!("Task completed successfully for receipt_handle: {}", receipt_handle);
-                            } else {
-                                warn!("Task completed with error for receipt_handle: {}", receipt_handle);
+
+                Some(joined) = active_tasks.join_next(), if !active_tasks.is_empty() => {
+                    match joined {
+                        Ok(done) => {
+                            metrics().inflight_jobs.dec();
+                            if !done.success {
+                                warn!(
+                                    "Handler failed for {}-{}-{}",
+                                    done.topic, done.partition, done.offset
+                                );
                             }
+                            self.advance_and_commit(&consumer, &mut watermark, &done);
                         }
                         Err(e) => {
-                            error!("Task panicked: {}", e);
+                            // A panicked task never reports its offset, so the
+                            // watermark stalls behind it and the record is
+                            // redelivered on the next rebalance. That is the safe
+                            // direction: reprocessing beats acknowledging work
+                            // that never happened.
+                            metrics().inflight_jobs.dec();
+                            error!("Task panicked, watermark will hold: {}", e);
                         }
                     }
                 }
-                result = self.sqs_client
-                    .receive_message()
-                    .queue_url(&self.input_queue_url)
-                    .max_number_of_messages(10)
-                    .wait_time_seconds(20)
-                    .send() => {
-                    let response = result.context("Failed to receive messages from queue")?;
 
-                    if let Some(messages) = response.messages {
-                        for message in messages {
-                            // Check for shutdown before spawning
-                            if shutdown_rx.try_recv().is_ok() {
-                                info!("Stopping before processing message due to shutdown");
-                                break;
+                received = consumer.recv() => {
+                    let borrowed = match received {
+                        Ok(m) => m,
+                        Err(e) => {
+                            // Do NOT propagate: `?` here would kill the loop and
+                            // the process on a transient broker hiccup, which is
+                            // exactly the crash-loop the T7 handoff warns about.
+                            error!("Kafka receive error: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let record = match OwnedRecord::from_borrowed(&borrowed) {
+                        Some(r) => r,
+                        None => {
+                            // Nothing to do but move past it: a record with no
+                            // payload can never be handled, and leaving it
+                            // uncommitted would block the partition forever.
+                            error!(
+                                "Record {}-{}-{} has no payload, skipping",
+                                borrowed.topic(), borrowed.partition(), borrowed.offset()
+                            );
+                            continue;
+                        }
+                    };
+
+                    metrics().messages_consumed.with_label_values(&[&record.topic]).inc();
+                    watermark.observe(&record.topic, record.partition, record.offset);
+
+                    // ── Cancellations short-circuit here, before the semaphore ──
+                    if let Some(correlation_id) = peek_cancellation(&record.payload) {
+                        let was_running = self.mark_cancelled(&correlation_id);
+                        info!(
+                            "Cancellation for correlation_id={} ({}), handled inline at {}-{}-{}",
+                            correlation_id,
+                            if was_running { "job running" } else { "not yet started" },
+                            record.topic, record.partition, record.offset
+                        );
+                        let done = CompletedRecord::ok(&record);
+                        self.advance_and_commit(&consumer, &mut watermark, &done);
+                        continue;
+                    }
+
+                    let processor = self.clone();
+                    let semaphore_clone = semaphore.clone();
+                    metrics().inflight_jobs.inc();
+
+                    // Continue the producer's trace rather than starting a new one.
+                    // The span is created here, on the poll thread, so the parent
+                    // link is established from the record's own headers before the
+                    // work moves to another task.
+                    let span = tracing::info_span!(
+                        "nesting.handle",
+                        messaging.system = "kafka",
+                        messaging.source.name = %record.topic,
+                        messaging.kafka.partition = record.partition,
+                        messaging.kafka.offset = record.offset,
+                    );
+                    {
+                        use tracing_opentelemetry::OpenTelemetrySpanExt;
+                        span.set_parent(record.parent_context());
+                    }
+
+                    active_tasks.spawn(async move {
+                        let _permit = match semaphore_clone.acquire().await {
+                            Ok(permit) => permit,
+                            Err(e) => {
+                                error!("Failed to acquire semaphore permit: {}", e);
+                                return CompletedRecord::failed(&record);
                             }
+                        };
 
-                            let receipt_handle = match message.receipt_handle() {
-                                Some(h) => h.to_string(),
-                                None => {
-                                    error!("Message missing receipt handle, skipping");
-                                    continue;
-                                }
-                            };
-                            let body = match message.body() {
-                                Some(b) => b.to_string(),
-                                None => {
-                                    error!("Message missing body, skipping");
-                                    continue;
-                                }
-                            };
-                            let message_id = message.message_id().map(|s| s.to_string());
+                        let result = processor
+                            .process_message(&record.key.clone().unwrap_or_default(), &record.payload)
+                            .await;
 
-                            if let Some(msg_id) = &message_id {
-                                info!("Received message {}, spawning processing task", msg_id);
-                            } else {
-                                info!("Received message, spawning processing task");
+                        match result {
+                            Ok(()) => CompletedRecord::ok(&record),
+                            Err(e) => {
+                                error!(
+                                    "Error handling {}-{}-{}: {}",
+                                    record.topic, record.partition, record.offset, e
+                                );
+                                metrics()
+                                    .messages_failed
+                                    .with_label_values(&[&record.topic])
+                                    .inc();
+                                processor.route_to_retry(&record).await;
+                                // The record is acknowledged either way. A failure
+                                // that stayed uncommitted would head-of-line-block
+                                // its partition for the whole attempt budget.
+                                CompletedRecord::failed(&record)
                             }
-
-                            // Clone necessary data for the spawned task
-                            let processor = self.clone();
-                            let semaphore_clone = semaphore.clone();
-                            let sqs_client_clone = self.sqs_client.clone();
-                            let input_queue_url_clone = self.input_queue_url.clone();
-                            let receipt_handle_clone = receipt_handle.clone();
-
-                            // Spawn concurrent task for processing
-                            // Message is deleted AFTER successful processing to prevent data loss
-                            active_tasks.spawn(async move {
-                                // Acquire semaphore permit (waits if max tasks are already running)
-                                let _permit = match semaphore_clone.acquire().await {
-                                    Ok(permit) => permit,
-                                    Err(e) => {
-                                        error!("Failed to acquire semaphore permit: {}", e);
-                                        return (receipt_handle_clone, false);
-                                    }
-                                };
-
-                                // Process the message
-                                let process_result = processor.process_message(&receipt_handle, &body).await;
-                                let success = process_result.is_ok();
-
-                                if let Err(e) = &process_result {
-                                    error!("Error during message processing: {}", e);
-                                }
-
-                                // Delete message from queue AFTER processing completes
-                                // This ensures messages are not lost if processing fails
-                                if let Err(e) = retry_with_backoff("delete_message", || {
-                                    let client = sqs_client_clone.clone();
-                                    let url = input_queue_url_clone.clone();
-                                    let handle = receipt_handle_clone.clone();
-                                    async move {
-                                        client
-                                            .delete_message()
-                                            .queue_url(&url)
-                                            .receipt_handle(&handle)
-                                            .send()
-                                            .await
-                                            .map_err(|e| anyhow!("SQS delete failed: {}", e))
-                                    }
-                                }).await {
-                                    error!("Failed to delete message after processing: {}", e);
-                                    // Message will become visible again after visibility timeout
-                                    // and may be reprocessed (at-least-once delivery)
-                                }
-
-                                (receipt_handle_clone, success)
-                            });
                         }
                     }
+                    // Instrument the whole task, so the response produced inside it
+                    // injects THIS span's context and the backend's consumer links
+                    // straight back to the job that produced it.
+                    .instrument(span));
                 }
             }
         }
 
-        // Graceful shutdown: wait for all active tasks to complete
+        // Graceful shutdown. `terminationGracePeriodSeconds: 600` in the Deployment
+        // exists for exactly this drain: a nesting run is minutes long, and the
+        // default 30s would SIGKILL one mid-flight on every rollout.
         info!(
             "Waiting for {} active tasks to complete...",
             active_tasks.len()
         );
-        while let Some(result) = active_tasks.join_next().await {
-            match result {
-                Ok((receipt_handle, success)) => {
-                    if success {
-                        info!(
-                            "Shutdown: task completed successfully for receipt_handle: {}",
-                            receipt_handle
-                        );
-                    } else {
-                        warn!(
-                            "Shutdown: task completed with error for receipt_handle: {}",
-                            receipt_handle
-                        );
-                    }
+        while let Some(joined) = active_tasks.join_next().await {
+            match joined {
+                Ok(done) => {
+                    metrics().inflight_jobs.dec();
+                    self.advance_and_commit(&consumer, &mut watermark, &done);
                 }
                 Err(e) => {
+                    metrics().inflight_jobs.dec();
                     error!("Shutdown: task panicked: {}", e);
                 }
             }
         }
 
+        // One last synchronous commit. The async commits above may still be in
+        // flight, and dropping the consumer without this loses the final offsets —
+        // which would replay a job that has already published its result.
+        if let Err(e) = consumer.commit_consumer_state(CommitMode::Sync) {
+            warn!("Final offset commit failed: {}", e);
+        }
+
         info!("Worker exiting gracefully, all tasks completed");
         Ok(())
+    }
+
+    /// Send a failed record to the next retry tier, or drop it and raise the alert.
+    ///
+    /// **Republish-and-commit, never retry in place.** Retrying by seeking back
+    /// head-of-line-blocks the partition on a poison message for the whole attempt
+    /// budget, and sleeping before a retry trips `max.poll.interval.ms` and gets
+    /// the consumer evicted mid-job.
+    ///
+    /// Tier delays are applied by the tier's own consumer, not here.
+    async fn route_to_retry(&self, record: &OwnedRecord) {
+        self.escalate(
+            &record.payload,
+            record.key.as_deref(),
+            &record.headers,
+            &record.topic,
+            record.partition,
+            record.offset,
+        )
+        .await
+    }
+
+    /// Escalate a failed message, from either the main loop or a retry tier.
+    ///
+    /// Takes the parts rather than an `OwnedRecord` so the tier consumers, which
+    /// never build one, can share the same ladder and the same exhaustion
+    /// reporting. Two code paths reporting loss differently would be worse than
+    /// one: the counter is the only record a message existed.
+    pub async fn escalate(
+        &self,
+        payload: &str,
+        key: Option<&str>,
+        headers: &RecordHeaders,
+        source_topic: &str,
+        partition: i32,
+        offset: i64,
+    ) {
+        let origin_topic = headers.origin_or(source_topic);
+        let attempt = headers.attempt;
+
+        if attempt >= self.kafka.attempt_budget {
+            // ── The end of the line. There is no DLQ: this message is now gone. ──
+            //
+            // The counter says a message was lost; this log is the only thing that
+            // says *which*. Both are required — cutl-infra's CutlRetriesExhausted
+            // alert fires on the counter and its description points the on-call at
+            // these fields.
+            error!(
+                "RETRIES EXHAUSTED after {} attempts, message DROPPED (no DLQ): \
+                 origin_topic={} key={} at {}-{}-{}",
+                attempt,
+                origin_topic,
+                key.unwrap_or("<none>"),
+                source_topic,
+                partition,
+                offset,
+            );
+            metrics().record_retries_exhausted(&origin_topic);
+            return;
+        }
+
+        let tier = attempt;
+        let tier_topic = self.kafka.retry_topic(tier);
+        let next_attempt = attempt + 1;
+
+        let key = key.unwrap_or_default().to_string();
+        // Trace context rides along with the retry headers, so all three ladder
+        // hops and the eventual drop stay in ONE trace. Without it each tier looks
+        // like an unrelated failure and the "why was this message lost" question
+        // needs manual correlation-id grepping across three topics.
+        let out_headers =
+            crate::trace_context::inject_current(retry_headers(next_attempt, &origin_topic));
+
+        let record_to_send = FutureRecord::to(&tier_topic)
+            .key(&key)
+            .payload(payload)
+            .headers(out_headers);
+
+        match self.producer.send(record_to_send, Duration::ZERO).await {
+            Ok(_) => {
+                metrics()
+                    .retry_republished
+                    .with_label_values(&[&tier.to_string()])
+                    .inc();
+                info!(
+                    "Republished to {} (attempt {} of {}): origin_topic={} key={}",
+                    tier_topic, next_attempt, self.kafka.attempt_budget, origin_topic, key
+                );
+            }
+            Err((e, _)) => {
+                // The ladder itself is broken, so this message is lost exactly as
+                // if it had exhausted its budget — and must be reported the same
+                // way, or the loss is silent.
+                error!(
+                    "Failed to republish to {}, message DROPPED (no DLQ): \
+                     origin_topic={} key={} at {}-{}-{}: {}",
+                    tier_topic, origin_topic, key, source_topic, partition, offset, e
+                );
+                metrics().record_retries_exhausted(&origin_topic);
+            }
+        }
+    }
+
+    /// Advance the watermark for a finished record and commit if the contiguous
+    /// prefix moved.
+    fn advance_and_commit(
+        &self,
+        consumer: &StreamConsumer,
+        watermark: &mut OffsetWatermark,
+        done: &CompletedRecord,
+    ) {
+        let Some(commit_at) = watermark.complete(&done.topic, done.partition, done.offset) else {
+            debug!(
+                "{}-{}-{} done but an earlier offset is still in flight; holding the commit",
+                done.topic, done.partition, done.offset
+            );
+            return;
+        };
+
+        let mut tpl = TopicPartitionList::new();
+        if let Err(e) =
+            tpl.add_partition_offset(&done.topic, done.partition, Offset::Offset(commit_at))
+        {
+            error!("Failed to build commit list for {}: {}", done.topic, e);
+            return;
+        }
+
+        // Async: a synchronous commit here would block the receive loop, and
+        // blocking the receive loop is what makes cancellation stop working.
+        if let Err(e) = consumer.commit(&tpl, CommitMode::Async) {
+            // Not fatal. The watermark keeps its position and the next commit
+            // carries this offset too; worst case a record is redelivered.
+            warn!("Commit of {}@{} failed: {}", done.topic, commit_at, e);
+            return;
+        }
+
+        metrics()
+            .committed_offset
+            .with_label_values(&[&done.topic, &done.partition.to_string()])
+            .set(commit_at);
+    }
+}
+
+/// A record lifted out of rdkafka's borrowed message so it can cross a task
+/// boundary. `BorrowedMessage` is tied to the consumer's buffer and cannot be sent
+/// to a spawned task.
+#[derive(Debug, Clone)]
+struct OwnedRecord {
+    topic: String,
+    partition: i32,
+    offset: i64,
+    key: Option<String>,
+    payload: String,
+    headers: RecordHeaders,
+    /// Every header as a string pair, kept so the W3C trace context can be
+    /// re-extracted inside the spawned task: `BorrowedMessage` is tied to the
+    /// consumer's buffer and cannot cross a task boundary.
+    raw_headers: Vec<(String, String)>,
+}
+
+impl OwnedRecord {
+    fn from_borrowed(msg: &BorrowedMessage<'_>) -> Option<Self> {
+        let payload = msg
+            .payload()
+            .map(|b| String::from_utf8_lossy(b).into_owned())?;
+
+        let mut raw_headers = Vec::new();
+        if let Some(headers) = msg.headers() {
+            for header in headers.iter() {
+                if let Some(value) = header.value {
+                    if let Ok(text) = std::str::from_utf8(value) {
+                        raw_headers.push((header.key.to_string(), text.to_string()));
+                    }
+                }
+            }
+        }
+
+        Some(Self {
+            topic: msg.topic().to_string(),
+            partition: msg.partition(),
+            offset: msg.offset(),
+            key: msg.key().map(|k| String::from_utf8_lossy(k).into_owned()),
+            payload,
+            headers: RecordHeaders::from_message(msg),
+            raw_headers,
+        })
+    }
+
+    /// The upstream trace context, when the producer sent one. An absent
+    /// `traceparent` yields an invalid context, which starts a new trace rather
+    /// than failing — a producer without tracing is not an error.
+    fn parent_context(&self) -> opentelemetry::Context {
+        crate::trace_context::extract_context(&crate::trace_context::HeaderExtractor::from_pairs(
+            self.raw_headers.clone(),
+        ))
+    }
+}
+
+/// Outcome of a handled record, carrying enough to advance the watermark.
+#[derive(Debug, Clone)]
+struct CompletedRecord {
+    topic: String,
+    partition: i32,
+    offset: i64,
+    success: bool,
+}
+
+impl CompletedRecord {
+    fn ok(r: &OwnedRecord) -> Self {
+        Self {
+            topic: r.topic.clone(),
+            partition: r.partition,
+            offset: r.offset,
+            success: true,
+        }
+    }
+
+    fn failed(r: &OwnedRecord) -> Self {
+        Self {
+            topic: r.topic.clone(),
+            partition: r.partition,
+            offset: r.offset,
+            success: false,
+        }
+    }
+}
+
+/// Cheaply detect a cancellation message without paying for full deserialization.
+///
+/// Returns the `correlationId` when `cancelled` is true. Cancellation messages
+/// arrive with every nesting field set to explicit `null`, so this deliberately
+/// parses to `serde_json::Value` rather than the strict DTO — a cancel must be
+/// honoured even if the rest of the message would not deserialize.
+fn peek_cancellation(payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if value.get("cancelled")?.as_bool()? {
+        value
+            .get("correlationId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    } else {
+        None
     }
 }
 
 #[cfg(test)]
-impl SqsProcessor {
+impl NestingProcessor {
     pub(crate) fn cancellation_registry_handle(
         &self,
     ) -> Arc<Mutex<HashMap<String, CancellationEntry>>> {
@@ -1575,8 +1922,38 @@ impl SqsProcessor {
 mod tests {
     use super::*;
     use aws_config::BehaviorVersion;
-    use aws_sdk_sqs::Client as SqsClient;
     use tokio::time::Duration;
+
+    /// Build a processor with no live dependencies.
+    ///
+    /// rdkafka connects lazily, so a producer aimed at an address nothing is
+    /// listening on constructs fine and is never used by the tests below — they
+    /// exercise the cancellation registry and the request DTOs, not the transport.
+    async fn test_processor() -> NestingProcessor {
+        let aws = aws_config::defaults(BehaviorVersion::latest()).load().await;
+        let kafka = KafkaSettings {
+            bootstrap_servers: "127.0.0.1:1".to_string(),
+            username: "test".to_string(),
+            password: "test".to_string(),
+            sasl_mechanism: "SCRAM-SHA-512".to_string(),
+            consumer_group: crate::kafka::DEFAULT_CONSUMER_GROUP.to_string(),
+            request_topic: crate::kafka::DEFAULT_REQUEST_TOPIC.to_string(),
+            response_topic: crate::kafka::DEFAULT_RESPONSE_TOPIC.to_string(),
+            attempt_budget: crate::kafka::DEFAULT_ATTEMPT_BUDGET,
+            retry_delays: crate::kafka::DEFAULT_RETRY_DELAYS_MS
+                .iter()
+                .map(|ms| Duration::from_millis(*ms))
+                .collect(),
+        };
+        NestingProcessor::new(
+            kafka.producer().expect("producer builds without a broker"),
+            aws_sdk_s3::Client::new(&aws),
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            kafka,
+            None,
+        )
+    }
 
     #[test]
     fn test_cancellation_registry_insert_and_get() {
@@ -1787,6 +2164,43 @@ mod tests {
         std::env::remove_var("EXECUTION_TIMEOUT_SECS");
     }
 
+    /// The poll loop detects cancellations with `peek_cancellation` rather than by
+    /// deserializing, so it must cope with the shape cancels actually arrive in:
+    /// every nesting field an explicit `null`. A strict parse would reject these
+    /// and the cancel would be treated as an ordinary job.
+    #[test]
+    fn peek_cancellation_reads_the_production_cancel_shape() {
+        let body = r#"{"correlationId":"9abdb358-35fd-4dbf-ba06-1ae9023a4512",
+            "binWidth":null,"binHeight":null,"spacing":null,
+            "amountOfRotations":null,"cancelled":true,"parts":null}"#;
+
+        assert_eq!(
+            peek_cancellation(body).as_deref(),
+            Some("9abdb358-35fd-4dbf-ba06-1ae9023a4512")
+        );
+    }
+
+    /// A normal request must not be mistaken for a cancel — that would silently
+    /// drop the job instead of running it.
+    #[test]
+    fn peek_cancellation_ignores_normal_and_malformed_requests() {
+        assert_eq!(
+            peek_cancellation(r#"{"correlationId":"c-1","cancelled":false}"#),
+            None
+        );
+        assert_eq!(
+            peek_cancellation(r#"{"correlationId":"c-1","binWidth":100}"#),
+            None,
+            "absent `cancelled` is not a cancellation"
+        );
+        assert_eq!(peek_cancellation("not json at all"), None);
+        assert_eq!(
+            peek_cancellation(r#"{"cancelled":true}"#),
+            None,
+            "a cancel with no correlationId identifies no job"
+        );
+    }
+
     #[test]
     fn test_sqs_nesting_request_cancelled_field_default() {
         let request_json = r#"{
@@ -1842,18 +2256,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_cancellation_flag_shared_between_workers() {
-        let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-        let sqs_client = SqsClient::new(&config);
-        let s3_client = aws_sdk_s3::Client::new(&config);
-        let processor = SqsProcessor::new(
-            sqs_client,
-            s3_client,
-            "test-bucket".to_string(),
-            "us-east-1".to_string(),
-            "test-input-queue".to_string(),
-            "test-output-queue".to_string(),
-            None,
-        );
+        let processor = test_processor().await;
 
         let correlation_id = "parallel-cancelled".to_string();
 
@@ -1918,18 +2321,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancellation_registry_cleanup() {
-        let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-        let sqs_client = SqsClient::new(&config);
-        let s3_client = aws_sdk_s3::Client::new(&config);
-        let processor = SqsProcessor::new(
-            sqs_client,
-            s3_client,
-            "test-bucket".to_string(),
-            "us-east-1".to_string(),
-            "test-input-queue".to_string(),
-            "test-output-queue".to_string(),
-            None,
-        );
+        let processor = test_processor().await;
 
         // Register a correlation_id
         processor.register_correlation_id("test-cleanup");

@@ -14,9 +14,33 @@ path = "src/main.rs"
 
 [dependencies]
 jagua-utils = { path = "../jagua-utils" }
-aws-sdk-sqs = "1.0"
 aws-sdk-s3 = "1.0"
 aws-config = "1.0"
+
+# ── Kafka transport (VK migration T9) ──
+# Replaces aws-sdk-sqs: `sqs.eu-north-1` is 0/6 reachable from a VK pod while
+# `cutl-kafka-bootstrap.kafka.svc:9092` is 6/6. rdkafka wraps librdkafka, which is
+# the only Rust client with real consumer groups, SCRAM auth and pause/resume —
+# rskafka has no group coordination and kafka-rust has no SASL.
+#
+# `cmake-build` builds the vendored librdkafka with CMake (the Dockerfile builder
+# stage installs cmake for exactly this). `ssl` is NOT optional even though the VK
+# listener is plaintext: librdkafka implements SCRAM's HMAC via OpenSSL, so without
+# it SCRAM-SHA-512 is compiled out and auth fails at runtime, not at build time.
+rdkafka = { version = "0.37", default-features = false, features = [
+    "cmake-build",
+    "tokio",
+    "ssl",
+    "sasl",
+    "libz",
+] }
+
+# Prometheus metrics. `cutl_retries_exhausted_total` is the ONLY signal a message
+# was lost (there is no DLQ by design) and cutl-infra already ships the alert, so
+# this is a correctness requirement rather than instrumentation.
+# default-features off drops the `protobuf`/push-gateway path; we only ever serve
+# the text exposition format over the axum router that already exists.
+prometheus = { version = "0.13", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1.0", features = ["full"] }
@@ -59,8 +83,10 @@ syn = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
-mockall = "0.12"
 regex = "1"
+# Integration tests drive the docker-compose harness (Kafka + MinIO) over HTTP for
+# the /metrics scrape assertions; the Kafka side uses rdkafka directly.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [lints.rust]
 warnings = "deny"

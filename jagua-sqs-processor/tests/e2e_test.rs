@@ -661,20 +661,32 @@ async fn test_cancellation_request_handling() -> Result<()> {
 
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::Client as S3Client;
-    use aws_sdk_sqs::Client as SqsClient;
-    use jagua_sqs_processor::SqsProcessor;
+    use jagua_sqs_processor::{KafkaSettings, NestingProcessor};
 
-    // Create a processor
+    // rdkafka connects lazily, so a producer pointed at a dead address constructs
+    // fine. This test only exercises the cancellation registry, never the wire.
     let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-    let sqs_client = SqsClient::new(&config);
-    let s3_client = S3Client::new(&config);
-    let processor = SqsProcessor::new(
-        sqs_client,
-        s3_client,
+    let kafka = KafkaSettings {
+        bootstrap_servers: "127.0.0.1:1".to_string(),
+        username: "test".to_string(),
+        password: "test".to_string(),
+        sasl_mechanism: "SCRAM-SHA-512".to_string(),
+        consumer_group: "jagua-nesting".to_string(),
+        request_topic: "nesting-request".to_string(),
+        response_topic: "nesting-response".to_string(),
+        attempt_budget: 3,
+        retry_delays: vec![
+            std::time::Duration::from_millis(5_000),
+            std::time::Duration::from_millis(60_000),
+            std::time::Duration::from_millis(600_000),
+        ],
+    };
+    let processor = NestingProcessor::new(
+        kafka.producer().expect("producer builds without a broker"),
+        S3Client::new(&config),
         "test-bucket".to_string(),
         "us-east-1".to_string(),
-        "test-input-queue".to_string(),
-        "test-output-queue".to_string(),
+        kafka,
         None,
     );
 

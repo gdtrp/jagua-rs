@@ -1,6 +1,9 @@
-.PHONY: build fmt fmt-check lint lint-fix check sync-spec codegen
+.PHONY: build fmt fmt-check lint lint-fix check sync-spec codegen \
+        test test-integration compose-up compose-down
 
 LINT_CRATES := -p jagua-utils -p jagua-sqs-processor
+
+COMPOSE := docker compose -f jagua-sqs-processor/docker-compose.yml
 
 # Path to the cutl-backend checkout that owns the AsyncAPI contracts (override if elsewhere).
 CUTL_BACKEND ?= ../cutl-backend
@@ -40,3 +43,27 @@ lint-fix:
 
 # Run all checks (format + lint).
 check: fmt-check lint
+
+# ── Tests ──
+# `test` is the broker-free suite: unit tests, the wire contract goldens and the
+# in-process nesting e2e tests. Safe to run anywhere, no Docker needed.
+test:
+	cargo test $(LINT_CRATES)
+
+# Brings up Kafka (SASL_PLAINTEXT + SCRAM-SHA-512) and MinIO, waits for both to be
+# healthy, then provisions the SCRAM user and the five topics. Idempotent.
+#
+# The broker advertises its SASL listener as localhost:9092 because the tests run
+# on the host via `cargo test`, not inside the compose network.
+compose-up:
+	$(COMPOSE) up -d --wait kafka minio
+	$(COMPOSE) up kafka-init minio-init
+
+compose-down:
+	$(COMPOSE) down -v
+
+# The broker-backed tests are #[ignore]d so a plain `cargo test` on a machine with
+# no Docker still passes rather than failing for the wrong reason. This target is
+# the only thing that runs them.
+test-integration: compose-up
+	cargo test $(LINT_CRATES) -- --ignored --test-threads=1

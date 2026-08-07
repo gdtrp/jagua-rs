@@ -9,7 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::{extract::State, http::StatusCode, routing::get, Router};
+use axum::{
+    extract::State,
+    http::{header, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 // with_endpoint lives on this trait, not on the builder itself.
@@ -57,7 +63,32 @@ async fn ready(State(health): State<Health>) -> StatusCode {
     }
 }
 
-/// Serves `/health` and `/ready` until `shutdown` resolves.
+/// Prometheus scrape endpoint.
+///
+/// Served on the same port as the probes (8080, `HEALTH_PORT`) because the
+/// ServiceMonitor in `deploy/k8s/service-staging.yaml` targets port name `http`
+/// path `/metrics`. Unlike the Java services there is no separate management
+/// port, and none is needed: jagua's Service is headless and not referenced by
+/// any Ingress, so nothing here is publicly routable.
+async fn metrics_handler() -> impl IntoResponse {
+    match crate::metrics::metrics().encode() {
+        Ok(body) => (
+            StatusCode::OK,
+            // Prometheus requires this exact content type for the text exposition
+            // format; without the `version` parameter some scrapers fall back to
+            // guessing and silently drop the payload.
+            [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+            body,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("failed to encode metrics: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "metrics encoding failed").into_response()
+        }
+    }
+}
+
+/// Serves `/health`, `/ready` and `/metrics` until `shutdown` resolves.
 ///
 /// Returns as soon as the listener is bound and the server is spawned, so
 /// startup order is not a race: the endpoints answer before the processor
@@ -70,6 +101,7 @@ pub async fn serve_health(
     let app = Router::new()
         .route("/health", get(health_handler_marker))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics_handler))
         .with_state(health);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
@@ -112,6 +144,16 @@ pub fn init_tracing(service_name: &str) -> Result<Option<TracerProvider>> {
     //
     // Found by running the built image; it compiles cleanly either way.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    // Register the W3C trace-context propagator globally. Without this,
+    // `inject_context` / `extract_context` in `crate::trace_context` are silent
+    // no-ops — headers are written empty and incoming `traceparent` is ignored —
+    // and every nesting job starts an unlinked trace. It fails by producing
+    // plausible-looking traces that simply do not join up, so it is worth setting
+    // even when no exporter is configured.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
 
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
 

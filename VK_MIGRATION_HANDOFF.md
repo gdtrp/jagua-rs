@@ -1,16 +1,20 @@
 # jagua-rs: VK migration handoff
 
-Branch `vk-cloud`. Written 2026-08-07.
+Branch `vk-cloud`. Written 2026-08-07, updated after T9.
 
 ## State
 
-**Scaled to 0 on the VK staging cluster.** It cannot start: `main.rs` requires
-`S3_BUCKET`, `INPUT_QUEUE_URL` and `OUTPUT_QUEUE_URL`, and exits when one is
-missing. It was crash-looping and holding a CPU reservation on a saturated
-cluster, so it was scaled down rather than left to restart forever.
+**T9 is implemented: the worker consumes Kafka, not SQS.** `aws-sdk-sqs` and both
+`*_QUEUE_URL` variables are gone. See "Done in T9" below for what changed and
+"Left to do" for what is still open.
 
-Supplying those variables would not fix it. The worker is an SQS consumer
-against `eu-north-1`, which this cluster cannot reach at all.
+The workload is still **scaled to 0** on the VK staging cluster and needs scaling
+back up to be verified — nothing here has run against the real cluster yet.
+
+Missing configuration no longer kills the process. It logs the problem and holds
+`/ready` at 503, so a misconfigured pod withholds traffic instead of crash-looping
+against a CPU reservation on a saturated cluster — which is what forced the scale
+to 0 in the first place.
 
 ## Egress: blocked per AWS REGION, not AWS-wide
 
@@ -53,33 +57,91 @@ attempts on the same hosts returned 0/8.
 - `deploy/k8s/` manifests: internal worker, no Ingress, headless Service,
   `terminationGracePeriodSeconds: 600` and `strategy: Recreate`.
 
+## Done in T9
+
+Read **`cutl-infra/docs/kafka-contract.md`** before touching any of this. It is
+the binding contract, and three of its rules exist because the obvious
+implementation is wrong in a way that fails silently:
+
+- **The receive loop never pauses a partition while a job runs.** Both topics are
+  keyed by `correlationId`, so a cancel lands on the same partition as the job it
+  cancels, at a later offset. Pausing to throttle would mean the cancel is only
+  read after the job finishes — cancellation becomes a no-op that nothing reports.
+- **Offsets advance through a contiguous watermark** (`OffsetWatermark` in
+  `src/kafka.rs`), because a commit of 105 implicitly acknowledges 100..=104 and
+  jobs finish out of order behind the semaphore.
+- **Cancellations are handled inline on the poll thread**, before the semaphore,
+  so they are never queued behind the twenty jobs they are meant to stop.
+
+Also:
+
+- **Retry ladder** to `jagua-nesting-retry-{1,2,3}` with the `x-cutl-attempt` /
+  `x-cutl-origin-topic` headers, plus a consumer per tier
+  (`src/retry_consumer.rs`) that applies its delay by **pausing the partition and
+  rewinding**, never by sleeping. Sleeping in a handler stops the consumer polling
+  and gets it evicted mid-job; a 10-minute tier-3 delay against a 15-minute poll
+  interval leaves no margin.
+- **`cutl_retries_exhausted_total{group, origin_topic}`** and a `/metrics`
+  endpoint on the existing axum router — the ServiceMonitor has pointed at it
+  since T7 with nothing serving it. The counter is **pre-registered at zero** at
+  startup: a labelled counter has no series until its child exists, and
+  `increase(...[5m]) > 0` cannot fire on a series that was never reported. That is
+  how `cutl_log_errors_total` came to report healthy forever.
+- **W3C trace context over Kafka headers** (`src/trace_context.rs`):
+  `traceparent`/`tracestate` are extracted from every consumed record and set as
+  the handler span's parent, and injected into every produced record — responses
+  and retry republishes alike. A job therefore continues the trace of whatever
+  published the request, and all three ladder hops stay in one trace.
+  The global propagator is registered in `init_tracing`; **without that
+  registration inject/extract are silent no-ops** and traces simply never join up.
+  Note the RFC describes the existing envelope carrying a hand-rolled
+  `traceparent` *inside the JSON body* — this uses headers instead, so the payload
+  stays governed by the AsyncAPI schema alone.
+- Readiness gated on a real broker metadata fetch, so a pod with bad credentials
+  no longer reports Ready and then silently consumes nothing.
+- `S3_BUCKET` set on the Deployment.
+- A **docker-compose harness** running Kafka with SASL_PLAINTEXT + SCRAM-SHA-512,
+  matching the VK listener, plus MinIO for S3.
+- **The first CI workflow that runs tests at all** (`.github/workflows/ci.yml`) —
+  previously nothing gated a merge on any branch.
+- `scripts/cargo-docker.sh`, because there may be no local Rust toolchain and
+  rdkafka needs `cmake`, `g++`, `libsasl2-dev`, `zlib1g-dev` and
+  `libcurl4-openssl-dev` that `rust:slim-bookworm` does not ship.
+
 ## Left to do
 
-### 1. Port SQS to Kafka
-Consumer group is **`jagua-nesting`**; its SCRAM credentials are already mounted
-as the `kafka-jagua-nesting` Secret by cutl-infra's `modules-vk/kafka-credentials`,
-so connectivity can be proven before the code depends on it. Mounting only its
-own group is deliberate — jagua cannot read another worker's topics.
+### 1. Verify on the cluster
+Nothing below has run against real VK infrastructure. Scale the Deployment up
+from 0 and work through the Verification list at the bottom.
 
-**Topics carry no environment suffix.** Each environment has its own cluster, so
-topics are namespaced by the cluster rather than the name: `nesting-request`,
-`nesting-response`. Drop `INPUT_QUEUE_URL` / `OUTPUT_QUEUE_URL` entirely.
+### 2. cutl-backend still publishes to SQS (T8)
+It is still `@SqsListener` with `SqsTemplate.send(queue, payload)` and **no
+message key**. An end-to-end round trip in staging needs T8 first; jagua's own
+side can be proven by hand-producing to `nesting-request` with the key set to the
+`correlationId`. Producing without a key breaks cancellation.
 
-### 2. Emit `cutl_retries_exhausted_total`
-There is **no dead-letter queue by design**, so this counter is the only signal
-a message was lost. cutl-infra already ships the alert; nothing produces the
-metric.
+### 3. The eu-west-1 S3 relay
+`S3_BUCKET` is set to `cutl-staging-uploads`, but `s3.eu-north-1` is still 0/6
+from a pod. The relay is set via `AWS_ENDPOINT_URL` — the code path already
+exists and is exercised by MinIO in the test harness. Until then S3 calls fail
+into the retry ladder and raise `CutlRetriesExhausted`, which is visible rather
+than silent, but it is not working.
 
-Related: `deploy/k8s/service-staging.yaml` has a ServiceMonitor scraping
-`/metrics`, **which this binary does not serve yet**. The target shows as down
-in Prometheus, which is honest and visible, rather than the reverse failure
-where an endpoint is served and scraped by nobody. Adding a metrics endpoint
-closes both at once.
+### 4. Which failures should climb the ladder
+Right now **any** `Err` from the handler escalates. In practice `process_message`
+returns `Ok(())` for almost everything — validation failures become an error
+*response* on `nesting-response` rather than an error — so the ladder mostly sees
+genuine infrastructure faults, which is the intent.
 
-### 3. Decide what `S3_BUCKET` points at
-S3 stays on AWS for now, so the value is the AWS bucket
-(`cutl-staging-uploads`) reached through the relay. Until the relay exists, no
-value works — `eu-north-1` is 0/6.
+Two things are worth tightening once the relay exists and real failures are
+observable:
+
+- `download_svg_from_s3` (`processor.rs`) is **not** wrapped in
+  `retry_with_backoff`, unlike all four upload sites. With the relay adding a
+  network hop it should be.
+- A malformed message that can never parse still consumes all three attempts
+  before being dropped. Harmless, but it spends ~11 minutes of ladder to reach a
+  conclusion available immediately.
 
 ## Traps
 
@@ -94,6 +156,37 @@ value works — `eu-north-1` is 0/6.
     `tracing-subscriber`'s default `tracing-log` feature already installs the
     bridge. Do not add a direct `tracing-log` dependency back.
   - Verify by building the image and running it, not by `cargo check`.
+- **T9 added four more of the same kind.** rdkafka compiles librdkafka from C
+  source, and each missing piece failed at `cargo build`, never at `cargo check`:
+  - `rust:slim-bookworm` has `cc` but **no `c++`**. librdkafka's top-level
+    CMakeLists declares a CXX project, so cmake aborts before compiling anything.
+    Needs `g++`.
+  - It also needs `libcurl4-openssl-dev` **despite** rdkafka-sys passing
+    `-DWITH_CURL=0`: the `ssl` feature enables SASL OAUTHBEARER (SCRAM and
+    OAUTHBEARER share the OpenSSL dependency) and `rdkafka_conf.c` includes
+    `<curl/curl.h>` on that path. We never use OAUTHBEARER.
+  - **`max.poll.records` is a Java-consumer property.** librdkafka rejects it at
+    client creation with "No such configuration property", so the contract's
+    `max.poll.records=1` is satisfied structurally instead — `recv()` yields one
+    message per call. `max.poll.interval.ms` *is* valid; only the records one is not.
+  - `fetch_metadata` lives on the `Consumer` trait, not on `StreamConsumer`, and
+    is blocking — it needs `block_in_place`, which **panics on a single-threaded
+    runtime**. Tests calling it need `#[tokio::test(flavor = "multi_thread")]`.
+- **`test_e2e_processing_dr_svg` fails under Docker-on-macOS** with "Test timed
+  out after 1 minute". Confirmed pre-existing: it fails identically on the
+  unmodified commit before T9. It is CPU-bound nesting against a hard 60s budget,
+  so it is an environment artifact, not a regression — but do not read it as a
+  green baseline.
+- **The compose harness advertises two SASL listeners** (`localhost:9092` for the
+  host, `kafka:29092` in-network) because an advertised address can only be
+  correct from one vantage point. Advertising only localhost makes every
+  in-network produce time out, which looks like a broker fault rather than a
+  routing mistake.
+- **`scripts/sync-schema.sh` pulls cutl-schemas' default branch.** The Kafka
+  `servers:` declaration is on that repo's `vk-cloud` branch, so CI currently
+  vendors a spec that still says `aws-sqs`. Harmless — typify only reads
+  `components.schemas`, so the generated types are byte-identical — but set
+  `CUTL_SCHEMAS_REF=vk-cloud` if you want them to match.
 - **`terminationGracePeriodSeconds: 600` and `Recreate` are load-bearing.** A
   nesting run is minutes long and single-owner. The default 30s would SIGKILL a
   job mid-flight on every rollout, and with no DLQ that is a silent loss.
@@ -105,11 +198,40 @@ value works — `eu-north-1` is 0/6.
 
 ## Verification
 
-1. Pod reaches 1/1 with `/ready` returning 200 (503 while dependencies are down
-   is correct behaviour, not a fault).
-2. A message on `nesting-request` is consumed and a result published to
-   `nesting-response`.
-3. `cutl_retries_exhausted_total` appears in Prometheus and the ServiceMonitor
+### Repo-local (done)
+
+```bash
+make test              # 39 unit + 25 e2e pass; see the dr_svg trap above
+make test-integration  # 9 broker-backed tests against real SCRAM auth
+make check             # fmt + clippy -D warnings
+make build             # docker image builds with librdkafka
+```
+
+The integration suite covers SCRAM auth (positive and negative), partition
+affinity under keying, the 3-partition topic layout, the implicit-acknowledgement
+property that forces the watermark, retry-header propagation, tier-topic
+existence, the tier delay's pause-and-rewind, and the response wire round trip.
+
+### On the cluster (not yet done)
+
+1. Scale the Deployment up from 0. Pod reaches 1/1 with `/ready` returning 200
+   (503 while dependencies are down is correct behaviour, not a fault).
+2. A message on `nesting-request` — **keyed by `correlationId`** — is consumed and
+   a result published to `nesting-response`. Until T8 lands, produce it by hand.
+3. `cutl_retries_exhausted_total` appears in Prometheus at 0 and the ServiceMonitor
    target goes up.
-4. A trace reaches Tempo with `service.name=jagua-nesting`.
-5. A rollout during an in-flight nesting job drains rather than losing it.
+4. Force a failure (a bad `svgUrl`) and watch it walk
+   `jagua-nesting-retry-1 → 2 → 3` and then fire `CutlRetriesExhausted`.
+5. Start a long job, then send a cancel with the same `correlationId`, and confirm
+   it is honoured **while the job is still running** — not after it finishes.
+   This is the property the whole keying/no-pause design exists for.
+6. A trace reaches Tempo with `service.name=jagua-nesting`. Produce a request
+   with a `traceparent` header and confirm the job's span is a **child** of it,
+   and that the response on `nesting-response` carries a `traceparent` in the same
+   trace — not a fresh one.
+7. A rollout during an in-flight nesting job drains rather than losing it.
+
+Note the existing envelope reportedly carries a hand-rolled `traceparent` as a
+JSON body field. This implementation ignores that and uses headers. If a producer
+is only setting the body field, traces will not join — worth checking against
+cutl-backend during T8 rather than after.
