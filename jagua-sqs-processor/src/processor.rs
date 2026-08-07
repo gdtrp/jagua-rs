@@ -1136,6 +1136,14 @@ impl NestingProcessor {
             let output_queue_url_for_task = output_queue_url.to_string();
             let correlation_id_for_task = request.correlation_id.clone();
 
+            // `tokio::spawn` does NOT inherit the caller's span — the spawned future
+            // starts with an empty span stack. Without this, `inject_current` inside
+            // `publish_response` sees an invalid context and the propagator writes no
+            // headers at all, so every improvement lands in its own orphan trace while
+            // the final response stays in the caller's. Created here, before the spawn,
+            // so it is a child of `nesting.handle` and carries the same trace id.
+            let improvement_span = tracing::info_span!("nesting.improvements");
+
             let improvement_task_handle = tokio::spawn(async move {
                 info!("Improvement task started, waiting for messages...");
                 while let Some(result) = rx.recv().await {
@@ -1243,7 +1251,10 @@ impl NestingProcessor {
                     }
                 }
                 info!("Improvement task finished (channel closed)");
-            });
+            }
+            // Instrument the task, so the produce inside it injects the job's span
+            // instead of an empty one.
+            .instrument(improvement_span));
 
             // Create improvement callback that sends to channel
             info!("Creating improvement callback");
