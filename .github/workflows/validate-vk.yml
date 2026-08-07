@@ -47,6 +47,13 @@ env:
 jobs:
   validate:
     name: Validate
+    # Same concurrency group as deploy-vk-staging. A push to vk-cloud triggers
+    # both workflows at once, and without this the validation grabs a pod name
+    # that the rollout then replaces underneath it — every later step fails with
+    # "pods not found", which reads like a broken cluster rather than a race.
+    concurrency:
+      group: jagua-vk-staging-deploy
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -144,6 +151,7 @@ jobs:
       - name: 2. Startup logs (Kafka connect, subscribe, tiers)
         run: |
           set -uo pipefail
+          POD=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua -o jsonpath='{.items[0].metadata.name}')
           kubectl -n "$NS" logs "$POD" --tail=120 \
             | grep -iE "Starting|KAFKA_|S3_BUCKET|Connected to Kafka|Consuming topic|Tier [0-9] consumer started|health endpoints|OTLP|ERROR|panic" \
             || echo "(no matching lines)"
@@ -151,6 +159,7 @@ jobs:
       - name: 3. /ready and /metrics
         run: |
           set -uo pipefail
+          POD=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua -o jsonpath='{.items[0].metadata.name}')
           echo "--- readiness condition ---"
           kubectl -n "$NS" get pod "$POD" \
             -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
@@ -228,6 +237,25 @@ jobs:
         if: env.MODE != 'readonly'
         run: |
           set -uo pipefail
+          # Wait for the group to have a live member before producing.
+          #
+          # auto.offset.reset=latest means a consumer with no committed offset
+          # starts at the log end, so a message produced while it is still joining
+          # is skipped rather than queued. That only bites a group that has never
+          # committed — after the first commit a restart resumes from it — but a
+          # freshly deployed worker is exactly that case, and the symptom is a test
+          # message that vanishes with no error anywhere.
+          echo "waiting for a live member in group jagua-nesting..."
+          for i in $(seq 1 30); do
+            if kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- \
+                 bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+                 --command-config /tmp/client.properties --describe --group jagua-nesting 2>/dev/null \
+                 | grep -q rdkafka; then
+              echo "group has a member after ${i}s"; break
+            fi
+            sleep 2
+          done
+
           CID="t9-validate-${GITHUB_RUN_ID}"
           echo "CID=$CID" >> "$GITHUB_ENV"
 
@@ -257,6 +285,7 @@ jobs:
         run: |
           set -uo pipefail
           sleep 45
+          POD=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua -o jsonpath='{.items[0].metadata.name}')
           kubectl -n "$NS" logs "$POD" --tail=200 | grep -iE "$CID|nesting.handle|Tier [0-9]|RETRIES EXHAUSTED|Republished" | tail -40 \
             || echo "(nothing yet)"
 
@@ -287,6 +316,7 @@ jobs:
               | grep "$CID" | head -2 | cut -c1-240 || echo "(none yet)"
           done
           echo "--- exhaustion counter ---"
+          POD=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua -o jsonpath='{.items[0].metadata.name}')
           kubectl -n "$NS" port-forward "pod/$POD" 18081:8080 >/tmp/pf2.log 2>&1 &
           PF=$!
           for i in $(seq 1 20); do
