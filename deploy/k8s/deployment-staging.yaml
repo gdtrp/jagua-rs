@@ -57,6 +57,11 @@ spec:
             - secretRef:
                 name: kafka-jagua-nesting
           env:
+            # From cutl-infra config/staging/nesting.properties, the same file
+            # the CDK feeds to the ECS task definition. Only one key survives:
+            # the other was SENTRY_ENVIRONMENT, and Sentry was removed in T7.
+            - name: AWS_REGION
+              value: "eu-north-1"
             - name: HEALTH_PORT
               value: "8080"
             # Tempo's OTLP receiver. observability.rs treats an unset value as
