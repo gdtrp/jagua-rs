@@ -117,6 +117,11 @@ spec:
             requests:
               cpu: 500m
               memory: 256Mi
+            # Trimmed from 1500m: measured steady usage is a fraction of it, and
+            # excess limits on an idle service are pure overcommit noise. The
+            # frontend deliberately keeps 1500m — its burst is the /calculation
+            # cold-LCP fix. Note this does NOT clear KubeCPUOvercommit, which is
+            # about REQUESTS and node-failure headroom, not limits.
             limits:
-              cpu: "1500m"
+              cpu: "1000m"
               memory: 1Gi
