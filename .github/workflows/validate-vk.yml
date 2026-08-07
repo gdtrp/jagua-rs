@@ -12,6 +12,16 @@ name: Validate jagua on VK staging
 # that input before enabling it.
 
 on:
+  # A push trigger as well as workflow_dispatch, because GitHub only exposes
+  # workflow_dispatch for workflows that exist on the DEFAULT branch — and this
+  # one lives on vk-cloud until the migration merges. Touching the trigger file
+  # runs it; its contents select the mode (see `read mode` below), which is how
+  # the dispatch inputs are approximated until this reaches main.
+  push:
+    branches: [vk-cloud]
+    paths:
+      - '.github/validate.trigger'
+      - '.github/workflows/validate-vk.yml'
   workflow_dispatch:
     inputs:
       send_test_message:
@@ -42,6 +52,25 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+
+      # Normalises the two trigger paths into one MODE, so every step below has a
+      # single thing to branch on.
+      #   readonly — inspect only, touches nothing (the default, and the safe one)
+      #   cancel   — produce a cancellation; exercises the transport, never S3
+      #   full     — produce a real nesting request; WILL fire CutlRetriesExhausted
+      - name: read mode
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.send_test_message }}" = "true" ]; then MODE=full
+            elif [ "${{ inputs.cancel_only }}" = "true" ]; then MODE=cancel
+            else MODE=readonly; fi
+          else
+            MODE=$(grep -oE '^mode=(readonly|cancel|full)' .github/validate.trigger 2>/dev/null | cut -d= -f2 | tail -1)
+            MODE=${MODE:-readonly}
+          fi
+          echo "MODE=$MODE" >> "$GITHUB_ENV"
+          echo "validation mode: $MODE"
 
       - name: install kubectl
         run: |
@@ -163,7 +192,7 @@ jobs:
       # unkeyed request cannot be cancelled, because the cancel would be free to
       # land on a different partition.
       - name: 7. Produce a test message
-        if: ${{ inputs.send_test_message || inputs.cancel_only }}
+        if: env.MODE != 'readonly'
         run: |
           set -uo pipefail
           KPOD=$(kubectl -n "$KAFKA_NS" get pods -l strimzi.io/name=cutl-kafka \
@@ -178,7 +207,7 @@ jobs:
           echo "traceparent: $TP"
           echo "TP=$TP" >> "$GITHUB_ENV"
 
-          if [ "${{ inputs.cancel_only }}" = "true" ]; then
+          if [ "$MODE" = "cancel" ]; then
             BODY="{\"correlationId\":\"$CID\",\"cancelled\":true,\"binWidth\":null,\"binHeight\":null,\"spacing\":null,\"parts\":null}"
           else
             SVG=$(printf '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><path d="M0,0 L100,0 L100,150 L0,150 Z"/></svg>' | base64 -w0)
@@ -194,7 +223,7 @@ jobs:
           echo "produced $CID"
 
       - name: 8. Worker logs for the test message
-        if: ${{ inputs.send_test_message || inputs.cancel_only }}
+        if: env.MODE != 'readonly'
         run: |
           set -uo pipefail
           sleep 45
@@ -202,7 +231,7 @@ jobs:
             || echo "(nothing yet)"
 
       - name: 9. Response on nesting-response (key + traceparent)
-        if: ${{ inputs.send_test_message || inputs.cancel_only }}
+        if: env.MODE != 'readonly'
         run: |
           set -uo pipefail
           kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- bash -c \
@@ -215,7 +244,7 @@ jobs:
       # The whole ladder takes ~11 minutes (5s + 1m + 10m), so this only reports
       # where it has got to rather than waiting it out.
       - name: 10. Retry ladder and exhaustion counter
-        if: ${{ inputs.send_test_message }}
+        if: env.MODE == 'full'
         run: |
           set -uo pipefail
           for t in jagua-nesting-retry-1 jagua-nesting-retry-2 jagua-nesting-retry-3; do
