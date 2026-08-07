@@ -212,24 +212,53 @@ affinity under keying, the 3-partition topic layout, the implicit-acknowledgemen
 property that forces the watermark, retry-header propagation, tier-topic
 existence, the tier delay's pause-and-rewind, and the response wire round trip.
 
-### On the cluster (not yet done)
+### On the cluster — done 2026-08-07
 
-1. Scale the Deployment up from 0. Pod reaches 1/1 with `/ready` returning 200
-   (503 while dependencies are down is correct behaviour, not a fault).
-2. A message on `nesting-request` — **keyed by `correlationId`** — is consumed and
-   a result published to `nesting-response`. Until T8 lands, produce it by hand.
-3. `cutl_retries_exhausted_total` appears in Prometheus at 0 and the ServiceMonitor
-   target goes up.
-4. Force a failure (a bad `svgUrl`) and watch it walk
-   `jagua-nesting-retry-1 → 2 → 3` and then fire `CutlRetriesExhausted`.
-5. Start a long job, then send a cancel with the same `correlationId`, and confirm
-   it is honoured **while the job is still running** — not after it finishes.
-   This is the property the whole keying/no-pause design exists for.
-6. A trace reaches Tempo with `service.name=jagua-nesting`. Produce a request
-   with a `traceparent` header and confirm the job's span is a **child** of it,
-   and that the response on `nesting-response` carries a `traceparent` in the same
-   trace — not a fresh one.
-7. A rollout during an in-flight nesting job drains rather than losing it.
+Driven by `.github/workflows/validate-vk.yml`, which authenticates the same way
+the deploy job does. Use it rather than a local kubeconfig: the VK bearer token
+is a project-scoped Keystone token that expires within hours.
+
+Confirmed on VK staging:
+
+- **Pod 1/1 Running, 0 restarts**, up from the scaled-to-0 state. The two prior
+  deploys had failed with `BackOff restarting failed container jagua`.
+- `/health` **200**, `/ready` **200**, `/metrics` **200** — the ServiceMonitor
+  target is no longer dead, and `cutl_retries_exhausted_total` is present at 0
+  with both `group` and `origin_topic` labels.
+- **All four consumer groups joined** (`jagua-nesting` plus the three tiers),
+  3 partitions each, over SASL_PLAINTEXT + SCRAM-SHA-512.
+- A keyed request carrying a `traceparent` was consumed on `nesting-request`
+  partition 2, handled inside a `nesting.handle` span parented to it.
+- **The retry ladder climbs**: S3 upload failed (expected — no relay), the
+  handler escalated, `Republished to jagua-nesting-retry-1 (attempt 2 of 3)`,
+  the tier-1 consumer applied its delay and re-invoked, then
+  `Republished to jagua-nesting-retry-2 (attempt 3 of 3)`. Tier spans carry
+  `retry.tier` and `retry.attempt`.
+
+Exhaustion itself landed ~4s after the validation snapshot (tier 2's delay is
+60s), so the counter still read 0 in that run. **Check Prometheus for
+`cutl_retries_exhausted_total` and whether `CutlRetriesExhausted` fired** — the
+counter is in-process and resets on every redeploy, so Prometheus is the only
+place the increment survives. End-to-end exhaustion was proven locally against
+the harness with S3 pointed at a dead host and the tier delays shortened.
+
+### Still to verify on the cluster
+
+1. A **cancellation** honoured mid-job — the property the whole keying and
+   no-pause design exists for. Needs a job long enough to cancel, which needs S3
+   working, so it is blocked on the relay.
+2. A **successful** round trip producing a real result on `nesting-response`.
+   Every cluster run so far dies at the S3 upload, so the success path is proven
+   only locally. Blocked on the relay.
+3. A trace actually arriving in **Tempo** with `service.name=jagua-nesting`, and
+   the job's span appearing as a *child* of the producer's `traceparent`.
+   Propagation is verified on the wire; what has not been checked is that Tempo
+   received and joined it.
+4. `CutlRetriesExhausted` firing in Alertmanager. The counter increments (proven
+   locally), but nobody has watched the alert route.
+5. A rollout during an in-flight nesting job draining rather than losing it —
+   the `terminationGracePeriodSeconds: 600` behaviour. Also needs a job long
+   enough to interrupt, so also blocked on the relay.
 
 Note the existing envelope reportedly carries a hand-rolled `traceparent` as a
 JSON body field. This implementation ignores that and uses headers. If a producer

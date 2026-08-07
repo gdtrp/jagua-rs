@@ -9,11 +9,9 @@
 # mode=readonly  inspect only — pod state, logs, /ready, /metrics, consumer groups
 # mode=cancel    also produce a cancellation: exercises consume, keying, the
 #                inline cancel path and the offset commit, and never touches S3
-# mode=full      also produce a real nesting request. WARNING: S3 eu-north-1 is
+# mode=readonly      also produce a real nesting request. WARNING: S3 eu-north-1 is
 #                unreachable from VK until the relay exists, so this WILL fail its
 #                upload, walk all three retry tiers (~11 min) and fire
 #                CutlRetriesExhausted at severity: critical. Someone gets paged.
 
-mode=full
-
-# rerun 2026-08-07T12:07:08Z
+mode=readonly
