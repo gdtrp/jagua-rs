@@ -101,11 +101,12 @@ spec:
             periodSeconds: 20
             failureThreshold: 3
           resources:
-            # Nesting is CPU-bound; memory is modest. Mirrors the ECS task
-            # sizing, using the non-ARM values since VK nodes are amd64.
+            # Nesting is CPU-bound but the process is small; Rust, no JVM heap
+            # to reserve. Requests are a scheduling floor, so they stay modest
+            # on a 1930m node — the limit is what a nesting run actually gets.
             requests:
-              cpu: "1"
-              memory: 512Mi
+              cpu: 500m
+              memory: 256Mi
             limits:
-              cpu: "2"
-              memory: 2Gi
+              cpu: "1500m"
+              memory: 1Gi
