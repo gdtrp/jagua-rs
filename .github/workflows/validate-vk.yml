@@ -154,28 +154,61 @@ jobs:
           echo "--- readiness condition ---"
           kubectl -n "$NS" get pod "$POD" \
             -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
-          echo "--- /metrics (via a curl pod on the cluster network) ---"
-          kubectl -n "$NS" run jagua-validate-curl-$RANDOM --rm -i --restart=Never --quiet \
-            --image=curlimages/curl:8.10.1 --command -- \
-            curl -sS --max-time 20 "http://jagua.${NS}.svc:8080/metrics" \
-            | grep -E "^cutl_retries_exhausted_total|^jagua_messages_consumed_total|^jagua_inflight_jobs|^jagua_committed_offset" \
+          # port-forward rather than a curl pod: the cluster cannot reach Docker
+          # Hub (TLS handshake timeouts — which is why every image in this repo
+          # comes from mirror.gcr.io), so `kubectl run --image=curlimages/curl`
+          # sits in ImagePullBackOff. Forwarding pulls nothing and curls from the
+          # runner instead.
+          echo "--- /metrics ---"
+          kubectl -n "$NS" port-forward "pod/$POD" 18080:8080 >/tmp/pf.log 2>&1 &
+          PF=$!
+          for i in $(seq 1 20); do
+            curl -sf --max-time 2 http://127.0.0.1:18080/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          echo "/health  -> $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:18080/health)"
+          echo "/ready   -> $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:18080/ready)"
+          echo "--- series ---"
+          curl -sS --max-time 20 http://127.0.0.1:18080/metrics \
+            | grep -E "^cutl_retries_exhausted_total|^jagua_messages_consumed_total|^jagua_messages_failed_total|^jagua_inflight_jobs|^jagua_retry_republished_total" \
             || echo "::warning::could not scrape /metrics"
+          kill $PF 2>/dev/null || true
 
-      - name: 4. Consumer group membership and lag
+      # The broker's only listener is SASL_PLAINTEXT + SCRAM-SHA-512 (tls = false,
+      # port 9092), so the Kafka CLI tools need --command-config or every call
+      # dies on FIND_COORDINATOR with a node-assignment timeout that looks like a
+      # broker fault. Credentials come from the Secret already in the cluster —
+      # the same one the worker mounts — so nothing extra is stored anywhere.
+      - name: 4. Kafka client config + consumer groups
         run: |
           set -uo pipefail
-          KPOD=$(kubectl -n "$KAFKA_NS" get pods -l strimzi.io/name=cutl-kafka \
+          KPOD=$(kubectl -n "$KAFKA_NS" get pods -l strimzi.io/name=cutl-dual-role \
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -z "$KPOD" ]; then
-            KPOD=$(kubectl -n "$KAFKA_NS" get pods -o name 2>/dev/null | grep -m1 kafka | cut -d/ -f2 || true)
+            KPOD=$(kubectl -n "$KAFKA_NS" get pods -o name 2>/dev/null | grep -m1 -E "kafka|dual-role" | cut -d/ -f2 || true)
           fi
           echo "kafka pod: ${KPOD:-<none>}"
           [ -n "$KPOD" ] || { echo "::warning::no kafka pod found"; exit 0; }
+          echo "KPOD=$KPOD" >> "$GITHUB_ENV"
+
+          KU=$(kubectl -n "$NS" get secret kafka-jagua-nesting -o jsonpath='{.data.KAFKA_USERNAME}' | base64 -d)
+          KP=$(kubectl -n "$NS" get secret kafka-jagua-nesting -o jsonpath='{.data.KAFKA_PASSWORD}' | base64 -d)
+          echo "::add-mask::$KP"
+          echo "scram user: $KU"
+
+          cat > /tmp/client.properties <<EOF
+          security.protocol=SASL_PLAINTEXT
+          sasl.mechanism=SCRAM-SHA-512
+          sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="$KU" password="$KP";
+          EOF
+          kubectl -n "$KAFKA_NS" cp /tmp/client.properties "$KPOD:/tmp/client.properties" -c kafka
+
           for g in jagua-nesting jagua-nesting-retry-1 jagua-nesting-retry-2 jagua-nesting-retry-3; do
             echo "--- group $g ---"
             kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- \
               bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
-              --describe --group "$g" 2>/dev/null || echo "(unavailable)"
+              --command-config /tmp/client.properties \
+              --describe --group "$g" 2>&1 | grep -vE "^\s*$" | head -8 || echo "(unavailable)"
           done
 
       - name: 5. ServiceMonitor target
@@ -195,12 +228,8 @@ jobs:
         if: env.MODE != 'readonly'
         run: |
           set -uo pipefail
-          KPOD=$(kubectl -n "$KAFKA_NS" get pods -l strimzi.io/name=cutl-kafka \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-          [ -n "$KPOD" ] || KPOD=$(kubectl -n "$KAFKA_NS" get pods -o name | grep -m1 kafka | cut -d/ -f2)
           CID="t9-validate-${GITHUB_RUN_ID}"
           echo "CID=$CID" >> "$GITHUB_ENV"
-          echo "KPOD=$KPOD" >> "$GITHUB_ENV"
 
           # A distinctive trace id so the propagation assertion is unambiguous.
           TP="00-$(printf '%032x' $((GITHUB_RUN_ID)) )-00f067aa0ba902b7-01"
@@ -218,6 +247,7 @@ jobs:
           kubectl -n "$KAFKA_NS" cp /tmp/line.txt "$KPOD:/tmp/line.txt" -c kafka
           kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- bash -c \
             'bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic nesting-request \
+               --producer.config /tmp/client.properties \
                --property parse.key=true --property key.separator="|" \
                --property parse.headers=true --property headers.key.separator=: < /tmp/line.txt'
           echo "produced $CID"
@@ -236,6 +266,7 @@ jobs:
           set -uo pipefail
           kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- bash -c \
             'timeout 40 bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+               --consumer.config /tmp/client.properties \
                --topic nesting-response --from-beginning \
                --property print.headers=true --property print.key=true 2>/dev/null' \
             | grep "$CID" | head -3 | cut -c1-400 \
@@ -251,15 +282,21 @@ jobs:
             echo "--- $t ---"
             kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- bash -c \
               "timeout 20 bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+                 --consumer.config /tmp/client.properties \
                  --topic $t --from-beginning --property print.headers=true 2>/dev/null" \
               | grep "$CID" | head -2 | cut -c1-240 || echo "(none yet)"
           done
           echo "--- exhaustion counter ---"
-          kubectl -n "$NS" run jagua-validate-curl2-$RANDOM --rm -i --restart=Never --quiet \
-            --image=curlimages/curl:8.10.1 --command -- \
-            curl -sS --max-time 20 "http://jagua.${NS}.svc:8080/metrics" \
-            | grep -E "^cutl_retries_exhausted_total|^jagua_retry_republished_total|^jagua_messages_failed_total" \
+          kubectl -n "$NS" port-forward "pod/$POD" 18081:8080 >/tmp/pf2.log 2>&1 &
+          PF=$!
+          for i in $(seq 1 20); do
+            curl -sf --max-time 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -sS --max-time 20 http://127.0.0.1:18081/metrics \
+            | grep -E "^cutl_retries_exhausted_total|^jagua_retry_republished_total|^jagua_messages_failed_total|^jagua_messages_consumed_total" \
             || echo "(scrape failed)"
+          kill $PF 2>/dev/null || true
 
       - name: 11. Recent warning events for jagua
         if: always()

@@ -14,4 +14,4 @@
 #                upload, walk all three retry tiers (~11 min) and fire
 #                CutlRetriesExhausted at severity: critical. Someone gets paged.
 
-mode=readonly
+mode=full
