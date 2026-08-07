@@ -135,6 +135,37 @@ fn safe_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Marks a failure as *infrastructure* trouble rather than a bad request.
+///
+/// The distinction decides what happens to the message. A malformed request will
+/// fail identically on every attempt, so it gets an error response and is done
+/// with. An S3 outage might not, so it belongs on the retry ladder.
+///
+/// This exists because the two were previously indistinguishable: an upload that
+/// exhausted its attempts was logged and swallowed, and the worker then published
+/// a `final: true` response carrying `partsPlaced: 4` and no page URLs — a
+/// success as far as the schema is concerned, for a job that produced nothing
+/// the caller can use. Observed on VK staging, where S3 eu-north-1 is unreachable.
+#[derive(Debug)]
+pub struct RetryableError(pub String);
+
+impl std::fmt::Display for RetryableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RetryableError {}
+
+/// Whether an error should be escalated to the retry ladder.
+///
+/// Walks the whole chain, so a `RetryableError` keeps its meaning through any
+/// number of `.context(...)` wrappings on the way up.
+pub fn is_retryable(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<RetryableError>().is_some())
+}
+
 /// Retry an async operation with exponential backoff
 async fn retry_with_backoff<F, Fut, T, E>(
     operation_name: &str,
@@ -427,12 +458,12 @@ impl NestingProcessor {
                 // Log the full error
                 error!("Full error details: {}", e);
 
-                return Err(anyhow::anyhow!(
-                    "Failed to download SVG from S3: bucket={}, key={}, error={}",
-                    bucket,
-                    key,
-                    e
-                ));
+                // Retryable: a download failure is the network or S3, not the
+                // request. With the eu-west-1 relay adding a hop, this path gets
+                // more likely rather than less.
+                return Err(anyhow!(RetryableError(format!(
+                    "Failed to download SVG from S3: bucket={bucket}, key={key}, error={e}"
+                ))));
             }
         };
 
@@ -925,6 +956,23 @@ impl NestingProcessor {
                 request.correlation_id, e
             );
 
+            // Infrastructure failures go to the retry ladder instead of becoming a
+            // response. Two reasons not to answer here: a `final: true` error tells
+            // the caller the job is permanently done, which a retry then
+            // contradicts with a second final response; and answering would make
+            // the handler look successful, so nothing would ever escalate.
+            //
+            // If every tier is exhausted the message is dropped and
+            // cutl_retries_exhausted_total fires — that alert is the contract's
+            // substitute for a DLQ, and it is deliberately the only signal.
+            if is_retryable(e) {
+                warn!(
+                    "Infrastructure failure for correlation_id={}, escalating to the retry ladder: {}",
+                    request.correlation_id, error_msg
+                );
+                return Err(anyhow!(RetryableError(error_msg)));
+            }
+
             // Send error response for internal processing errors
             let error_response = SqsNestingResponse {
                 correlation_id: request.correlation_id.clone(),
@@ -1361,7 +1409,16 @@ impl NestingProcessor {
                         page_svg_urls.push(url);
                     }
                     Err(e) => {
+                        // Escalate rather than swallow. Publishing a response
+                        // without this page would report success for a layout the
+                        // caller cannot fetch; the retry ladder at least gives S3
+                        // a chance to come back, and failing that the exhaustion
+                        // alert says the message was lost.
                         error!("Failed to upload final page {} SVG to S3 after retries: {}", page_idx, e);
+                        return Err(anyhow!(RetryableError(format!(
+                            "S3 upload of final page {} failed after retries: {}",
+                            page_idx, e
+                        ))));
                     }
                 }
             }
@@ -1390,7 +1447,9 @@ impl NestingProcessor {
                     }
                     Err(e) => {
                         error!("Failed to upload final result last page SVG to S3 after retries: {}", e);
-                        None
+                        return Err(anyhow!(RetryableError(format!(
+                            "S3 upload of the final last page failed after retries: {e}"
+                        ))));
                     }
                 }
             } else {
@@ -2168,6 +2227,35 @@ mod tests {
     /// deserializing, so it must cope with the shape cancels actually arrive in:
     /// every nesting field an explicit `null`. A strict parse would reject these
     /// and the cancel would be treated as an ordinary job.
+    /// The classification that decides retry-vs-answer. Getting it wrong either
+    /// way is bad: a validation error on the ladder burns ~11 minutes to reach a
+    /// conclusion available immediately, and an infrastructure error answered as
+    /// a response reports success for a job that produced nothing usable.
+    #[test]
+    fn infrastructure_errors_are_retryable_and_validation_errors_are_not() {
+        let infra: anyhow::Error = anyhow!(RetryableError("S3 upload failed".into()));
+        assert!(is_retryable(&infra));
+
+        let validation = anyhow!("'parts' array is empty");
+        assert!(!is_retryable(&validation));
+    }
+
+    /// The marker has to survive the `.context(...)` wrapping it picks up on the
+    /// way out of the handler, or an S3 failure silently becomes a permanent one.
+    #[test]
+    fn retryable_survives_context_wrapping() {
+        let deep: anyhow::Error = anyhow!(RetryableError("S3 timeout".into()));
+        let wrapped = deep
+            .context("uploading final page 0")
+            .context("processing nesting request");
+
+        assert!(
+            is_retryable(&wrapped),
+            "the marker must be found anywhere in the chain, not just at the root"
+        );
+        assert!(format!("{wrapped:#}").contains("S3 timeout"));
+    }
+
     #[test]
     fn peek_cancellation_reads_the_production_cancel_shape() {
         let body = r#"{"correlationId":"9abdb358-35fd-4dbf-ba06-1ae9023a4512",

@@ -47,6 +47,6 @@ exec docker run --rm \
   -v jagua-cargo-git:/usr/local/cargo/git \
   -v jagua-target:/app/target \
   -e CARGO_TERM_COLOR=never \
-  "${NETWORK_ARGS[@]}" \
+  ${NETWORK_ARGS[@]+"${NETWORK_ARGS[@]}"} \
   "$IMAGE" \
   bash -c "apt-get update -qq >/dev/null && apt-get install -y -qq $BUILD_DEPS >/dev/null 2>&1 && cargo $(printf '%q ' "$@")"
