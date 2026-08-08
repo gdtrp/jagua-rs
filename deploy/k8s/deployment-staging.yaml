@@ -58,20 +58,40 @@ spec:
             # already env-var shaped so nothing needs parsing or mounting.
             - secretRef:
                 name: kafka-jagua-nesting
+            # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for S3.
+            #
+            # WHY THIS IS SUDDENLY NEEDED, when the ECS task ran without it: on
+            # Fargate the task ROLE supplied credentials (the CDK calls
+            # bucket.grantReadWrite(taskRole), and the ECS agent injects
+            # AWS_CONTAINER_CREDENTIALS_RELATIVE_URI so the SDK fetches
+            # short-lived credentials from 169.254.170.2). VK has no ECS agent,
+            # no instance profile and no IRSA, so the credential chain finds
+            # nothing — which is exactly what this pod used to print at startup:
+            # `AWS_ACCESS_KEY_ID: Err(NotPresent)`. Static keys stand in for the
+            # identity the platform used to provide.
+            #
+            # Built by this repo's deploy workflow from the VK_S3_SECRETS GitHub
+            # secret, which cutl-infra scripts/vk-github-secrets.sh extracts
+            # from config/staging/backend.properties. Same delivery path as the
+            # backend's cutl-backend-secrets, and deliberately NOT cutl-env:
+            # that Secret is Terraform-owned and platform-derived only.
+            - secretRef:
+                name: jagua-s3-secrets
           env:
-            # S3 stays on AWS: only the queue moved to Kafka, the payload path
-            # did not. Note eu-north-1 S3 is NOT reachable from this cluster
-            # (measured 0/6), so object access needs the eu-west-1 relay set via
-            # AWS_ENDPOINT_URL. Until that exists, S3 calls fail into the retry
-            # ladder and then raise CutlRetriesExhausted — visibly, rather than
-            # silently.
+            # S3 stays on AWS - only the queue moved to Kafka, the payload path
+            # did not. But it moved REGION: eu-west-1, not eu-north-1 where
+            # every other bucket lives, because VK's egress block is per AWS
+            # region. Measured from a pod in this cluster, six attempts each:
+            # eu-west-1 6/6, eu-north-1 0/6. The bucket is created by
+            # cutl-infra's cutl-relay-staging CDK stack.
+            #
+            # THE BACKEND MUST POINT AT THE SAME BUCKET: it writes the input and
+            # sends the object key over Kafka, so a region split turns a working
+            # pipeline into NoSuchKey on every job.
             - name: S3_BUCKET
-              value: "cutl-staging-uploads"
-            # From cutl-infra config/staging/nesting.properties, the same file
-            # the CDK feeds to the ECS task definition. Only one key survives:
-            # the other was SENTRY_ENVIRONMENT, and Sentry was removed in T7.
+              value: "cutl-staging-uploads-eu-west-1"
             - name: AWS_REGION
-              value: "eu-north-1"
+              value: "eu-west-1"
             - name: HEALTH_PORT
               value: "8080"
             # Tempo's OTLP receiver. observability.rs treats an unset value as

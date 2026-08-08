@@ -230,6 +230,30 @@ jobs:
           EOF
           chmod 600 "$HOME/.kube/config"
 
+      # BEFORE the manifests: the Deployment's envFrom references this Secret,
+      # and a missing envFrom target leaves the pod in
+      # CreateContainerConfigError instead of failing with a clear message.
+      #
+      # Same shape as cutl-backend's "create application secret" step. These are
+      # the ECS credentials (s3-upload-user) because VK provides no task role -
+      # see the Deployment for the full reasoning.
+      - name: create S3 credentials secret
+        env:
+          S3_SECRETS: ${{ secrets.VK_S3_SECRETS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${S3_SECRETS:-}" ]; then
+            echo "::error::VK_S3_SECRETS is unset. Nesting downloads read from S3, so the worker would start and then fail every job into the retry ladder. Set it by running cutl-infra scripts/vk-github-secrets.sh."
+            exit 1
+          fi
+          # --from-env-file reads KEY=VALUE lines, the format it was extracted
+          # in, so the value transfers unchanged.
+          printf '%s' "$S3_SECRETS" > /tmp/s3-secrets.env
+          kubectl -n cutl create secret generic jagua-s3-secrets \
+            --from-env-file=/tmp/s3-secrets.env \
+            --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+          shred -u /tmp/s3-secrets.env 2>/dev/null || rm -f /tmp/s3-secrets.env
+
       - name: render + apply manifests
         env:
           IMAGE: ${{ env.VK_REGISTRY }}/${{ env.VK_IMAGE }}:${{ github.sha }}
