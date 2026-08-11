@@ -1142,7 +1142,18 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
     Ok(())
 }
 
+// Wall-clock throughput test, not a correctness test: it polls for 60s and fails only on the
+// "no responses captured" branch, so it asserts that this machine can produce at least one
+// improvement for dr.svg within a minute. A GitHub runner cannot, and it has been the sole
+// reason the CI `test` job has been red on every vk-cloud push since CI was introduced (26
+// passed, 1 failed). It passes on a developer machine, including under a 2-core cap, so the
+// deadline tracks core speed rather than anything about the code.
+//
+// Same treatment as the four wall-clock tests in jagua-utils/tests/adaptive_strategy_test.rs.
+// Run it explicitly with:
+//     cargo test -p jagua-sqs-processor --test e2e_test -- --ignored test_e2e_processing_dr_svg
 #[tokio::test]
+#[ignore = "wall-clock throughput test; the 60s budget is unreachable on a CI runner — run explicitly with --ignored"]
 async fn test_e2e_processing_dr_svg() -> Result<()> {
     init_test_logging();
 
