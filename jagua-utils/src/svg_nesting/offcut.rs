@@ -283,14 +283,28 @@ pub(crate) fn detect_rect_offcuts(
 /// Greedily extract non-overlapping maximal free rectangles. Repeatedly takes the
 /// largest-area empty rectangle, emits it if it meets the minimum size, then marks it
 /// occupied and repeats — yielding a small set of large rectangles rather than many slivers.
+///
+/// The selection is by **area**, but the threshold is per **dimension**, and those disagree: a
+/// long thin strip can be the largest remaining region while failing `min_h`, and stopping there
+/// discards every smaller-but-qualifying region behind it. That is how a reusable block next to
+/// the packed column went unreported — the big rectangle was emitted, the next-largest region was
+/// a strip too thin to qualify, and the walk ended before reaching the block.
+///
+/// So a failing rectangle is consumed and the walk continues. Termination is safe because the
+/// walk is area-descending: once the largest remaining region is smaller in area than the minimum
+/// box, nothing left can satisfy both dimensions.
 fn maximal_free_rects(bin: Rect, obstacles: &[Rect], min_w: f32, min_h: f32) -> Vec<Rect> {
     let mut obs = obstacles.to_vec();
     let mut out = Vec::new();
+    let min_area = min_w * min_h;
     while let Some(r) = largest_empty_rect(bin, &obs) {
-        if r.width() < min_w || r.height() < min_h {
+        if r.width() * r.height() < min_area {
             break;
         }
-        out.push(r);
+        if r.width() >= min_w && r.height() >= min_h {
+            out.push(r);
+        }
+        // Consume it either way — an unconsumed rectangle would be returned forever.
         obs.push(r);
     }
     out
@@ -847,6 +861,49 @@ mod tests {
         assert!(bands[0].contains("510"), "inset edge missing: {}", bands[0]);
         // No band when kerf is zero.
         assert!(kerf_band_paths(std::slice::from_ref(&offcut), 0.0).is_empty());
+    }
+
+    /// A thin strip must not end the walk: it is the largest remaining region by area but
+    /// fails `min_h`, and behind it sits a block that does qualify. The old code broke on the
+    /// strip and reported only the first rectangle, losing reusable material next to the parts.
+    #[test]
+    fn rect_thin_strip_does_not_hide_a_qualifying_block() {
+        // 2000x1000 bin, min 100x100. The obstacles leave three free regions, and the areas are
+        // chosen so the disqualifying one is picked *between* the two qualifying ones:
+        //   1. right block   900 x 1000 = 900,000  ✓ emitted first
+        //   2. top strip    1100 x   90 =  99,000  ✗ only 90 tall — where the old walk stopped
+        //   3. bottom-left   150 x  400 =  60,000  ✓ must still be reported
+        let bin = Rect::try_new(0.0, 0.0, 2000.0, 1000.0).unwrap();
+        let obstacles = [
+            Rect::try_new(150.0, 0.0, 1100.0, 910.0).unwrap(),
+            Rect::try_new(0.0, 400.0, 150.0, 910.0).unwrap(),
+        ];
+        let offcuts = detect_rect_offcuts(bin, &obstacles, &rect_policy(100.0, 100.0, 0.0), 0.0);
+
+        let has = |x: f32, y: f32| {
+            offcuts.iter().any(|o| match o {
+                Offcut::Rect {
+                    x: ox,
+                    y: oy,
+                    width,
+                    height,
+                } => *ox <= x && x <= ox + width && *oy <= y && y <= oy + height,
+                _ => false,
+            })
+        };
+        assert!(has(1500.0, 500.0), "right block missing: {offcuts:?}");
+        assert!(
+            has(75.0, 200.0),
+            "bottom-left block was hidden behind the thin top strip: {offcuts:?}"
+        );
+        for o in &offcuts {
+            if let Offcut::Rect { width, height, .. } = o {
+                assert!(
+                    *width >= 100.0 && *height >= 100.0,
+                    "below threshold: {o:?}"
+                );
+            }
+        }
     }
 
     #[test]
