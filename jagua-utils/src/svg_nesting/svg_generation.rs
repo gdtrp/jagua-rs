@@ -37,7 +37,7 @@ pub struct PlacedPartInfo {
 pub struct PageResult {
     /// Page index (0-based).
     pub page_index: usize,
-    /// Utilisation ratio (0.0 to 1.0) for this page.
+    /// Utilisation ratio (0.0 to 1.0) for this page, including each part's separation halo.
     pub utilisation: f32,
     /// S3 URL to the SVG for this page (populated by the SQS processor).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,8 +66,15 @@ pub struct NestingResult {
     pub total_parts_requested: usize,
     /// SVG for unplaced parts (if any), showing remaining parts in a grid layout.
     pub unplaced_parts_svg: Option<Vec<u8>>,
-    /// Average bin utilisation ratio (0.0 to 1.0) across all pages.
+    /// Average bin utilisation ratio (0.0 to 1.0) across all pages, **including** each part's
+    /// separation halo. The caller asked for that spacing, so it reads as consumed sheet rather
+    /// than loss — a sheet with no room left for another part reports close to 100%.
     pub utilisation: f32,
+    /// Average **material** utilisation (0.0 to 1.0): bare part outlines only, spacing counted as
+    /// waste. This is the true yield, and it is what drives the optimiser's early-stop decision —
+    /// comparing a halo-inclusive number against that threshold would stop the search sooner and
+    /// pack worse.
+    pub material_utilisation: f32,
     /// Per-page results: utilisation and placements grouped by page.
     pub pages: Vec<PageResult>,
     /// Total number of sheets the run expects to produce, when known up front (the deterministic

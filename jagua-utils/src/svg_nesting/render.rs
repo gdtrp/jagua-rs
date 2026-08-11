@@ -382,6 +382,10 @@ pub(crate) fn render_periodic(
         total_parts_requested,
         unplaced_parts_svg: None,
         utilisation,
+        // The deterministic paths derive `util` from the lattice pitch, which already carries the
+        // spacing, so the halo-inclusive and material figures are not separable here. Reporting the
+        // same value for both is honest about that rather than inventing a second number.
+        material_utilisation: utilisation,
         sheets_total_estimate: Some(page_results.len()),
         pages: page_results,
     }
@@ -445,6 +449,10 @@ pub(crate) fn render_page_list(
         total_parts_requested,
         unplaced_parts_svg: None,
         utilisation,
+        // The deterministic paths derive `util` from the lattice pitch, which already carries the
+        // spacing, so the halo-inclusive and material figures are not separable here. Reporting the
+        // same value for both is honest about that rather than inventing a second number.
+        material_utilisation: utilisation,
         sheets_total_estimate: Some(page_results.len()),
         pages: page_results,
     }

@@ -332,8 +332,8 @@ impl NestingStrategy for SimpleNestingStrategy {
                 page_svgs.push(processed_svg.into_bytes());
             }
 
-            // Compute per-page utilisation using actual polygon area (matches SVG density)
-            let page_util = layout_snapshot.density(&instance);
+            // Reported utilisation counts each part's separation halo as consumed sheet.
+            let page_util = crate::svg_nesting::strategy::sheet_utilisation(layout_snapshot);
 
             // Always extract real placement data (cheap, and item_id values differ per page)
             let mut page_placements = Vec::new();
@@ -436,6 +436,19 @@ impl NestingStrategy for SimpleNestingStrategy {
             None
         };
 
+        // Material yield: bare outlines, spacing as waste. Kept separate because the optimiser's
+        // early-stop threshold is calibrated against it.
+        let material_utilisation = if solution.layout_snapshots.is_empty() {
+            0.0
+        } else {
+            solution
+                .layout_snapshots
+                .values()
+                .map(|ls| ls.density(&instance))
+                .sum::<f32>()
+                / solution.layout_snapshots.len() as f32
+        };
+
         // Calculate average bin utilisation across all pages
         let utilisation = if pages.is_empty() {
             0.0
@@ -450,6 +463,7 @@ impl NestingStrategy for SimpleNestingStrategy {
             total_parts_requested,
             unplaced_parts_svg,
             utilisation,
+            material_utilisation,
             pages,
             sheets_total_estimate: None,
         };

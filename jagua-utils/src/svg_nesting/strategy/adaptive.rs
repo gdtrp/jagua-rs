@@ -368,8 +368,8 @@ impl AdaptiveNestingStrategy {
                 page_svgs.push(processed_svg.into_bytes());
             }
 
-            // Compute per-page utilisation using actual polygon area (matches SVG density)
-            let page_util = layout_snapshot.density(instance);
+            // Reported utilisation counts each part's separation halo as consumed sheet.
+            let page_util = crate::svg_nesting::strategy::sheet_utilisation(layout_snapshot);
 
             // Always extract real placement data (cheap, and item_id values differ per page)
             let mut page_placements = Vec::new();
@@ -434,6 +434,19 @@ impl AdaptiveNestingStrategy {
             pages.iter().map(|p| p.utilisation).sum::<f32>() / pages.len() as f32
         };
 
+        // Material yield: bare outlines, spacing as waste. Kept separate because the optimiser's
+        // early-stop threshold is calibrated against it.
+        let material_utilisation = if solution.layout_snapshots.is_empty() {
+            0.0
+        } else {
+            solution
+                .layout_snapshots
+                .values()
+                .map(|ls| ls.density(instance))
+                .sum::<f32>()
+                / solution.layout_snapshots.len() as f32
+        };
+
         log::debug!("Average bin utilisation: {:.1}%", utilisation * 100.0);
 
         Ok(NestingResult {
@@ -443,6 +456,7 @@ impl AdaptiveNestingStrategy {
             total_parts_requested,
             unplaced_parts_svg: None,
             utilisation,
+            material_utilisation,
             pages,
             sheets_total_estimate: None,
         })
@@ -890,7 +904,11 @@ impl AdaptiveNestingStrategy {
         // Wall-clock safety ceiling, shared by max_fit and regular nesting. Kept
         // under the SQS visibility timeout so a job can't overrun into redelivery.
         const MAX_TOTAL_OPTIMIZATION_SECONDS: u64 = 600;
-        const HIGH_DENSITY_THRESHOLD: f32 = 0.65;
+        // Calibrated against the halo-inclusive `utilisation` (see NestingResult), not the bare
+        // material yield. 0.65 was the bar when this compared bare outlines; on the same layouts
+        // the halo-inclusive figure is higher, so the threshold moves with it — leaving it at
+        // 0.65 would stop the search sooner and pack worse.
+        const HIGH_DENSITY_THRESHOLD: f32 = 0.85;
 
         'outer: loop {
             let elapsed_total = optimization_start.elapsed().as_secs();
@@ -1036,6 +1054,7 @@ impl AdaptiveNestingStrategy {
                             total_parts_requested,
                             unplaced_parts_svg: None,
                             utilisation: 0.0,
+                            material_utilisation: 0.0,
                             pages: Vec::new(),
                             sheets_total_estimate: None,
                         });
@@ -1279,6 +1298,7 @@ impl AdaptiveNestingStrategy {
                 total_parts_requested,
                 unplaced_parts_svg: None,
                 utilisation: 0.0,
+                material_utilisation: 0.0,
                 pages: Vec::new(),
                 sheets_total_estimate: None,
             }),

@@ -2234,6 +2234,7 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
             pages: None,
             parts_placed: 0,
             utilisation: 0.0,
+                            material_utilisation: 0.0,
             is_improvement: false,
             is_final: true,
             timestamp: current_timestamp(),
