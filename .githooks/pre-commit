@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Pre-commit gate for the two crates this repo owns.
+#
+# WHY THIS EXISTS: every CI failure on this branch so far has been something a local command
+# would have caught in seconds. The last one was a text edit that inserted a field into the
+# wrong struct in jagua-sqs-processor; jagua-utils was checked, the processor was not, and it
+# took a ~30-minute CI round trip to find out.
+#
+# So this runs the SAME commands CI's `check` job runs, over BOTH crates -- never one of them.
+# Enable it once per clone (it is version-controlled, so .git/hooks is not used):
+#
+#     git config core.hooksPath .githooks
+#
+# Deliberately excluded: `make test`. It takes minutes, which is a pre-push cost, not a
+# per-commit one -- see .githooks/pre-push.
+#
+# Escape hatch for a genuine work-in-progress commit: `git commit --no-verify`.
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 1
+
+CRATES=(-p jagua-utils -p jagua-sqs-processor)
+export PATH="$HOME/.cargo/bin:$PATH"
+
+fail() {
+  echo ""
+  echo "pre-commit: $1" >&2
+  echo "pre-commit: fix it, or bypass with 'git commit --no-verify' if this is a WIP commit." >&2
+  exit 1
+}
+
+command -v cargo >/dev/null 2>&1 || fail "cargo not found on PATH"
+
+# build.rs runs typify over this file; without it every cargo invocation dies in build.rs
+# rather than reporting a real problem.
+if [[ ! -f jagua-sqs-processor/asyncapi/jagua-rs.yaml ]]; then
+  fail "jagua-sqs-processor/asyncapi/jagua-rs.yaml is missing -- run scripts/sync-schema.sh"
+fi
+
+echo "pre-commit: cargo fmt --check (jagua-utils + jagua-sqs-processor)"
+cargo fmt "${CRATES[@]}" -- --check || fail "formatting differs -- run 'make fmt'"
+
+# Clippy needs a full build, and jagua-sqs-processor compiles librdkafka from C source -- so it
+# needs cmake, g++ and the sasl/zlib/curl dev headers. A machine without them cannot lint the
+# processor natively, and silently linting only jagua-utils is exactly the half-check that let
+# the last breakage reach CI. So: use the native toolchain when it can do the job, fall back to
+# the container, and refuse rather than check half the workspace.
+echo "pre-commit: cargo clippy -D warnings (jagua-utils + jagua-sqs-processor)"
+if command -v cmake >/dev/null 2>&1; then
+  cargo clippy "${CRATES[@]}" --all-targets --no-deps -- -D warnings || fail "clippy failed"
+elif docker info >/dev/null 2>&1; then
+  echo "pre-commit: cmake missing -- linting in the container instead (scripts/cargo-docker.sh)"
+  scripts/cargo-docker.sh clippy "${CRATES[@]}" --all-targets --no-deps -- -D warnings \
+    || fail "clippy failed (in container)"
+else
+  fail "cannot lint jagua-sqs-processor: it needs cmake/g++/libsasl2/zlib/libcurl to build
+              librdkafka. Install cmake (brew install cmake), or start Docker so
+              scripts/cargo-docker.sh can run it. Linting only jagua-utils is NOT enough --
+              that is how a field was committed into the wrong struct in the processor."
+fi
+
+echo "pre-commit: ok"

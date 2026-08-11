@@ -11,6 +11,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Branch divergence**: `main` is the AWS SQS/ECS worker; `vk-cloud` is the Kafka + Kubernetes (VK Cloud) port. The processor sections below describe `vk-cloud`. `VK_MIGRATION_HANDOFF.md` records what is done, what is still unverified on the cluster, and a list of traps worth reading before touching the transport.
 - The crate is still **named** `jagua-sqs-processor` and its DTOs keep the `Sqs` prefix (`SqsNestingRequest`/`SqsNestingResponse`) on `vk-cloud` — only the transport was ported. Don't "fix" the names.
 
+## Before Committing (hard rule)
+
+**Never commit or push without running these over BOTH owned crates.** Every CI failure on this branch has been something one of these would have caught in seconds instead of a ~30-minute round trip (and on `vk-cloud`, a staging deploy):
+
+```bash
+make check   # fmt --check + clippy -D warnings, jagua-utils AND jagua-sqs-processor
+make test    # the broker-free suite, both crates            (before pushing)
+```
+
+Enable the hooks that enforce this — once per clone, they live in `.githooks/` so they're version-controlled:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`pre-commit` runs `make check`; `pre-push` runs `make test`. Bypass only for a deliberate WIP commit (`--no-verify`).
+
+- **Checking one crate is not enough.** A field was once committed into the wrong struct in `jagua-sqs-processor` because only `jagua-utils` had been verified. `cargo fmt` needs no build and covers both crates in seconds — there is no excuse for skipping it.
+- **`cargo check` does not cover `jagua-sqs-processor`.** It compiles librdkafka from C source; failures show up at build/link time. If `cmake` isn't installed, use `scripts/cargo-docker.sh` (the pre-commit hook falls back to it automatically).
+- Text-substitution edits across files are the main source of this class of bug — a struct-literal field name can match in an unrelated struct. Verify by building, not by reading the diff.
+
 ## Build & Test Commands
 
 ```bash

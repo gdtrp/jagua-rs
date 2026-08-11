@@ -1313,6 +1313,7 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         combined_svg: vec![],
                         unplaced_parts_svg: None,
                         utilisation: final_responses[0].utilisation,
+                        material_utilisation: final_responses[0].utilisation,
                         pages: vec![],
                         sheets_total_estimate: None,
                     };
@@ -2234,7 +2235,6 @@ fn process_request_with_timeout(request_json: &str) -> Result<Vec<SqsNestingResp
             pages: None,
             parts_placed: 0,
             utilisation: 0.0,
-                            material_utilisation: 0.0,
             is_improvement: false,
             is_final: true,
             timestamp: current_timestamp(),
