@@ -79,27 +79,32 @@ spec:
                 name: jagua-s3-secrets
           env:
             # S3 stays on AWS - only the queue moved to Kafka, the payload path
-            # did not. The REGION keeps moving though: eu-north-1, then
-            # eu-west-1, now il-central-1 (Tel Aviv) as of 2026-08-10. VK's
-            # egress block is per AWS region and the permitted set is not fixed.
+            # did not. The REGION keeps moving though: eu-north-1, eu-west-1,
+            # il-central-1, and now ap-east-1 (Hong Kong) as of 2026-08-11 —
+            # four regions in five days.
             #
-            # eu-west-1 went from 6/6 on 2026-08-07 to 10/22 on 2026-08-10,
-            # sampled every two minutes for 44 minutes from a pod here, while
-            # il-central-1, me-central-1, eu-west-2 and two non-AWS controls
-            # were 22/22 in the very same samples. Per-destination filtering,
-            # not VK egress: TCP connects fine and only the TLS handshake
-            # stalls, so a connect-only probe reports it healthy.
+            # The filtering is IP-prefix based on the Russian path and rotates by
+            # the hour. TCP connects fine and only the TLS handshake is dropped,
+            # regardless of SNI, so a connect-only probe reports a dead region as
+            # healthy. Tel Aviv measured 25/25 when we moved to it and ~2/6 twelve
+            # hours later; eu-west-1 was the failing one that evening and perfect
+            # the next morning.
             #
-            # The bucket is created by cutl-infra's cutl-relay-staging-il CDK
+            # Hong Kong is the only region that has never failed a probe, incl.
+            # the window where every other region was blocked. That is why it is
+            # here despite being the slowest of the candidates. It is a bet: the
+            # durable fix is VK Object Storage, with no cross-border path at all.
+            #
+            # The bucket is created by cutl-infra's cutl-relay-staging-hk CDK
             # stack, which derives the name from the region.
             #
             # THE BACKEND MUST POINT AT THE SAME BUCKET: it writes the input and
             # sends the object key over Kafka, so a region split turns a working
             # pipeline into NoSuchKey on every job.
             - name: S3_BUCKET
-              value: "cutl-staging-uploads-il-central-1"
+              value: "cutl-staging-uploads-ap-east-1"
             - name: AWS_REGION
-              value: "il-central-1"
+              value: "ap-east-1"
             - name: HEALTH_PORT
               value: "8080"
             # Tempo's OTLP receiver. observability.rs treats an unset value as
