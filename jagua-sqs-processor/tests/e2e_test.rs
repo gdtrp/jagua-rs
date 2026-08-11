@@ -4,6 +4,24 @@ use jagua_sqs_processor::{SqsNestingRequest, SqsNestingResponse};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Initialise logging for a test. Idempotent — the logger is global and first-init wins.
+///
+/// Defaults to `Warn` rather than `Debug`. These tests drive real nesting runs and lbf emits a
+/// DEBUG line per improving sample, so the CI job for this crate produced 700k+ log lines and
+/// GitHub truncated the log *before* the failure summary — a red build was undiagnosable from
+/// the run page. env_logger writes straight to `io::stderr()`, which bypasses libtest's per-test
+/// capture, so this output reaches the job log even for tests that pass.
+///
+/// `parse_default_env` is applied *after* the default level so `RUST_LOG=debug` still turns
+/// everything back on locally. The old call sites did the reverse (`from_default_env()` then
+/// `.filter_level(..)`), which pinned the level and made `RUST_LOG` useless.
+fn init_test_logging() {
+    let _ = env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Warn)
+        .parse_default_env()
+        .try_init();
+}
+
 /// Process a request directly (bypassing AWS SDK) and capture responses
 /// If shared_responses is provided, intermediate responses will be written there as they arrive
 /// If shared_intermediate_results is provided, intermediate NestingResults (with SVG data) will be stored there
@@ -154,9 +172,7 @@ fn process_request_direct(
 
 #[tokio::test]
 async fn test_e2e_processing() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     let test_svg = r#"<?xml version="1.0" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
@@ -220,9 +236,7 @@ async fn test_e2e_processing() -> Result<()> {
 
 #[tokio::test]
 async fn test_single_page_last_page_matches_first() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     // Test SVG that will fit on a single page
     let test_svg = r#"<?xml version="1.0" standalone="no"?>
@@ -290,9 +304,7 @@ async fn test_single_page_last_page_matches_first() -> Result<()> {
 
 #[tokio::test]
 async fn test_multiple_pages_last_page_is_set() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     // Test SVG that will require multiple pages
     let test_svg = r#"<?xml version="1.0" standalone="no"?>
@@ -356,9 +368,7 @@ async fn test_multiple_pages_last_page_is_set() -> Result<()> {
 
 #[tokio::test]
 async fn test_svg_with_circles() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     // Test SVG with circles (not paths) - this may cause parsing issues
     let test_svg = r#"<?xml version="1.0"?>
@@ -444,9 +454,7 @@ async fn test_svg_with_circles() -> Result<()> {
 
 #[tokio::test]
 async fn test_all_parts_fit_last_page_empty() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     // Test SVG with 11 circles (exact SVG from user's bug report)
     let test_svg = r#"<?xml version="1.0"?>
@@ -655,9 +663,7 @@ fn process_request_with_cancellation(
 
 #[tokio::test]
 async fn test_cancellation_request_handling() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::Client as S3Client;
@@ -733,9 +739,7 @@ async fn test_cancellation_request_handling() -> Result<()> {
 
 #[tokio::test]
 async fn test_optimization_cancellation_during_execution() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -829,9 +833,7 @@ async fn test_optimization_cancellation_during_execution() -> Result<()> {
 
 #[tokio::test]
 async fn test_cancellation_before_optimization_starts() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -897,9 +899,7 @@ async fn test_cancellation_before_optimization_starts() -> Result<()> {
 
 #[tokio::test]
 async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1025,9 +1025,7 @@ async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> 
 
 #[tokio::test]
 async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1146,9 +1144,7 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
 
 #[tokio::test]
 async fn test_e2e_processing_dr_svg() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .try_init();
+    init_test_logging();
 
     // Load dr.svg from testdata directory
     let dr_svg = include_str!("testdata/dr.svg");
@@ -1583,9 +1579,7 @@ fn test_parse_and_serialize_dr_svg() -> Result<()> {
 
 #[tokio::test]
 async fn test_e2e_processing_custom_svg() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .try_init();
+    init_test_logging();
     // Test with a closed polygon using H, V, and A commands
     // This is a rounded rectangle: starts at top-left, goes right with arc at top-right,
     // down with arc at bottom-right, left with arc at bottom-left, up with arc at top-left
@@ -2005,9 +1999,7 @@ async fn test_execution_timeout() -> Result<()> {
     use std::time::Duration;
     use tokio::time::Instant;
 
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
+    init_test_logging();
 
     // Set timeout to 5 seconds for this test
     std::env::set_var("EXECUTION_TIMEOUT_SECS", "5");
@@ -2271,9 +2263,7 @@ async fn test_complex_svg_timeout() -> Result<()> {
     use std::time::Duration;
     use tokio::time::Instant;
 
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .try_init();
+    init_test_logging();
 
     // Set timeout to 2 minutes for complex SVG processing
     std::env::set_var("EXECUTION_TIMEOUT_SECS", "120");
@@ -2357,9 +2347,7 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
     use std::fs;
     use std::path::PathBuf;
 
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .try_init();
+    init_test_logging();
 
     // Load SVGs from testdata/
     let dr_svg = include_bytes!("testdata/dr.svg").to_vec();
@@ -2583,9 +2571,7 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
     use std::fs;
     use std::path::PathBuf;
 
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .try_init();
+    init_test_logging();
 
     let dnishche_svg = include_bytes!("testdata/dnishche.svg").to_vec();
     let bokovaya_svg = include_bytes!("testdata/bokovaya_panel.svg").to_vec();
@@ -2822,9 +2808,7 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
 /// the test helper mirrors the production processor branching.
 #[test]
 fn test_max_fit_legacy_single_part_returns_one_page() -> Result<()> {
-    let _ = env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .try_init();
+    init_test_logging();
 
     let fork_svg = include_bytes!("testdata/fork.svg");
     let svg_b64 = general_purpose::STANDARD.encode(fork_svg);
