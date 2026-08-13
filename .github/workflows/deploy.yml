@@ -152,6 +152,19 @@ jobs:
           registry: ${{ env.VK_REGISTRY }}
           username: ${{ secrets.VK_REGISTRY_USER }}
           password: ${{ secrets.VK_REGISTRY_PASSWORD }}
+      # The PRODUCTION VK registry. MUST be here in build-vk, not only in
+      # build-prod: this job pushes production tags when VK_PROD_ENABLED is set,
+      # and build-prod does not run on the vk-cloud branch. Without it the push
+      # reaches a registry it never authenticated to and fails 401 Unauthorized
+      # AFTER the staging push has already succeeded, which reads like a registry
+      # fault rather than a missing login.
+      - name: docker login to the production VK registry
+        if: vars.VK_PROD_ENABLED == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.VK_PROD_REGISTRY }}
+          username: ${{ secrets.VK_PROD_REGISTRY_USER }}
+          password: ${{ secrets.VK_PROD_REGISTRY_PASSWORD }}
       - name: Build, tag, and push jagua image (VK)
         env:
           VK_PROD_ENABLED: ${{ vars.VK_PROD_ENABLED }}
