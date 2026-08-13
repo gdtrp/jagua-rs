@@ -35,17 +35,14 @@ env:
   # Not an oversight: CutlEnvironmentStack.java:1028 records that "Jagua
   # processor stays on x86_64 due to build issues with ARM", so its ECS task is
   # already x86_64, and VK worker nodes are amd64 too. Nothing here wants arm64.
-  VK_REGISTRY: registry.staging.cutl.online
-  VK_IMAGE: jagua-sqs-processor
-  # ─────────────── VK Cloud production ───────────────
-  # A SECOND VK PROJECT with its own cluster and its own registry (ADR-001: the
-  # router quota is one per project, so the environments cannot share one).
+  # ONE REGISTRY FOR THE ESTATE, owned by the production cluster and consumed by
+  # staging too. Staging used to run its own at registry.staging.cutl.online;
+  # that was removed, so this name is the only one that resolves to a registry.
   #
-  # deploy-vk-production is gated on the repository VARIABLE VK_PROD_ENABLED
-  # being exactly 'true', not on an env: key — job-level `if:` can read `vars.*`
-  # but not `env.*`, so the switch is a toggle in the GitHub UI rather than a
-  # commit, and it is OFF until the variable is created.
-  VK_PROD_REGISTRY: registry.cutl.online
+  # VK_REGISTRY_USER / VK_REGISTRY_PASSWORD therefore hold the PRODUCTION
+  # registry's credentials, at repository scope, for both environments' jobs.
+  VK_REGISTRY: registry.cutl.online
+  VK_IMAGE: jagua-sqs-processor
   # Pushing this branch builds and rolls the VK cluster without touching ECR or
   # main, so the platform can be exercised before any of it merges.
   VK_DEPLOY_BRANCH: vk-cloud
@@ -152,19 +149,6 @@ jobs:
           registry: ${{ env.VK_REGISTRY }}
           username: ${{ secrets.VK_REGISTRY_USER }}
           password: ${{ secrets.VK_REGISTRY_PASSWORD }}
-      # The PRODUCTION VK registry. MUST be here in build-vk, not only in
-      # build-prod: this job pushes production tags when VK_PROD_ENABLED is set,
-      # and build-prod does not run on the vk-cloud branch. Without it the push
-      # reaches a registry it never authenticated to and fails 401 Unauthorized
-      # AFTER the staging push has already succeeded, which reads like a registry
-      # fault rather than a missing login.
-      - name: docker login to the production VK registry
-        if: vars.VK_PROD_ENABLED == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.VK_PROD_REGISTRY }}
-          username: ${{ secrets.VK_PROD_REGISTRY_USER }}
-          password: ${{ secrets.VK_PROD_REGISTRY_PASSWORD }}
       - name: Build, tag, and push jagua image (VK)
         env:
           VK_PROD_ENABLED: ${{ vars.VK_PROD_ENABLED }}
@@ -175,7 +159,7 @@ jobs:
           # PRODUCTION registry only - it must never reach into staging's.
           PROD_TAGS=""
           if [ "${VK_PROD_ENABLED:-}" = "true" ]; then
-            PROD_TAGS="-t $VK_PROD_REGISTRY/$VK_IMAGE:$IMAGE_TAG -t $VK_PROD_REGISTRY/$VK_IMAGE:production"
+            PROD_TAGS="-t $VK_REGISTRY/$VK_IMAGE:$IMAGE_TAG -t $VK_REGISTRY/$VK_IMAGE:production"
           fi
           # Cache ref lives in the VK registry so the feature branch needs no
           # ECR credentials at all.
@@ -397,16 +381,6 @@ jobs:
           registry: ${{ env.VK_REGISTRY }}
           username: ${{ secrets.VK_REGISTRY_USER }}
           password: ${{ secrets.VK_REGISTRY_PASSWORD }}
-      # The PRODUCTION VK registry, so this one build reaches it directly.
-      # Repository-scope secrets rather than the production-vk environment's:
-      # this job must not sit behind that environment's approval gate.
-      - name: docker login to the production VK registry
-        if: vars.VK_PROD_ENABLED == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.VK_PROD_REGISTRY }}
-          username: ${{ secrets.VK_PROD_REGISTRY_USER }}
-          password: ${{ secrets.VK_PROD_REGISTRY_PASSWORD }}
       - name: Build, tag, and push jagua image (production)
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -420,7 +394,7 @@ jobs:
           # so artifact identity is preserved exactly as a copy would.
           PROD_TAGS=""
           if [ "${VK_PROD_ENABLED:-}" = "true" ]; then
-            PROD_TAGS="-t $VK_PROD_REGISTRY/$VK_IMAGE:$IMAGE_TAG -t $VK_PROD_REGISTRY/$VK_IMAGE:production"
+            PROD_TAGS="-t $VK_REGISTRY/$VK_IMAGE:$IMAGE_TAG -t $VK_REGISTRY/$VK_IMAGE:production"
           fi
           # Layer cache lives as :buildcache-prod in the same ECR repo (kept
           # separate from staging so the two pipelines don't evict each
@@ -523,20 +497,6 @@ jobs:
           curl -sSLo /tmp/kubectl https://dl.k8s.io/release/v1.34.2/bin/linux/amd64/kubectl
           sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
 
-      # OPTIONAL, and only needed while registry.cutl.online has no A record.
-      # The production build-out deliberately creates no public DNS, so if the
-      # registry hostname does not resolve yet, set the VK_PROD_REGISTRY_IP
-      # environment secret to the ingress floating IP and this bridges the gap.
-      # Leave it unset once the record exists.
-      - name: resolve the production registry, if it has no DNS record yet
-        env:
-          VK_PROD_REGISTRY_IP: ${{ secrets.VK_PROD_REGISTRY_IP }}
-        run: |
-          set -euo pipefail
-          if [ -n "${VK_PROD_REGISTRY_IP:-}" ]; then
-            echo "${VK_PROD_REGISTRY_IP} ${VK_PROD_REGISTRY}" | sudo tee -a /etc/hosts
-          fi
-
       # NOTHING HERE TOUCHES THE STAGING REGISTRY. build-prod already pushed this
       # sha straight to the production registry, so this job only talks to
       # production: its registry, its cluster, its secrets.
@@ -604,7 +564,7 @@ jobs:
 
       - name: render + apply manifests
         env:
-          IMAGE: ${{ env.VK_PROD_REGISTRY }}/${{ env.VK_IMAGE }}:${{ github.sha }}
+          IMAGE: ${{ env.VK_REGISTRY }}/${{ env.VK_IMAGE }}:${{ github.sha }}
           DEPLOYMENT_ENV: production
           GIT_SHA: ${{ github.sha }}
         run: |
