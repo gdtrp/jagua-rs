@@ -1,0 +1,61 @@
+# CURRENTLY IDENTICAL TO service-staging.yaml, and that is expected: a Service is
+# a name, a port and a selector, none of which differ by environment. It exists
+# as its own file so the production deploy job renders one consistent
+# `-production.yaml` set across all four app repos. If you change one, change
+# both.
+#
+# Headless, and NOT referenced by any Ingress. jagua is an internal worker:
+# nothing outside the cluster addresses it, and cutl-infra's Ingresses only know
+# about `frontend`, `frontend-ru` and `backend`. This Service exists so the
+# probes have a stable name and so the ServiceMonitor below has something to
+# select.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jagua
+  namespace: cutl
+  labels:
+    app.kubernetes.io/name: jagua
+    app.kubernetes.io/part-of: cutl
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: jagua
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+# NOTE: this scrapes /metrics, which the binary DOES NOT SERVE YET — it exposes
+# only /health and /ready. The target will show as down in Prometheus until a
+# metrics endpoint exists, which is honest and visible, rather than the reverse
+# failure where an endpoint is served and silently scraped by nobody.
+#
+# THIS MATTERS MORE IN PRODUCTION THAN IN STAGING.
+# `cutl_retries_exhausted_total` is the alert that replaces the dead-letter
+# queue (cutl-infra modules-vk/observability), so this worker MUST emit it
+# before production traffic arrives: with no DLQ and no metric, a nesting
+# message that exhausts its retry ladder leaves no record anywhere that it
+# existed. Treat this as a cutover blocker rather than a nice-to-have.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: jagua
+  namespace: cutl
+  labels:
+    # The operator ignores ServiceMonitors without its release label — the same
+    # trap that left ingress-nginx's metrics invisible in T6.
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jagua
+  namespaceSelector:
+    matchNames:
+      - cutl
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

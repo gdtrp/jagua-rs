@@ -1,0 +1,193 @@
+# jagua-nesting is an INTERNAL worker. It has no Ingress and no public
+# hostname: nothing outside the cluster addresses it, and work reaches it over
+# the message bus. The Service alongside this exists only so Prometheus has
+# something to select — it is not a traffic path.
+#
+# Derived from deployment-staging.yaml. Read that file for the reasoning behind
+# the probes and the resource shape, which are unchanged here. Two things differ
+# and both are explained below: the replica count and the rollout strategy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jagua
+  namespace: cutl
+  labels:
+    app.kubernetes.io/name: jagua
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: cutl
+spec:
+  # TWO, where staging runs one and RFC-001 section 14 sized this at one pod.
+  # That is a deliberate change of assumption, so here is why it is safe.
+  #
+  # Staging's Recreate comment calls a nesting job "long-running and
+  # single-owner". Single-owner is a property of the MESSAGE, and Kafka's
+  # partition assignment is what provides it: within one consumer group a
+  # partition has exactly one owner at a time, so no two pods ever receive the
+  # same message. It is not a statement that the process is a singleton.
+  #
+  # Checked rather than assumed, in jagua-sqs-processor/src/kafka.rs: an ordinary
+  # StreamConsumer group with enable.auto.commit=false and offsets committed
+  # through a contiguous-completed watermark, which is per-partition state held
+  # by whichever process owns that partition. There is no leader election, no
+  # advisory lock and no shared cursor for a second member to corrupt.
+  #
+  # The nesting topics carry 3 partitions, so two members split them 2/1 and
+  # neither sits idle. Do not raise this above 3 without raising the partition
+  # count first — a fourth member would join the group and never be assigned
+  # anything.
+  replicas: 2
+  # ROLLINGUPDATE WITH maxSurge: 0, where staging uses Recreate.
+  #
+  # Staging's concern is "two replicas of DIFFERENT VERSIONS competing for the
+  # same messages during a rollout". maxSurge: 0 is what removes that: the group
+  # never grows beyond its steady-state size, so a new-version pod only joins
+  # after an old-version pod has fully left. Two versions are never members at
+  # the same instant.
+  #
+  # What it buys over Recreate is that one pod keeps consuming throughout. With
+  # no dead-letter topic anywhere in the estate, a deploy that stops the whole
+  # group is a window where nesting requests pile up against a 96h retention and
+  # nothing is draining them.
+  #
+  # Do not raise maxSurge. A surge pod is exactly the second-version member the
+  # staging comment warns about.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jagua
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jagua
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: cutl
+    spec:
+      imagePullSecrets:
+        # Created by cutl-infra modules-vk/k8s-workload kubernetes_secret.image_pull.
+        - name: registry-pull
+      # A nesting run can be minutes long. The default 30s would SIGKILL a job
+      # mid-flight on every rollout, losing the work with no record of it — and
+      # since retries are the only recovery (there is no DLQ, RFC-001), that is
+      # a silent loss. main.rs handles SIGTERM and drains via the shutdown
+      # channel; this gives it room to finish.
+      #
+      # With maxUnavailable 1 the pods drain one after the other, so a worst-case
+      # rollout is two full grace periods rather than one.
+      terminationGracePeriodSeconds: 600
+      # Both replicas on one node would be the appearance of redundancy without
+      # the substance. Preferred rather than required, so a mid-scale-up cluster
+      # gets a co-located pod rather than a Pending one.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: jagua
+      containers:
+        - name: jagua
+          # ${IMAGE} is substituted by envsubst in the deploy workflow.
+          image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            # Postgres/Valkey/Kafka bootstrap, written by cutl-infra
+            # modules-vk/k8s-workload kubernetes_secret.cutl_env.
+            - secretRef:
+                name: cutl-env
+            # This worker's OWN Kafka SCRAM credentials, copied into this
+            # namespace per consumer group by modules-vk/kafka-credentials.
+            # Mounting only its own group is the point of the per-group users:
+            # jagua cannot read another worker's topics.
+            #
+            # Consumed directly as env vars by KafkaSettings::from_env — the key
+            # names are already env-var shaped so nothing needs parsing.
+            - secretRef:
+                name: kafka-jagua-nesting
+            # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for S3.
+            #
+            # WHY THIS IS NEEDED, when the ECS task ran without it: on Fargate
+            # the task ROLE supplied credentials and the ECS agent injected
+            # AWS_CONTAINER_CREDENTIALS_RELATIVE_URI so the SDK fetched
+            # short-lived credentials from 169.254.170.2. VK has no ECS agent, no
+            # instance profile and no IRSA, so the credential chain finds nothing
+            # — which is exactly what this pod printed at startup on the first VK
+            # run: `AWS_ACCESS_KEY_ID: Err(NotPresent)`.
+            #
+            # Built by this repo's deploy workflow from the VK_S3_SECRETS GitHub
+            # Environment secret. Deliberately NOT cutl-env: that Secret is
+            # Terraform-owned and platform-derived only.
+            - secretRef:
+                name: jagua-s3-secrets
+          env:
+            # S3 stays on AWS — only the queue moved to Kafka, the payload path
+            # did not. ap-east-1 (Hong Kong) because VK's egress filtering is per
+            # AWS REGION and IP-prefix based on the Russian path: eu-north-1,
+            # where every other production bucket lives, measured 0/6 from a pod.
+            # TCP connects fine and only the TLS handshake is dropped regardless
+            # of SNI, so a connect-only probe reports a dead region as healthy.
+            #
+            # A SEPARATE BUCKET FROM STAGING'S: staging's stack is
+            # RemovalPolicy.DESTROY with autoDeleteObjects. Created by
+            # cutl-infra's cutl-relay-production-hk stack, which is RETAIN.
+            #
+            # THE BACKEND MUST POINT AT THE SAME BUCKET: it writes the input and
+            # sends the object key over Kafka, so a region split turns a working
+            # pipeline into NoSuchKey on every job.
+            - name: S3_BUCKET
+              value: "cutl-production-uploads-ap-east-1"
+            - name: AWS_REGION
+              value: "ap-east-1"
+            - name: HEALTH_PORT
+              value: "8080"
+            # Tempo's OTLP receiver. observability.rs treats an unset value as
+            # "log to stdout only" rather than an error, so local and ECS runs
+            # are unaffected.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://tempo.monitoring.svc.cluster.local:4318"
+            - name: RUST_LOG
+              value: "info"
+            - name: DEPLOYMENT_ENV
+              value: "${DEPLOYMENT_ENV}"
+            - name: GIT_SHA
+              value: "${GIT_SHA}"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # Without these a wedged worker keeps its pod Ready forever and just
+          # stops consuming.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            # /health answers as long as the process is alive and is NOT gated
+            # on readiness state. Deliberate: a failing dependency should stop
+            # traffic, not trigger a restart loop that cannot fix it.
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            # Staging's measured shape, carried forward deliberately: production
+            # request sizing comes from measurement once this cluster has run
+            # real traffic. Nesting is CPU-bound but the process is small — Rust,
+            # no JVM heap to reserve — so this is the cheapest of the four
+            # services to run at two replicas.
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: "1000m"
+              memory: 1Gi
