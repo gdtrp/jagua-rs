@@ -185,8 +185,25 @@ spec:
             # real traffic. Nesting is CPU-bound but the process is small — Rust,
             # no JVM heap to reserve — so this is the cheapest of the four
             # services to run at two replicas.
+            # RIGHT-SIZED FROM MEASUREMENT, 2026-08-13. Was 500m, carried over
+            # from staging as a placeholder.
+            #
+            # AWS production ECS, 30 days of REAL traffic: average CPU
+            # utilisation 0.19-0.36% of allocation, with spikes to 100%. So the
+            # typical need is single-digit millicores and the burst is a full
+            # core. Requests are a SCHEDULING FLOOR for the typical case; the
+            # 1500m limit is what covers the spike, and it is unchanged.
+            #
+            # 500m across ten application pods reserved 5 CPU the workloads never
+            # used, which forced a fifth node and still tripped
+            # KubeCPUOvercommit at four. At 250m the cluster tolerates losing a
+            # node on four, so the autoscaler's scale-down stops fighting the
+            # alert.
+            #
+            # Not lower: 200m gains nothing (three nodes still cannot carry the
+            # set) and JVM startup genuinely wants headroom.
             requests:
-              cpu: 500m
+              cpu: 250m
               memory: 256Mi
             limits:
               cpu: "1000m"
