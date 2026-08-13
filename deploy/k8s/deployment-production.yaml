@@ -185,25 +185,24 @@ spec:
             # real traffic. Nesting is CPU-bound but the process is small — Rust,
             # no JVM heap to reserve — so this is the cheapest of the four
             # services to run at two replicas.
-            # RIGHT-SIZED FROM MEASUREMENT, 2026-08-13. Was 500m, carried over
-            # from staging as a placeholder.
+            # 500m, DELIBERATELY GENEROUS, not a measured figure.
             #
-            # AWS production ECS, 30 days of REAL traffic: average CPU
-            # utilisation 0.19-0.36% of allocation, with spikes to 100%. So the
-            # typical need is single-digit millicores and the burst is a full
-            # core. Requests are a SCHEDULING FLOOR for the typical case; the
-            # 1500m limit is what covers the spike, and it is unchanged.
+            # Measurement says it could be far lower: thirty days of AWS
+            # production ECS shows average CPU utilisation of 0.19-0.36% of
+            # allocation. But average is the wrong statistic to provision on when
+            # the same metric peaks at 100%, and VK production has not yet served
+            # real traffic - so this keeps headroom rather than trusting an idle
+            # baseline.
             #
-            # 500m across ten application pods reserved 5 CPU the workloads never
-            # used, which forced a fifth node and still tripped
-            # KubeCPUOvercommit at four. At 250m the cluster tolerates losing a
-            # node on four, so the autoscaler's scale-down stops fighting the
-            # alert.
+            # The cost is capacity, and it is paid explicitly: ten application
+            # pods at 500m need five nodes to tolerate losing one, which is why
+            # node_min_count is 5 in cutl-infra environments/production-vk rather
+            # than letting the autoscaler drop to four and trip
+            # KubeCPUOvercommit. Requests and the node floor have to agree.
             #
-            # Not lower: 200m gains nothing (three nodes still cannot carry the
-            # set) and JVM startup genuinely wants headroom.
+            # Revisit together, once there is real traffic to measure.
             requests:
-              cpu: 250m
+              cpu: 500m
               memory: 256Mi
             limits:
               cpu: "1000m"
