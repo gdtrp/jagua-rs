@@ -1,0 +1,335 @@
+name: Validate jagua on VK staging
+
+# Manual, read-only-by-default validation of the deployed worker (VK migration T9).
+#
+# WHY THIS EXISTS: the VK API's bearer token is a project-scoped Keystone token
+# that expires quickly, so a laptop's kubeconfig goes stale within hours and
+# re-authenticating means holding the VKCS credentials locally. This workflow
+# already runs where those secrets live, so validation can be driven from CI
+# without any credential leaving GitHub — and without a cutl-infra checkout.
+#
+# Everything is read-only unless `send_test_message` is set. See the warning on
+# that input before enabling it.
+
+on:
+  # A push trigger as well as workflow_dispatch, because GitHub only exposes
+  # workflow_dispatch for workflows that exist on the DEFAULT branch — and this
+  # one lives on vk-cloud until the migration merges. Touching the trigger file
+  # runs it; its contents select the mode (see `read mode` below), which is how
+  # the dispatch inputs are approximated until this reaches main.
+  push:
+    branches: [vk-cloud]
+    paths:
+      - '.github/validate.trigger'
+      - '.github/workflows/validate-vk.yml'
+  workflow_dispatch:
+    inputs:
+      send_test_message:
+        description: >-
+          Produce a real nesting request. WARNING: S3 eu-north-1 is unreachable
+          from VK until the relay exists, so the job WILL fail its upload, walk
+          all three retry tiers, and fire CutlRetriesExhausted (severity:
+          critical). Leave false for a read-only check.
+        type: boolean
+        default: false
+      cancel_only:
+        description: >-
+          Produce a cancellation message instead. Exercises consume, keying, the
+          inline cancel path and the offset commit without touching S3, so it
+          cannot trigger the alert.
+        type: boolean
+        default: false
+
+env:
+  NS: cutl
+  KAFKA_NS: kafka
+
+jobs:
+  validate:
+    name: Validate
+    # Same concurrency group as deploy-vk-staging. A push to vk-cloud triggers
+    # both workflows at once, and without this the validation grabs a pod name
+    # that the rollout then replaces underneath it — every later step fails with
+    # "pods not found", which reads like a broken cluster rather than a race.
+    concurrency:
+      group: jagua-vk-staging-deploy
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Normalises the two trigger paths into one MODE, so every step below has a
+      # single thing to branch on.
+      #   readonly — inspect only, touches nothing (the default, and the safe one)
+      #   cancel   — produce a cancellation; exercises the transport, never S3
+      #   full     — produce a real nesting request; WILL fire CutlRetriesExhausted
+      - name: read mode
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.send_test_message }}" = "true" ]; then MODE=full
+            elif [ "${{ inputs.cancel_only }}" = "true" ]; then MODE=cancel
+            else MODE=readonly; fi
+          else
+            MODE=$(grep -oE '^mode=(readonly|cancel|full)' .github/validate.trigger 2>/dev/null | cut -d= -f2 | tail -1)
+            MODE=${MODE:-readonly}
+          fi
+          echo "MODE=$MODE" >> "$GITHUB_ENV"
+          echo "validation mode: $MODE"
+
+      - name: install kubectl
+        run: |
+          set -euo pipefail
+          curl -sSLo /tmp/kubectl https://dl.k8s.io/release/v1.34.2/bin/linux/amd64/kubectl
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+      # Identical to the deploy job's auth: a project-scoped VK Keystone token IS
+      # the Kubernetes API bearer token.
+      - name: build kubeconfig from Keystone token
+        env:
+          VKCS_AUTH_URL:   ${{ secrets.VKCS_AUTH_URL }}
+          VKCS_USERNAME:   ${{ secrets.VKCS_USERNAME }}
+          VKCS_PASSWORD:   ${{ secrets.VKCS_PASSWORD }}
+          VKCS_PROJECT_ID: ${{ secrets.VKCS_PROJECT_ID }}
+          VK_K8S_ENDPOINT: ${{ secrets.VK_K8S_ENDPOINT }}
+          VK_K8S_CA:       ${{ secrets.VK_K8S_CA }}
+        run: |
+          set -euo pipefail
+          token=$(curl -sS -D - -o /dev/null -X POST "${VKCS_AUTH_URL%/}/auth/tokens" \
+            -H "Content-Type: application/json" \
+            -d "{\"auth\":{\"identity\":{\"methods\":[\"password\"],\"password\":{\"user\":{\"name\":\"${VKCS_USERNAME}\",\"domain\":{\"name\":\"users\"},\"password\":\"${VKCS_PASSWORD}\"}}},\"scope\":{\"project\":{\"id\":\"${VKCS_PROJECT_ID}\"}}}}" \
+            | grep -i '^x-subject-token:' | tr -d '\r' | awk '{print $2}')
+          if [ -z "$token" ]; then
+            echo "::error::Failed to obtain a Keystone token (check VKCS_* secrets)."
+            exit 1
+          fi
+          echo "::add-mask::$token"
+
+          mkdir -p "$HOME/.kube"
+          cat > "$HOME/.kube/config" <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: vk
+            cluster:
+              server: ${VK_K8S_ENDPOINT}
+              certificate-authority-data: ${VK_K8S_CA}
+          contexts:
+          - name: vk
+            context:
+              cluster: vk
+              user: vk
+              namespace: cutl
+          current-context: vk
+          users:
+          - name: vk
+            user:
+              token: ${token}
+          EOF
+          chmod 600 "$HOME/.kube/config"
+
+      - name: 1. Deployment and pod state
+        run: |
+          set -uo pipefail
+          kubectl -n "$NS" get deploy jagua -o wide || true
+          echo
+          kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua -o wide || true
+          echo
+          POD=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          echo "POD=$POD" | tee -a "$GITHUB_ENV"
+          [ -n "$POD" ] || { echo "::error::no jagua pod found"; exit 1; }
+          echo "image:    $(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[0].image}')"
+          echo "ready:    $(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].ready}')"
+          echo "restarts: $(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+
+      # A restart count above zero here is the T9 regression signal: the whole
+      # point of the change is that a dependency problem withholds readiness
+      # instead of crash-looping.
+      - name: 2. Startup logs (Kafka connect, subscribe, tiers)
+        run: |
+          set -uo pipefail
+          POD=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n "$NS" logs "$POD" --tail=120 \
+            | grep -iE "Starting|KAFKA_|S3_BUCKET|Connected to Kafka|Consuming topic|Tier [0-9] consumer started|health endpoints|OTLP|ERROR|panic" \
+            || echo "(no matching lines)"
+
+      - name: 3. /ready and /metrics
+        run: |
+          set -uo pipefail
+          POD=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua -o jsonpath='{.items[0].metadata.name}')
+          echo "--- readiness condition ---"
+          kubectl -n "$NS" get pod "$POD" \
+            -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
+          # port-forward rather than a curl pod: the cluster cannot reach Docker
+          # Hub (TLS handshake timeouts — which is why every image in this repo
+          # comes from mirror.gcr.io), so `kubectl run --image=curlimages/curl`
+          # sits in ImagePullBackOff. Forwarding pulls nothing and curls from the
+          # runner instead.
+          echo "--- /metrics ---"
+          kubectl -n "$NS" port-forward "pod/$POD" 18080:8080 >/tmp/pf.log 2>&1 &
+          PF=$!
+          for i in $(seq 1 20); do
+            curl -sf --max-time 2 http://127.0.0.1:18080/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          echo "/health  -> $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:18080/health)"
+          echo "/ready   -> $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:18080/ready)"
+          echo "--- series ---"
+          curl -sS --max-time 20 http://127.0.0.1:18080/metrics \
+            | grep -E "^cutl_retries_exhausted_total|^jagua_messages_consumed_total|^jagua_messages_failed_total|^jagua_inflight_jobs|^jagua_retry_republished_total" \
+            || echo "::warning::could not scrape /metrics"
+          kill $PF 2>/dev/null || true
+
+      # The broker's only listener is SASL_PLAINTEXT + SCRAM-SHA-512 (tls = false,
+      # port 9092), so the Kafka CLI tools need --command-config or every call
+      # dies on FIND_COORDINATOR with a node-assignment timeout that looks like a
+      # broker fault. Credentials come from the Secret already in the cluster —
+      # the same one the worker mounts — so nothing extra is stored anywhere.
+      - name: 4. Kafka client config + consumer groups
+        run: |
+          set -uo pipefail
+          KPOD=$(kubectl -n "$KAFKA_NS" get pods -l strimzi.io/name=cutl-dual-role \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -z "$KPOD" ]; then
+            KPOD=$(kubectl -n "$KAFKA_NS" get pods -o name 2>/dev/null | grep -m1 -E "kafka|dual-role" | cut -d/ -f2 || true)
+          fi
+          echo "kafka pod: ${KPOD:-<none>}"
+          [ -n "$KPOD" ] || { echo "::warning::no kafka pod found"; exit 0; }
+          echo "KPOD=$KPOD" >> "$GITHUB_ENV"
+
+          KU=$(kubectl -n "$NS" get secret kafka-jagua-nesting -o jsonpath='{.data.KAFKA_USERNAME}' | base64 -d)
+          KP=$(kubectl -n "$NS" get secret kafka-jagua-nesting -o jsonpath='{.data.KAFKA_PASSWORD}' | base64 -d)
+          echo "::add-mask::$KP"
+          echo "scram user: $KU"
+
+          cat > /tmp/client.properties <<EOF
+          security.protocol=SASL_PLAINTEXT
+          sasl.mechanism=SCRAM-SHA-512
+          sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="$KU" password="$KP";
+          EOF
+          kubectl -n "$KAFKA_NS" cp /tmp/client.properties "$KPOD:/tmp/client.properties" -c kafka
+
+          for g in jagua-nesting jagua-nesting-retry-1 jagua-nesting-retry-2 jagua-nesting-retry-3; do
+            echo "--- group $g ---"
+            kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- \
+              bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+              --command-config /tmp/client.properties \
+              --describe --group "$g" 2>&1 | grep -vE "^\s*$" | head -8 || echo "(unavailable)"
+          done
+
+      - name: 5. ServiceMonitor target
+        run: |
+          set -uo pipefail
+          kubectl -n "$NS" get servicemonitor jagua -o yaml 2>/dev/null \
+            | grep -E "path:|port:|interval:|release:" || echo "(no ServiceMonitor)"
+
+      # ── Test traffic (opt-in) ──
+      #
+      # Produced from inside the Kafka pod so no SCRAM credential has to be
+      # extracted: the broker's own PLAINTEXT replication listener is reachable
+      # on localhost there. Keyed by correlationId, which is mandatory — an
+      # unkeyed request cannot be cancelled, because the cancel would be free to
+      # land on a different partition.
+      - name: 7. Produce a test message
+        if: env.MODE != 'readonly'
+        run: |
+          set -uo pipefail
+          # Wait for the group to have a live member before producing.
+          #
+          # auto.offset.reset=latest means a consumer with no committed offset
+          # starts at the log end, so a message produced while it is still joining
+          # is skipped rather than queued. That only bites a group that has never
+          # committed — after the first commit a restart resumes from it — but a
+          # freshly deployed worker is exactly that case, and the symptom is a test
+          # message that vanishes with no error anywhere.
+          echo "waiting for a live member in group jagua-nesting..."
+          for i in $(seq 1 30); do
+            if kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- \
+                 bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+                 --command-config /tmp/client.properties --describe --group jagua-nesting 2>/dev/null \
+                 | grep -q rdkafka; then
+              echo "group has a member after ${i}s"; break
+            fi
+            sleep 2
+          done
+
+          CID="t9-validate-${GITHUB_RUN_ID}"
+          echo "CID=$CID" >> "$GITHUB_ENV"
+
+          # A distinctive trace id so the propagation assertion is unambiguous.
+          TP="00-$(printf '%032x' $((GITHUB_RUN_ID)) )-00f067aa0ba902b7-01"
+          echo "traceparent: $TP"
+          echo "TP=$TP" >> "$GITHUB_ENV"
+
+          if [ "$MODE" = "cancel" ]; then
+            BODY="{\"correlationId\":\"$CID\",\"cancelled\":true,\"binWidth\":null,\"binHeight\":null,\"spacing\":null,\"parts\":null}"
+          else
+            SVG=$(printf '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><path d="M0,0 L100,0 L100,150 L0,150 Z"/></svg>' | base64 -w0)
+            BODY="{\"correlationId\":\"$CID\",\"svgBase64\":\"$SVG\",\"binWidth\":600,\"binHeight\":600,\"spacing\":2,\"amountOfParts\":4,\"amountOfRotations\":4}"
+          fi
+
+          printf 'traceparent:%s\t%s|%s\n' "$TP" "$CID" "$BODY" > /tmp/line.txt
+          kubectl -n "$KAFKA_NS" cp /tmp/line.txt "$KPOD:/tmp/line.txt" -c kafka
+          kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- bash -c \
+            'bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic nesting-request \
+               --producer.config /tmp/client.properties \
+               --property parse.key=true --property key.separator="|" \
+               --property parse.headers=true --property headers.key.separator=: < /tmp/line.txt'
+          echo "produced $CID"
+
+      - name: 8. Worker logs for the test message
+        if: env.MODE != 'readonly'
+        run: |
+          set -uo pipefail
+          sleep 45
+          POD=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n "$NS" logs "$POD" --tail=200 | grep -iE "$CID|nesting.handle|Tier [0-9]|RETRIES EXHAUSTED|Republished" | tail -40 \
+            || echo "(nothing yet)"
+
+      - name: 9. Response on nesting-response (key + traceparent)
+        if: env.MODE != 'readonly'
+        run: |
+          set -uo pipefail
+          kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- bash -c \
+            'timeout 40 bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+               --consumer.config /tmp/client.properties \
+               --topic nesting-response --from-beginning \
+               --property print.headers=true --property print.key=true 2>/dev/null' \
+            | grep "$CID" | head -3 | cut -c1-400 \
+            || echo "::warning::no response observed for $CID"
+
+      # The whole ladder takes ~11 minutes (5s + 1m + 10m), so this only reports
+      # where it has got to rather than waiting it out.
+      - name: 10. Retry ladder and exhaustion counter
+        if: env.MODE == 'full'
+        run: |
+          set -uo pipefail
+          for t in jagua-nesting-retry-1 jagua-nesting-retry-2 jagua-nesting-retry-3; do
+            echo "--- $t ---"
+            kubectl -n "$KAFKA_NS" exec "$KPOD" -c kafka -- bash -c \
+              "timeout 20 bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+                 --consumer.config /tmp/client.properties \
+                 --topic $t --from-beginning --property print.headers=true 2>/dev/null" \
+              | grep "$CID" | head -2 | cut -c1-240 || echo "(none yet)"
+          done
+          echo "--- exhaustion counter ---"
+          POD=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=jagua -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n "$NS" port-forward "pod/$POD" 18081:8080 >/tmp/pf2.log 2>&1 &
+          PF=$!
+          for i in $(seq 1 20); do
+            curl -sf --max-time 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -sS --max-time 20 http://127.0.0.1:18081/metrics \
+            | grep -E "^cutl_retries_exhausted_total|^jagua_retry_republished_total|^jagua_messages_failed_total|^jagua_messages_consumed_total" \
+            || echo "(scrape failed)"
+          kill $PF 2>/dev/null || true
+
+      - name: 11. Recent warning events for jagua
+        if: always()
+        run: |
+          kubectl -n "$NS" get events --field-selector type=Warning \
+            --sort-by=.lastTimestamp 2>/dev/null | grep -i jagua | tail -20 || echo "(none)"

@@ -1,19 +1,147 @@
-version: '3.8'
+# Integration-test harness for the Kafka port (VK migration T9).
+#
+# This replaces the old file, which only passed AWS credentials into a container
+# running the service — it exercised nothing and had no dependencies to run against.
+#
+# The point of this harness is to test the things that only fail at runtime:
+# SCRAM authentication, consumer-group offset commits, partition pause/resume and
+# the retry ladder. Those are exactly what an in-process mock cannot prove.
+#
+# Two client listeners on purpose:
+#   SASL  (9092, published to localhost) — what the worker and the tests use, with
+#         SASL_PLAINTEXT + SCRAM-SHA-512, matching the VK listener bit for bit
+#         (cutl-infra modules-vk/kafka/main.tf:147-153 sets tls = false).
+#   PLAINTEXT (19092, in-network only)   — setup only. SCRAM credentials must exist
+#         before any SASL client can connect, so bootstrapping them over the SASL
+#         listener is a chicken-and-egg problem. The init service uses this one.
+#
+# Apache Kafka rather than Redpanda: the assertions here are about rebalance,
+# commit and pause semantics, and production is Strimzi Kafka 4.2.1.
+
+name: jagua-test
 
 services:
-  jagua-sqs-processor:
-    build:
-      context: ..
-      dockerfile: jagua-sqs-processor/Dockerfile
-    image: jagua-sqs-processor:latest
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: jagua-test-kafka
+    ports:
+      - "9092:9092"
     environment:
-      - INPUT_QUEUE_URL=${INPUT_QUEUE_URL}
-      - OUTPUT_QUEUE_URL=${OUTPUT_QUEUE_URL}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - RUST_LOG=${RUST_LOG:-info}
-      - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
-    restart: unless-stopped
+      CLUSTER_ID: jagua-test-cluster-000001
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:19092,SASLNET://:29092,SASLHOST://:9092,CONTROLLER://:29093
+      # TWO SASL listeners, because an advertised address can only be correct for
+      # one vantage point:
+      #   SASLHOST -> localhost:9092, for `cargo test` run on the host (and on a
+      #               CI runner, where cargo also runs on the host).
+      #   SASLNET  -> kafka:29092, for a test container attached to this network,
+      #               which is how scripts/cargo-docker.sh runs on a machine with
+      #               no local Rust toolchain.
+      # Advertising only localhost makes every in-network produce time out, which
+      # looks like a broker fault rather than a routing mistake.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,SASLNET://kafka:29092,SASLHOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,SASLNET:SASL_PLAINTEXT,SASLHOST:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_SASL_ENABLED_MECHANISMS: SCRAM-SHA-512
+      # Per-listener JAAS. Without it the broker refuses to start with "Could not
+      # find a 'KafkaServer' entry in the JAAS configuration" — SCRAM still needs a
+      # login module declared, even though the credentials themselves live in the
+      # KRaft metadata log rather than in this config.
+      #
+      # The image maps env vars to properties as `_`->`.` and `___`->`-`, so these
+      # are listener.name.saslnet/saslhost.scram-sha-512.sasl.jaas.config. The
+      # listener names deliberately contain no underscore, which would need `__`
+      # escaping and is easy to get silently wrong.
+      KAFKA_LISTENER_NAME_SASLNET_SCRAM___SHA___512_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.scram.ScramLoginModule required;"
+      KAFKA_LISTENER_NAME_SASLHOST_SCRAM___SHA___512_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.scram.ScramLoginModule required;"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Zero, not the 3s default: every test that starts a consumer would otherwise
+      # pay the rebalance delay before it sees its first record.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Off so the tests prove topic setup rather than silently auto-creating a
+      # 1-partition topic and hiding partition-related bugs.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:19092 >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
 
+  # Creates the SCRAM user and the topics, then exits 0. Everything downstream
+  # waits on `service_completed_successfully`, so a test run cannot start against a
+  # half-provisioned broker.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: jagua-test-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        BS=kafka:19092
 
+        echo "creating SCRAM-SHA-512 credential for jagua-nesting"
+        /opt/kafka/bin/kafka-configs.sh --bootstrap-server "$$BS" \
+          --alter --entity-type users --entity-name jagua-nesting \
+          --add-config 'SCRAM-SHA-512=[password=jagua-test-secret]'
+
+        # 3 partitions everywhere, matching cutl-infra's `partitions = 3`. A
+        # 1-partition test topic would hide every ordering and watermark bug.
+        for t in nesting-request nesting-response \
+                 jagua-nesting-retry-1 jagua-nesting-retry-2 jagua-nesting-retry-3; do
+          echo "creating topic $$t"
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$$BS" \
+            --create --if-not-exists --topic "$$t" \
+            --partitions 3 --replication-factor 1
+        done
+
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$$BS" --list
+        echo "kafka-init done"
+
+  # Stands in for the AWS S3 bucket the worker reads part SVGs from and writes
+  # result pages to. The worker already supports this via AWS_ENDPOINT_URL +
+  # force_path_style (main.rs:70-104) — the same hook the future eu-west-1 relay
+  # will use, so this path is not test-only scaffolding.
+  minio:
+    image: minio/minio:latest
+    container_name: jagua-test-minio
+    # 9200, not the usual 9000: sibling repos (tws, dxf-processor) run their own
+    # MinIO on 9000/9100 and this harness must coexist with them on a dev machine.
+    ports:
+      - "9200:9000"
+    environment:
+      MINIO_ROOT_USER: jagua-test
+      MINIO_ROOT_PASSWORD: jagua-test-secret
+    command: server /data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: jagua-test-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mc alias set local http://minio:9000 jagua-test jagua-test-secret
+        mc mb --ignore-existing local/cutl-test-uploads
+        echo "minio-init done"

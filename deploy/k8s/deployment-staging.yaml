@@ -1,0 +1,160 @@
+# jagua-nesting is an INTERNAL worker. It has no Ingress and no public
+# hostname: nothing outside the cluster addresses it, and work reaches it over
+# the message bus. The Service below exists only so Prometheus has something to
+# select — it is not a traffic path.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jagua
+  namespace: cutl
+  labels:
+    app.kubernetes.io/name: jagua
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: cutl
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate. A nesting job is long-running and single-owner;
+  # two replicas of different versions competing for the same messages during a
+  # rollout is not something the processor is written to expect.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jagua
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jagua
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: cutl
+    spec:
+      imagePullSecrets:
+        # Created by cutl-infra modules-vk/k8s-workload kubernetes_secret.image_pull.
+        - name: registry-pull
+      # A nesting run can be minutes long. The default 30s would SIGKILL a job
+      # mid-flight on every rollout, losing the work with no record of it — and
+      # since retries are the only recovery (there is no DLQ, RFC-001), that is
+      # a silent loss. main.rs handles SIGTERM and drains via the shutdown
+      # channel; this gives it room to finish.
+      terminationGracePeriodSeconds: 600
+      containers:
+        - name: jagua
+          # ${IMAGE} is substituted by envsubst in the deploy workflow.
+          image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            # Postgres/Valkey/Kafka bootstrap, written by cutl-infra
+            # modules-vk/k8s-workload kubernetes_secret.cutl_env.
+            - secretRef:
+                name: cutl-env
+            # This worker's OWN Kafka SCRAM credentials, copied into this
+            # namespace per consumer group by modules-vk/kafka-credentials.
+            # Mounting only its own group is the point of the per-group users:
+            # jagua cannot read another worker's topics.
+            #
+            # Supplies KAFKA_USERNAME / KAFKA_PASSWORD /
+            # KAFKA_BOOTSTRAP_SERVERS / KAFKA_SASL_MECHANISM. Consumed directly
+            # as env vars by KafkaSettings::from_env (T9) — the key names are
+            # already env-var shaped so nothing needs parsing or mounting.
+            - secretRef:
+                name: kafka-jagua-nesting
+            # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for S3.
+            #
+            # WHY THIS IS SUDDENLY NEEDED, when the ECS task ran without it: on
+            # Fargate the task ROLE supplied credentials (the CDK calls
+            # bucket.grantReadWrite(taskRole), and the ECS agent injects
+            # AWS_CONTAINER_CREDENTIALS_RELATIVE_URI so the SDK fetches
+            # short-lived credentials from 169.254.170.2). VK has no ECS agent,
+            # no instance profile and no IRSA, so the credential chain finds
+            # nothing — which is exactly what this pod used to print at startup:
+            # `AWS_ACCESS_KEY_ID: Err(NotPresent)`. Static keys stand in for the
+            # identity the platform used to provide.
+            #
+            # Built by this repo's deploy workflow from the VK_S3_SECRETS GitHub
+            # secret, which cutl-infra scripts/vk-github-secrets.sh extracts
+            # from config/staging/backend.properties. Same delivery path as the
+            # backend's cutl-backend-secrets, and deliberately NOT cutl-env:
+            # that Secret is Terraform-owned and platform-derived only.
+            - secretRef:
+                name: jagua-s3-secrets
+          env:
+            # S3 stays on AWS - only the queue moved to Kafka, the payload path
+            # did not. The REGION keeps moving though: eu-north-1, eu-west-1,
+            # il-central-1, and now ap-east-1 (Hong Kong) as of 2026-08-11 —
+            # four regions in five days.
+            #
+            # The filtering is IP-prefix based on the Russian path and rotates by
+            # the hour. TCP connects fine and only the TLS handshake is dropped,
+            # regardless of SNI, so a connect-only probe reports a dead region as
+            # healthy. Tel Aviv measured 25/25 when we moved to it and ~2/6 twelve
+            # hours later; eu-west-1 was the failing one that evening and perfect
+            # the next morning.
+            #
+            # Hong Kong is the only region that has never failed a probe, incl.
+            # the window where every other region was blocked. That is why it is
+            # here despite being the slowest of the candidates. It is a bet: the
+            # durable fix is VK Object Storage, with no cross-border path at all.
+            #
+            # The bucket is created by cutl-infra's cutl-relay-staging-hk CDK
+            # stack, which derives the name from the region.
+            #
+            # THE BACKEND MUST POINT AT THE SAME BUCKET: it writes the input and
+            # sends the object key over Kafka, so a region split turns a working
+            # pipeline into NoSuchKey on every job.
+            - name: S3_BUCKET
+              value: "cutl-staging-uploads-ap-east-1"
+            - name: AWS_REGION
+              value: "ap-east-1"
+            - name: HEALTH_PORT
+              value: "8080"
+            # Tempo's OTLP receiver. observability.rs treats an unset value as
+            # "log to stdout only" rather than an error, so local and ECS runs
+            # are unaffected.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://tempo.monitoring.svc.cluster.local:4318"
+            - name: RUST_LOG
+              value: "info"
+            - name: DEPLOYMENT_ENV
+              value: "${DEPLOYMENT_ENV}"
+            - name: GIT_SHA
+              value: "${GIT_SHA}"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # This binary had no HTTP server at all before T7. Without these a
+          # wedged worker keeps its pod Ready forever and just stops consuming,
+          # which is precisely the gap the tws worker documents as known and
+          # unaddressed.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            # /health answers as long as the process is alive and is NOT gated
+            # on readiness state. Deliberate: a failing dependency should stop
+            # traffic, not trigger a restart loop that cannot fix it.
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            # Nesting is CPU-bound but the process is small; Rust, no JVM heap
+            # to reserve. Requests are a scheduling floor, so they stay modest
+            # on a 1930m node — the limit is what a nesting run actually gets.
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            # Trimmed from 1500m: measured steady usage is a fraction of it, and
+            # excess limits on an idle service are pure overcommit noise. The
+            # frontend deliberately keeps 1500m — its burst is the /calculation
+            # cold-LCP fix. Note this does NOT clear KubeCPUOvercommit, which is
+            # about REQUESTS and node-failure headroom, not limits.
+            limits:
+              cpu: "1000m"
+              memory: 1Gi

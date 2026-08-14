@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Pre-commit gate for the two crates this repo owns.
+#
+# WHY THIS EXISTS: every CI failure on this branch so far has been something a local command
+# would have caught in seconds. The last one was a text edit that inserted a field into the
+# wrong struct in jagua-sqs-processor; jagua-utils was checked, the processor was not, and it
+# took a ~30-minute CI round trip to find out.
+#
+# So this runs the SAME commands CI's `check` job runs, over BOTH crates -- never one of them.
+# Enable it once per clone (it is version-controlled, so .git/hooks is not used):
+#
+#     git config core.hooksPath .githooks
+#
+# Deliberately excluded: `make test`. It takes minutes, which is a pre-push cost, not a
+# per-commit one -- see .githooks/pre-push.
+#
+# Also deliberately excluded: `cargo clippy`. It used to run here. Warm it costs under a second,
+# but it needs a built workspace, and the cold cases are brutal: a first build after a toolchain
+# or dependency change compiles the whole tree (~30s), and it blocks outright on the target-dir
+# lock whenever rust-analyzer is mid-build -- which, in an editor-driven commit flow, is most of
+# the time. Clippy now runs in CI's `check` job only. If you want it back locally, the command is:
+#
+#     cargo clippy -p jagua-utils -p jagua-sqs-processor --all-targets --no-deps -- -D warnings
+#
+# It needs cmake on PATH (jagua-sqs-processor builds librdkafka from C source); without cmake,
+# use scripts/cargo-docker.sh to run the same command in the pinned builder image.
+#
+# Escape hatch for a genuine work-in-progress commit: `git commit --no-verify`.
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 1
+
+CRATES=(-p jagua-utils -p jagua-sqs-processor)
+export PATH="$HOME/.cargo/bin:$PATH"
+
+fail() {
+  echo ""
+  echo "pre-commit: $1" >&2
+  echo "pre-commit: fix it, or bypass with 'git commit --no-verify' if this is a WIP commit." >&2
+  exit 1
+}
+
+command -v cargo >/dev/null 2>&1 || fail "cargo not found on PATH"
+
+# build.rs runs typify over this file; without it every cargo invocation dies in build.rs
+# rather than reporting a real problem.
+if [[ ! -f jagua-sqs-processor/asyncapi/jagua-rs.yaml ]]; then
+  fail "jagua-sqs-processor/asyncapi/jagua-rs.yaml is missing -- run scripts/sync-schema.sh"
+fi
+
+echo "pre-commit: cargo fmt --check (jagua-utils + jagua-sqs-processor)"
+cargo fmt "${CRATES[@]}" -- --check || fail "formatting differs -- run 'make fmt'"
+
+echo "pre-commit: ok"

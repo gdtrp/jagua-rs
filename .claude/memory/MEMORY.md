@@ -6,3 +6,4 @@
 - [project_grain_direction.md](project_grain_direction.md) — Grain direction control: per-part allowedRotations (int degrees) in nesting request, implemented in jagua-utils + sqs-processor
 - [project_asyncapi_codegen.md](project_asyncapi_codegen.md) — API-first: SQS wire types generated from AsyncAPI spec via typify in build.rs (vendored spec, make sync-spec, jagua-utils type reuse)
 - [project_cutl160_nesting_rfc.md](project_cutl160_nesting_rfc.md) — CUTL-160 nesting overhaul RFC (docs/rfcs/): classifier + grid/periodic/pairing fast paths, progress contract, max/sheet bug; user to supply SVGs for per-case tests
+- [project_kafka_contract.md](project_kafka_contract.md) — VK Kafka port is governed by cutl-infra/docs/kafka-contract.md; 3 constraints that make the obvious implementation wrong

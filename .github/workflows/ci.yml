@@ -1,0 +1,125 @@
+name: CI
+
+# Until now NOTHING gated a merge: deploy.yml built and shipped images without
+# ever running cargo test, clippy or fmt on any branch. The Makefile check/lint
+# targets were local-only. This workflow closes that, and is where the Kafka
+# transport's broker-backed tests actually run (VK migration T9).
+
+on:
+  pull_request:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first: these jobs are pure
+# verification, so a superseded run has no value and CI minutes are not free.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast on a warning rather than letting it reach the Docker build, where
+  # the crate's own `[lints.rust] warnings = "deny"` would surface it much later.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Formatting and lints. Cheapest signal, so it runs on its own and does not
+  # wait for the Kafka harness.
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # build.rs runs typify over asyncapi/jagua-rs.yaml, which is git-ignored and
+      # pulled from cutl-schemas. Without this step every cargo invocation below
+      # fails in build.rs with a missing-spec panic, not with a lint error.
+      - name: Sync AsyncAPI spec from cutl-schemas
+        env:
+          GH_TOKEN: ${{ secrets.CUTL_SCHEMAS_TOKEN }}
+        run: ./scripts/sync-schema.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # librdkafka is built from C source by rdkafka-sys (cmake-build feature);
+      # clippy still has to compile it, so the same system deps as the Dockerfile
+      # builder stage are needed here.
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libsasl2-dev zlib1g-dev libssl-dev libcurl4-openssl-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+
+      # jagua-rs and lbf are upstream crates synced from JeroenGar/jagua-rs and are
+      # deliberately not linted — only the two crates this repo owns.
+      - run: cargo fmt -p jagua-utils -p jagua-sqs-processor -- --check
+      - run: cargo clippy -p jagua-utils -p jagua-sqs-processor --all-targets --no-deps -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # The broker-free suite: unit tests, wire-contract goldens, in-process nesting
+  # e2e. Runs everywhere, needs no services.
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync AsyncAPI spec from cutl-schemas
+        env:
+          GH_TOKEN: ${{ secrets.CUTL_SCHEMAS_TOKEN }}
+        run: ./scripts/sync-schema.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libsasl2-dev zlib1g-dev libssl-dev libcurl4-openssl-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+
+      # Note [profile.test] sets opt-level = 3 with debug-assertions on, so this is
+      # slower than a normal debug test run by design — it keeps jagua-rs's
+      # correctness assertions live at production-like speed.
+      - run: cargo test -p jagua-utils -p jagua-sqs-processor
+
+  # ---------------------------------------------------------------------------
+  # The tests that only fail at runtime: SCRAM auth, offset commits, partition
+  # pause/resume and the retry ladder. These are #[ignore]d so the `test` job
+  # above stays broker-free; this job is the only thing that runs them.
+  # ---------------------------------------------------------------------------
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync AsyncAPI spec from cutl-schemas
+        env:
+          GH_TOKEN: ${{ secrets.CUTL_SCHEMAS_TOKEN }}
+        run: ./scripts/sync-schema.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libsasl2-dev zlib1g-dev libssl-dev libcurl4-openssl-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+
+      # Kafka advertises its SASL listener as localhost:9092 and MinIO is published
+      # on 9200; the runner executes cargo on the host, so both resolve. `compose-up`
+      # waits for health and then provisions the SCRAM user and topics.
+      - name: Start Kafka + MinIO harness
+        run: make compose-up
+
+      - name: Run broker-backed integration tests
+        run: cargo test -p jagua-sqs-processor -- --ignored --test-threads=1
+
+      # Container logs are the only way to tell a broker misconfiguration apart
+      # from a genuine test failure, and they are gone once the job ends.
+      - name: Dump harness logs on failure
+        if: failure()
+        run: docker compose -f jagua-sqs-processor/docker-compose.yml logs --tail=200
+
+      - name: Tear down harness
+        if: always()
+        run: make compose-down

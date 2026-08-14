@@ -90,6 +90,25 @@ pub(crate) fn fit_orientations(allowed_rotations: &Option<Vec<f32>>) -> (bool, b
     (allow_original, allow_swapped)
 }
 
+/// Fraction of a sheet consumed by a layout, counting each part's separation halo as used.
+///
+/// [`LayoutSnapshot::density`] measures bare outlines (`shape_orig`) against the true sheet, so
+/// the spacing gutters read as waste and a sheet with no room left for another part reports ~68%.
+/// The gutter exists because the caller asked for that separation, so from their side it is sheet
+/// consumed, not lost. `PlacedItem::shape` is the collision shape — the outline inflated by
+/// `spacing/2` — and halos cannot overlap each other (that is the separation constraint), so
+/// summing them neither double-counts nor exceeds the sheet.
+///
+/// Use [`LayoutSnapshot::density`] instead wherever the *material yield* is what matters.
+pub(crate) fn sheet_utilisation(layout: &jagua_rs::entities::LayoutSnapshot) -> f32 {
+    let sheet = layout.container.area();
+    if sheet <= 0.0 {
+        return 0.0;
+    }
+    let used: f32 = layout.placed_items.values().map(|pi| pi.shape.area).sum();
+    (used / sheet).clamp(0.0, 1.0)
+}
+
 /// Callback function type for sending intermediate improvements
 /// Called when a better result is found during optimization
 pub type ImprovementCallback = Box<dyn Fn(NestingResult) -> Result<()> + Send + Sync>;

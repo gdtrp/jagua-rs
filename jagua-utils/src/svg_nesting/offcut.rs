@@ -165,9 +165,26 @@ pub(crate) fn detect_offcuts_for_layout(
 ///
 /// `spacing` is the nesting separation (`min_item_separation`). The engine bakes half of it
 /// into the geometry the detector sees — the sheet's collision box is deflated by `spacing/2`
-/// and every part's collision shape is inflated by `spacing/2`. The detectors undo both so
-/// offcuts span the true reusable material (touching the real part outlines and sheet edges)
-/// rather than respecting the nesting spacing.
+/// and every part's collision shape is inflated by `spacing/2`.
+///
+/// The detectors undo **only the sheet's** deflation (`grow_rect`), so offcuts reach the true
+/// sheet edges. That strip is genuinely reusable: there is no part to stay clear of at the
+/// sheet boundary, so the deflation there is a placement constraint, not a cut allowance.
+///
+/// Parts are deliberately **left inflated**: an offcut stops at the separation boundary rather
+/// than at the bare outline. Two reasons, one physical and one a correctness requirement:
+///
+/// * The gutter between a part and the remnant is consumed by the cut, so it is not reusable
+///   material. (`policy.kerf_mm` marks the additional allowance inside the remnant.)
+/// * De-inflating assumed every part was inflated by exactly `spacing/2`, and that is not
+///   true. [`crate::svg_nesting::parsing::build_inflatable_shape`] reduces — or entirely
+///   disables — the inflation for any part whose narrow concavities would self-intersect when
+///   offset by the full amount (irregular parts with thin throats: exactly the "dr" family).
+///   Subtracting a uniform `spacing/2` from such a part shrank the obstacle **below its real
+///   outline**, and the detected remnant then overlapped the part itself by up to `spacing/2`.
+///   Since the applied inflation is per-part and not recoverable from a [`LayoutSnapshot`],
+///   the safe invariant is to subtract the collision geometry as-is: it always contains the
+///   true outline, whatever inflation survived.
 pub(crate) fn detect_offcuts(
     bin_bbox: Rect,
     placed_bboxes: &[Rect],
@@ -226,11 +243,13 @@ fn merge_rect_offcuts(rects: Vec<Offcut>) -> Vec<Offcut> {
 /// Detect axis-aligned rectangular offcuts capturing the free space as a few large,
 /// non-overlapping rectangles.
 ///
-/// Free space = `bin − union(part bounding boxes)`, measured against the **true** sheet edges
-/// and part outlines (the `spacing/2` collision offset is undone first). The free area is
-/// decomposed greedily largest-rectangle-first so big reusable areas (e.g. the block below a
-/// packed column) survive as whole rectangles instead of being sliced into thin sub-minimum
-/// strips. Rectangles below the minimum size are dropped.
+/// Free space = `bin − union(part collision bounding boxes)`, measured against the **true**
+/// sheet edges (the sheet's `spacing/2` deflation is undone) but against each part's inflated
+/// collision bbox, so a remnant stops at the separation boundary and can never overlap a part.
+/// See [`detect_offcuts`] for why the parts are not de-inflated. The free area is decomposed
+/// greedily largest-rectangle-first so big reusable areas (e.g. the block below a packed
+/// column) survive as whole rectangles instead of being sliced into thin sub-minimum strips.
+/// Rectangles below the minimum size are dropped.
 pub(crate) fn detect_rect_offcuts(
     bin_bbox: Rect,
     placed_bboxes: &[Rect],
@@ -238,13 +257,11 @@ pub(crate) fn detect_rect_offcuts(
     spacing: f32,
 ) -> Vec<Offcut> {
     let half = (spacing / 2.0).max(0.0);
-    // Undo the collision offset: grow the sheet back to its true edges and shrink each part
-    // bbox back to its true outline so offcuts touch the real parts and walls.
+    // Grow the sheet back to its true edges. Part bboxes are used as the engine placed them.
     let bin = grow_rect(bin_bbox, half).unwrap_or(bin_bbox);
     let obstacles: Vec<Rect> = placed_bboxes
         .iter()
-        .filter_map(|b| inset_rect(*b, half))
-        .filter_map(|b| Rect::intersection(bin, b))
+        .filter_map(|b| Rect::intersection(bin, *b))
         .collect();
 
     maximal_free_rects(
@@ -266,14 +283,28 @@ pub(crate) fn detect_rect_offcuts(
 /// Greedily extract non-overlapping maximal free rectangles. Repeatedly takes the
 /// largest-area empty rectangle, emits it if it meets the minimum size, then marks it
 /// occupied and repeats — yielding a small set of large rectangles rather than many slivers.
+///
+/// The selection is by **area**, but the threshold is per **dimension**, and those disagree: a
+/// long thin strip can be the largest remaining region while failing `min_h`, and stopping there
+/// discards every smaller-but-qualifying region behind it. That is how a reusable block next to
+/// the packed column went unreported — the big rectangle was emitted, the next-largest region was
+/// a strip too thin to qualify, and the walk ended before reaching the block.
+///
+/// So a failing rectangle is consumed and the walk continues. Termination is safe because the
+/// walk is area-descending: once the largest remaining region is smaller in area than the minimum
+/// box, nothing left can satisfy both dimensions.
 fn maximal_free_rects(bin: Rect, obstacles: &[Rect], min_w: f32, min_h: f32) -> Vec<Rect> {
     let mut obs = obstacles.to_vec();
     let mut out = Vec::new();
+    let min_area = min_w * min_h;
     while let Some(r) = largest_empty_rect(bin, &obs) {
-        if r.width() < min_w || r.height() < min_h {
+        if r.width() * r.height() < min_area {
             break;
         }
-        out.push(r);
+        if r.width() >= min_w && r.height() >= min_h {
+            out.push(r);
+        }
+        // Consume it either way — an unconsumed rectangle would be returned forever.
         obs.push(r);
     }
     out
@@ -336,14 +367,6 @@ fn sort_dedup(xs: &mut Vec<f32>) {
     xs.dedup_by(|a, b| (*a - *b).abs() <= COORD_EPS);
 }
 
-/// Shrink a rect by `m` on every side. `m <= 0` is a no-op; `None` if it would collapse.
-fn inset_rect(rect: Rect, m: f32) -> Option<Rect> {
-    if m <= 0.0 {
-        return Some(rect);
-    }
-    rect.resize_by(-m, -m)
-}
-
 /// Grow a rect by `m` on every side. `m <= 0` is a no-op.
 fn grow_rect(rect: Rect, m: f32) -> Option<Rect> {
     if m <= 0.0 {
@@ -358,11 +381,14 @@ fn grow_rect(rect: Rect, m: f32) -> Option<Rect> {
 
 /// Detect polygonal offcuts capturing ALL free space.
 ///
-/// Free space = `bin − union(part outlines)`, measured against the true sheet edges and part
-/// outlines: the sheet is grown back by `spacing/2` and each part is deflated by `spacing/2`
-/// to undo the collision offset. The boolean difference yields free regions that follow the
-/// real, possibly concave, part edges and may contain holes where parts sit. Each region's
-/// rings are simplified (RDP) and returned as an [`Offcut::Poly`] (exterior + holes).
+/// Free space = `bin − union(part collision outlines)`, measured against the true sheet edges
+/// (the sheet is grown back by `spacing/2`) but against each part's inflated collision outline.
+/// See [`detect_offcuts`] for why the parts are not de-inflated — on this path the old deflation
+/// was worse than an overlap: `buffer_polygon` by `-spacing/2` erases any part narrower than the
+/// separation outright, and the free region then swallowed the part whole. The boolean difference
+/// yields free regions that follow the real, possibly concave, part edges and may contain holes
+/// where parts sit. Each region's rings are simplified (RDP) and returned as an [`Offcut::Poly`]
+/// (exterior + holes).
 pub(crate) fn detect_poly_offcuts(
     bin_bbox: Rect,
     placed_polys: &[&SPolygon],
@@ -373,18 +399,10 @@ pub(crate) fn detect_poly_offcuts(
     let bin = grow_rect(bin_bbox, half).unwrap_or(bin_bbox);
     let bin_mp = MultiPolygon::new(vec![rect_to_geo_polygon(bin)]);
 
-    // Union of all part outlines, each deflated by spacing/2 to recover its true (pre-inflate)
-    // outline. Parts thinner than the separation deflate to nothing and are simply skipped.
+    // Union of all part outlines, as the engine placed them (separation halo included).
     let occupied: Option<MultiPolygon<f64>> = placed_polys
         .iter()
-        .map(|sp| {
-            let poly = part_to_geo_polygon(sp);
-            if half > 0.0 {
-                geo_buffer::buffer_polygon(&poly, -(half as f64))
-            } else {
-                MultiPolygon::new(vec![poly])
-            }
-        })
+        .map(|sp| MultiPolygon::new(vec![part_to_geo_polygon(sp)]))
         .fold(None, |acc, mp| {
             Some(match acc {
                 None => mp,
@@ -768,24 +786,62 @@ mod tests {
     }
 
     #[test]
-    fn rect_spacing_reaches_true_edges() {
+    fn rect_spacing_reaches_true_sheet_edges_but_keeps_part_halo() {
         // With spacing 10 the engine deflates the sheet by 5 and inflates the part by 5, so
         // the detector receives bin [5,5]-[1995,995] and a part bbox of [5,5]-[505,995] for a
-        // true corner part (0,0)-(500,990). Undoing the offset, the offcut must reach the true
-        // sheet edges (x_max 2000, y 0..1000) and the true part edge (x 500).
+        // true corner part (0,0)-(500,990).
+        //
+        // The sheet deflation IS undone — the offcut reaches x_max 2000 and y 0..1000, because
+        // there is nothing to stay clear of at the sheet boundary. The part's inflation is NOT:
+        // the offcut starts at the collision edge 505, not the bare outline 500. The separation
+        // gutter is consumed by the cut, and the halo is what guarantees no overlap.
         let bin = Rect::try_new(5.0, 5.0, 1995.0, 995.0).unwrap();
         let part = Rect::try_new(5.0, 5.0, 505.0, 995.0).unwrap();
         let offcuts = detect_rect_offcuts(bin, &[part], &rect_policy(100.0, 100.0, 0.0), 10.0);
         assert_eq!(
             offcuts,
             vec![Offcut::Rect {
-                x: 500.0,
+                x: 505.0,
                 y: 0.0,
-                width: 1500.0,
+                width: 1495.0,
                 height: 1000.0,
             }],
-            "offcut should reach true edges: {offcuts:?}"
+            "offcut should reach the true sheet edges but stop at the part halo: {offcuts:?}"
         );
+    }
+
+    /// The reported defect: a remnant drawn on top of real parts.
+    ///
+    /// `build_inflatable_shape` reduces (or disables) a part's inflation when the full
+    /// `spacing/2` offset would self-intersect its narrow concavities, so the placed bbox of an
+    /// irregular part can carry *less* halo than `spacing/2` — here, none at all. The detector
+    /// used to subtract a uniform `spacing/2` from every part regardless, shrinking the obstacle
+    /// below the real outline and letting the offcut sit on top of the part.
+    #[test]
+    fn rect_offcut_never_overlaps_a_part_whose_inflation_was_reduced() {
+        let bin = Rect::try_new(0.0, 0.0, 2000.0, 1000.0).unwrap();
+        // Inflation backed off to zero: this bbox IS the part's true outline.
+        let part = Rect::try_new(0.0, 0.0, 500.0, 1000.0).unwrap();
+        let offcuts = detect_rect_offcuts(bin, &[part], &rect_policy(100.0, 100.0, 0.0), 20.0);
+
+        assert!(!offcuts.is_empty(), "expected an offcut");
+        for o in &offcuts {
+            let Offcut::Rect {
+                x,
+                y,
+                width,
+                height,
+            } = o
+            else {
+                panic!("rectangle policy must yield RECT, got {o:?}");
+            };
+            let overlap_x = (x + width).min(part.x_max) - x.max(part.x_min);
+            let overlap_y = (y + height).min(part.y_max) - y.max(part.y_min);
+            assert!(
+                overlap_x <= COORD_EPS || overlap_y <= COORD_EPS,
+                "offcut {o:?} overlaps the part by {overlap_x} x {overlap_y}"
+            );
+        }
     }
 
     #[test]
@@ -805,6 +861,49 @@ mod tests {
         assert!(bands[0].contains("510"), "inset edge missing: {}", bands[0]);
         // No band when kerf is zero.
         assert!(kerf_band_paths(std::slice::from_ref(&offcut), 0.0).is_empty());
+    }
+
+    /// A thin strip must not end the walk: it is the largest remaining region by area but
+    /// fails `min_h`, and behind it sits a block that does qualify. The old code broke on the
+    /// strip and reported only the first rectangle, losing reusable material next to the parts.
+    #[test]
+    fn rect_thin_strip_does_not_hide_a_qualifying_block() {
+        // 2000x1000 bin, min 100x100. The obstacles leave three free regions, and the areas are
+        // chosen so the disqualifying one is picked *between* the two qualifying ones:
+        //   1. right block   900 x 1000 = 900,000  ✓ emitted first
+        //   2. top strip    1100 x   90 =  99,000  ✗ only 90 tall — where the old walk stopped
+        //   3. bottom-left   150 x  400 =  60,000  ✓ must still be reported
+        let bin = Rect::try_new(0.0, 0.0, 2000.0, 1000.0).unwrap();
+        let obstacles = [
+            Rect::try_new(150.0, 0.0, 1100.0, 910.0).unwrap(),
+            Rect::try_new(0.0, 400.0, 150.0, 910.0).unwrap(),
+        ];
+        let offcuts = detect_rect_offcuts(bin, &obstacles, &rect_policy(100.0, 100.0, 0.0), 0.0);
+
+        let has = |x: f32, y: f32| {
+            offcuts.iter().any(|o| match o {
+                Offcut::Rect {
+                    x: ox,
+                    y: oy,
+                    width,
+                    height,
+                } => *ox <= x && x <= ox + width && *oy <= y && y <= oy + height,
+                _ => false,
+            })
+        };
+        assert!(has(1500.0, 500.0), "right block missing: {offcuts:?}");
+        assert!(
+            has(75.0, 200.0),
+            "bottom-left block was hidden behind the thin top strip: {offcuts:?}"
+        );
+        for o in &offcuts {
+            if let Offcut::Rect { width, height, .. } = o {
+                assert!(
+                    *width >= 100.0 && *height >= 100.0,
+                    "below threshold: {o:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -895,26 +994,58 @@ mod tests {
     }
 
     #[test]
-    fn poly_spacing_deflates_part() {
+    fn poly_spacing_keeps_part_halo() {
         // With spacing 10, a part whose collision outline is (5,0)-(505,1000) really occupies
-        // (10,0)-(500,1000). Undoing the inflate, the free region's right portion must extend
-        // to the part's true right edge (~500), not the inflated 505.
+        // (10,0)-(500,1000). The free region must stop at the collision edge (505) rather than
+        // eating into the separation gutter — the halo is what keeps the remnant off the part.
         let bin = Rect::try_new(0.0, 0.0, 2000.0, 1000.0).unwrap();
         let item = rect_spoly(5.0, 0.0, 505.0, 1000.0);
         let offcuts = detect_poly_offcuts(bin, &[&item], &poly_policy(50.0, 50.0, 0.0), 10.0);
         assert!(!offcuts.is_empty());
-        let min_x = offcuts
+        let right_of_part = offcuts
             .iter()
             .flat_map(|o| match o {
                 Offcut::Poly { vertices, .. } => vertices.clone(),
                 _ => vec![],
             })
             .map(|v| v.x)
+            .filter(|x| *x > 100.0)
             .fold(f32::INFINITY, f32::min);
-        // Free region reaches the deflated part edge (~500), proving the inflate was undone.
         assert!(
-            min_x <= 501.0,
-            "offcut left edge {min_x} did not reach true part edge"
+            right_of_part >= 505.0 - 1.0,
+            "offcut left edge {right_of_part} intrudes past the part's collision edge (505)"
+        );
+    }
+
+    /// The polygon path's version of the reported defect, which was worse than an overlap:
+    /// deflating by `spacing/2` erased any part narrower than the separation entirely, so the
+    /// free region simply swallowed it. Here a 12mm-wide sliver against a 20mm spacing must
+    /// still punch a hole in (or split) the free space.
+    #[test]
+    fn poly_offcut_does_not_swallow_a_part_thinner_than_the_spacing() {
+        let bin = Rect::try_new(0.0, 0.0, 2000.0, 1000.0).unwrap();
+        // 12mm wide against a 20mm spacing: deflating by spacing/2 used to erase it outright.
+        let sliver = rect_spoly(994.0, 0.0, 1006.0, 1000.0);
+        let offcuts = detect_poly_offcuts(bin, &[&sliver], &poly_policy(50.0, 50.0, 0.0), 20.0);
+
+        assert!(!offcuts.is_empty(), "expected free space around the sliver");
+        let free: f32 = offcuts
+            .iter()
+            .map(|o| match o {
+                Offcut::Poly { vertices, holes } => {
+                    signed_area(vertices).abs()
+                        - holes.iter().map(|h| signed_area(h).abs()).sum::<f32>()
+                }
+                other => panic!("quadrilateral policy must yield POLY, got {other:?}"),
+            })
+            .sum();
+
+        // The sheet grows by spacing/2 on every side; the sliver must be subtracted from it.
+        let sheet = 2020.0 * 1020.0;
+        let sliver_area = 12.0 * 1000.0;
+        assert!(
+            free <= sheet - sliver_area + 100.0,
+            "free area {free} did not exclude the {sliver_area}mm² sliver (sheet {sheet})"
         );
     }
 
