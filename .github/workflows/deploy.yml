@@ -418,7 +418,18 @@ jobs:
   deploy-prod:
     name: Deploy jagua → production
     needs: build-prod
-    if: github.event_name == 'push'
+    # ── ECS PROD DEPLOYS ARE GATED OFF FOR THE VK CUTOVER ──
+    # Not deleted, because this is the rollback path. After the cutover DNS
+    # points at VK and this ECS service is stopped; a deploy here would either
+    # fail against a scaled-to-zero service or quietly resurrect it behind DNS
+    # that no longer points at it.
+    #
+    # TO ROLL BACK TO AWS: set the repository variable ECS_PROD_ENABLED=true and
+    # re-run this workflow. No code change, no revert PR. Then move DNS back.
+    #
+    # Unset means SKIP, deliberately: the failure mode of a forgotten variable
+    # should be "ECS stays off", not "ECS comes back up on its own".
+    if: github.event_name == 'push' && vars.ECS_PROD_ENABLED == 'true'
     concurrency:
       group: jagua-prod-deploy
       cancel-in-progress: false
