@@ -20,16 +20,15 @@ make check   # fmt --check + clippy -D warnings, jagua-utils AND jagua-sqs-proce
 make test    # the broker-free suite, both crates            (before pushing)
 ```
 
-Enable the hooks that enforce this — once per clone, they live in `.githooks/` so they're version-controlled:
+**This is now on you, not on a hook.** The version-controlled hook in `.githooks/` (enable once per clone with `git config core.hooksPath .githooks`) runs **`cargo fmt --check` only** — about a second. Clippy and the test suite were deliberately removed from it:
 
-```bash
-git config core.hooksPath .githooks
-```
+- **Clippy left `pre-commit`** because it needs a built workspace. Warm it is under a second, but a first build after a toolchain or dependency change compiles the whole tree (~30s), and it blocks on the target-dir lock whenever rust-analyzer is mid-build — which, in an editor-driven commit flow, is most of the time.
+- **`pre-push` was deleted entirely.** Its cost was not compilation (test binaries link warm in ~2s) but genuine test runtime — the nesting suites do real packing work, and `adaptive_strategy_test` alone is ~224s locally. There is no caching trick for that.
 
-`pre-commit` runs `make check`; `pre-push` runs `make test`. Bypass only for a deliberate WIP commit (`--no-verify`).
+So run `make check` and `make test` yourself before pushing anything non-trivial. CI's `check` and `test` jobs are now the enforcing gate, and being wrong there costs a ~30-minute round trip (and on `vk-cloud`, a staging deploy).
 
 - **Checking one crate is not enough.** A field was once committed into the wrong struct in `jagua-sqs-processor` because only `jagua-utils` had been verified. `cargo fmt` needs no build and covers both crates in seconds — there is no excuse for skipping it.
-- **`cargo check` does not cover `jagua-sqs-processor`.** It compiles librdkafka from C source; failures show up at build/link time. If `cmake` isn't installed, use `scripts/cargo-docker.sh` (the pre-commit hook falls back to it automatically).
+- **`cargo check` does not cover `jagua-sqs-processor`.** It compiles librdkafka from C source; failures show up at build/link time. Clippy on the processor needs `cmake` on `PATH`; without it, use `scripts/cargo-docker.sh` to run the same command in the pinned builder image.
 - Text-substitution edits across files are the main source of this class of bug — a struct-literal field name can match in an unrelated struct. Verify by building, not by reading the diff.
 
 ## Build & Test Commands
