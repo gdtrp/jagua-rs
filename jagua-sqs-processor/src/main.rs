@@ -7,8 +7,9 @@ use jagua_sqs_processor::observability::{init_tracing, serve_health, Health};
 use jagua_sqs_processor::NestingProcessor;
 use log::{error, info};
 // `fetch_metadata` lives on the Consumer trait, not on StreamConsumer itself.
-use rdkafka::consumer::Consumer;
+use rdkafka::consumer::{Consumer, StreamConsumer};
 use std::env;
+use std::time::Duration;
 use tokio::signal;
 
 /// Must match what the Java services declare, since Grafana joins a trace to
@@ -46,6 +47,71 @@ fn load_config() -> Result<Config> {
         s3_bucket,
         aws_region,
     })
+}
+
+/// Block until `fetch_metadata` succeeds, flipping `health` ready when it does.
+///
+/// Returns `false` if shutdown fired first, meaning the caller should exit
+/// without ever having become ready.
+///
+/// This RETRIES rather than deciding once, which is the whole point of the
+/// function existing. The original code took a single 10s shot and, on failure,
+/// parked until SIGTERM. That turned a transient dependency blip into a
+/// permanent one: `/health` stays 200 by design (see `Health`), so the kubelet
+/// never restarts the pod, and nothing in the process ever looked at Kafka
+/// again. On 2026-08-14 one production pod spent 13h at 0/1 consuming nothing
+/// because a DNS lookup for the bootstrap Service stalled past the timeout —
+/// and recovered two seconds later, which the pod never noticed.
+///
+/// There is no attempt limit, because no bound is both long enough for a real
+/// broker outage and short enough to be worth having: giving up just recreates
+/// the zombie. A pod stuck here is not silent — it stays 0/1 and logs every
+/// attempt — which is exactly what the one-shot version failed to be.
+async fn await_kafka(
+    consumer: &StreamConsumer,
+    health: &Health,
+    shutdown: &mut tokio::sync::broadcast::Receiver<()>,
+) -> bool {
+    /// Matches the timeout the one-shot version used. Healthy fetches return in
+    /// ~150ms, so anything near this is already pathological.
+    const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+    const FIRST_BACKOFF: Duration = Duration::from_secs(1);
+    /// Capped so the log keeps reporting at a useful rate during a long outage
+    /// instead of backing off into silence.
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+    let mut backoff = FIRST_BACKOFF;
+    let mut attempt = 0u64;
+
+    loop {
+        attempt += 1;
+        match tokio::task::block_in_place(|| consumer.fetch_metadata(None, FETCH_TIMEOUT)) {
+            Ok(md) => {
+                info!(
+                    "Connected to Kafka: {} broker(s), {} topic(s) visible",
+                    md.brokers().len(),
+                    md.topics().len()
+                );
+                health.set_ready(true);
+                return true;
+            }
+            Err(e) => error!(
+                "Kafka metadata fetch failed (attempt {attempt}), staying unready, \
+                 retrying in {}s: {e}",
+                backoff.as_secs()
+            ),
+        }
+
+        tokio::select! {
+            _ = shutdown.recv() => {
+                info!("Shutting down without ever becoming ready");
+                return false;
+            }
+            _ = tokio::time::sleep(backoff) => {}
+        }
+
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
 }
 
 #[tokio::main]
@@ -221,24 +287,11 @@ async fn main() -> Result<()> {
     // consumed nothing. Fetching metadata is the cheapest call that actually
     // exercises the SASL/SCRAM handshake, and a failure here is precisely the case
     // where traffic should be withheld without restarting.
-    match tokio::task::block_in_place(|| {
-        consumer.fetch_metadata(None, std::time::Duration::from_secs(10))
-    }) {
-        Ok(md) => {
-            info!(
-                "Connected to Kafka: {} broker(s), {} topic(s) visible",
-                md.brokers().len(),
-                md.topics().len()
-            );
-            health.set_ready(true);
-        }
-        Err(e) => {
-            error!("Kafka metadata fetch failed, staying unready: {e}");
-            let _ = shutdown_rx.recv().await;
-            let _ = shutdown_tx.send(());
-            let _ = health_server.await;
-            return Ok(());
-        }
+    if !await_kafka(&consumer, &health, &mut shutdown_rx).await {
+        // Shutdown arrived before Kafka did.
+        let _ = shutdown_tx.send(());
+        let _ = health_server.await;
+        return Ok(());
     }
 
     // One consumer per retry tier, each in its own group, applying its delay by
