@@ -309,8 +309,15 @@ jobs:
     # always-skipped sibling build job. `config` is in needs so `if:` below can
     # read its staging_branch output.
     needs: [config, build-staging, build-prod]
+    # ── ECS STAGING DEPLOYS ARE GATED OFF FOR THE VK CUTOVER ──
+    # Same rationale and mechanism as deploy-prod below: the workload now runs
+    # on VK (deploy-vk-staging), so rolling the ECS service would either fail
+    # against a scaled-down service or resurrect a second consumer of the
+    # queue. TO ROLL BACK TO AWS: set the repository variable
+    # ECS_STAGING_ENABLED=true and re-run. Unset means SKIP, deliberately.
     if: |
       !failure() && !cancelled()
+      && vars.ECS_STAGING_ENABLED == 'true'
       && github.event_name == 'push'
       && (
         github.ref == format('refs/heads/{0}', needs.config.outputs.staging_branch)
