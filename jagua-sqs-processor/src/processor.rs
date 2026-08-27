@@ -19,6 +19,7 @@ use tracing::Instrument;
 
 use crate::kafka::{retry_headers, KafkaSettings, OffsetWatermark, RecordHeaders};
 use crate::metrics::metrics;
+use crate::s3::S3Settings;
 
 /// Default maximum concurrent processing tasks
 const DEFAULT_MAX_CONCURRENT_TASKS: usize = 20;
@@ -315,18 +316,18 @@ pub struct SqsNestingResponse {
 /// receive loop's shape is itself load-bearing (see [`Self::listen_and_process`]),
 /// and an abstraction over it would obscure exactly the part that matters.
 ///
-/// S3 is untouched by the port. It stays on AWS, reached through a relay in a
-/// region VK can actually see — the payload path is orthogonal to the queue.
+/// The storage backend is orthogonal to the queue and is resolved entirely by
+/// [`S3Settings`], which is what makes an AWS-to-VK move a configuration change.
 #[derive(Clone)]
 pub struct NestingProcessor {
     producer: FutureProducer,
     s3_client: S3Client,
-    s3_bucket: String,
-    aws_region: String,
+    /// `Arc` because the processor is cloned per job and per retry tier, and this
+    /// replaced three `String` clones on each of those paths.
+    s3: Arc<S3Settings>,
     /// Topic responses go to unless a request overrides it.
     response_topic: String,
     kafka: KafkaSettings,
-    endpoint_url: Option<String>,
     cancellation_registry: Arc<Mutex<HashMap<String, CancellationEntry>>>,
 }
 
@@ -405,27 +406,24 @@ impl NestingProcessor {
     pub fn new(
         producer: FutureProducer,
         s3_client: S3Client,
-        s3_bucket: String,
-        aws_region: String,
+        s3: S3Settings,
         kafka: KafkaSettings,
-        endpoint_url: Option<String>,
     ) -> Self {
         Self {
             producer,
             s3_client,
-            s3_bucket,
-            aws_region,
+            s3: Arc::new(s3),
             response_topic: kafka.response_topic.clone(),
             kafka,
-            endpoint_url,
             cancellation_registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Download SVG from S3 URL
     async fn download_svg_from_s3(&self, s3_url: &str) -> Result<Vec<u8>> {
-        // Parse S3 URL (supports both s3://bucket/key and https://bucket.s3.region.amazonaws.com/key)
-        let (bucket, key) = parse_s3_url(s3_url)?;
+        // Endpoint-aware: a VK/MinIO URL is recognised from the configured endpoint
+        // rather than from a hardcoded host list, so the next storage move is config.
+        let (bucket, key) = parse_s3_url_with(s3_url, self.s3.endpoint_host())?;
 
         info!(
             "Downloading SVG from S3: url={}, bucket={}, key={}",
@@ -487,8 +485,9 @@ impl SvgDownloader for NestingProcessor {
     }
 }
 
-/// Parse S3 URL and extract bucket and key
-/// Supports multiple formats:
+/// Parse an S3 URL into `(bucket, key)`.
+///
+/// Supported formats:
 /// - s3://bucket/key
 /// - https://bucket.s3.region.amazonaws.com/key (virtual-hosted style)
 /// - https://bucket.s3-region.amazonaws.com/key (virtual-hosted style with dash)
@@ -496,7 +495,31 @@ impl SvgDownloader for NestingProcessor {
 /// - https://s3-region.amazonaws.com/bucket/key (path-style with dash)
 /// - http://hostname:port/bucket/key (path-style, for localstack/minio)
 /// - https://hostname:port/bucket/key (path-style, for localstack/minio)
+/// - both addressing styles against a configured non-AWS endpoint, when
+///   `endpoint_host` is given — see [`parse_s3_url_with`].
+///
+/// Production always goes through [`parse_s3_url_with`] with the worker's
+/// configured endpoint. This shim exists so the pre-existing parser tests keep
+/// calling exactly what they always called, which is what makes them a proof that
+/// AWS-mode behaviour did not change.
+#[cfg(test)]
 fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
+    parse_s3_url_with(s3_url, None)
+}
+
+/// [`parse_s3_url`], but able to recognise a configured S3-compatible endpoint.
+///
+/// `endpoint_host` is `host[:port]` of the configured endpoint, or `None` on real
+/// AWS. It is checked BEFORE the hardcoded `amazonaws` heuristics, which is what
+/// makes this config-driven rather than another hardcoded host list — the next
+/// storage migration needs no code change here.
+///
+/// With `endpoint_host: None` the behaviour is identical to before this parameter
+/// existed, so an AWS-mode worker and every existing test are unaffected. With a VK
+/// endpoint configured, an `amazonaws.com` URL matches neither branch below and
+/// falls through to the legacy branches — which is what keeps a flip back to AWS
+/// working while VK config is still in place.
+fn parse_s3_url_with(s3_url: &str, endpoint_host: Option<&str>) -> Result<(String, String)> {
     // Handle s3://bucket/key format
     if let Some(path) = s3_url.strip_prefix("s3://") {
         if let Some(slash_pos) = path.find('/') {
@@ -524,6 +547,51 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
             s3_url
         ));
     };
+
+    // The configured endpoint, in either addressing style. Checked before the AWS
+    // heuristics so the deployment's own storage host always wins.
+    if let Some(host) = endpoint_host {
+        let (authority, path) = match url.find('/') {
+            Some(slash) => (&url[..slash], &url[slash + 1..]),
+            None => (url, ""),
+        };
+        let authority_lc = authority.to_ascii_lowercase();
+        let host_lc = host.to_ascii_lowercase();
+
+        // Path-style: https://hb.ru-msk.vkcs.cloud/bucket/key
+        if authority_lc == host_lc {
+            if let Some(slash) = path.find('/') {
+                let bucket = path[..slash].to_string();
+                let key = path[slash + 1..].to_string();
+                if bucket.is_empty() || key.is_empty() {
+                    return Err(anyhow!(
+                        "Invalid S3 endpoint URL: bucket or key is empty: {}",
+                        s3_url
+                    ));
+                }
+                return Ok((bucket, key));
+            }
+            return Err(anyhow!(
+                "Invalid S3 endpoint URL (missing key after bucket): {}",
+                s3_url
+            ));
+        }
+
+        // Virtual-hosted: https://bucket.hb.ru-msk.vkcs.cloud/key
+        // The leading dot is load-bearing — without it `evil-hb.ru-msk.vkcs.cloud`
+        // would be read as bucket `evil` on a host we do not control.
+        let suffix = format!(".{}", host_lc);
+        if let Some(bucket) = authority_lc.strip_suffix(&suffix) {
+            if bucket.is_empty() || path.is_empty() {
+                return Err(anyhow!(
+                    "Invalid S3 endpoint URL: bucket or key is empty: {}",
+                    s3_url
+                ));
+            }
+            return Ok((bucket.to_string(), path.to_string()));
+        }
+        // Neither form matched — fall through to the AWS branches below.
+    }
 
     // Check for AWS path-style URL: https://s3.region.amazonaws.com/bucket/key
     // or https://s3-region.amazonaws.com/bucket/key
@@ -598,31 +666,19 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String)> {
 /// Internal helper function to upload SVG to S3 (used by both improvement and final responses).
 /// `s3_prefix` is the full key prefix (without trailing slash) — callers should pass either the
 /// BE-provided `request.s3_prefix` or the legacy default `nesting/{correlation_id}`.
+///
+/// `s3_bucket` is passed separately from `s3` because a request may override the
+/// bucket while the endpoint, region and addressing mode stay worker config.
 async fn upload_svg_to_s3_internal(
     s3_client: &S3Client,
+    s3: &S3Settings,
     s3_bucket: &str,
-    aws_region: &str,
     svg_bytes: &[u8],
     s3_prefix: &str,
     filename: &str,
-    endpoint_url: Option<&str>,
 ) -> Result<String> {
     let s3_key = format!("{}/{}", s3_prefix.trim_end_matches('/'), filename);
-    let s3_url = if let Some(endpoint) = endpoint_url {
-        // Path-style URL for LocalStack/Minio
-        format!(
-            "{}/{}/{}",
-            endpoint.trim_end_matches('/'),
-            s3_bucket,
-            s3_key
-        )
-    } else {
-        // Virtual-hosted style for AWS
-        format!(
-            "https://{}.s3.{}.amazonaws.com/{}",
-            s3_bucket, aws_region, s3_key
-        )
-    };
+    let s3_url = s3.object_url(s3_bucket, &s3_key);
 
     info!(
         "Uploading SVG to S3: bucket={}, key={}, size={} bytes",
@@ -637,6 +693,10 @@ async fn upload_svg_to_s3_internal(
         .key(&s3_key)
         .body(aws_sdk_s3::primitives::ByteStream::from(svg_bytes.to_vec()))
         .content_type("image/svg+xml")
+        // `None` sends no ACL, which is the default and what AWS has always used.
+        // VK Object Storage has no bucket policies, so an object a browser fetches
+        // through the CDN needs `public-read` set per object — S3_UPLOAD_ACL.
+        .set_acl(s3.upload_acl.clone())
         .send()
         .await
         .with_context(|| {
@@ -1126,13 +1186,12 @@ impl NestingProcessor {
             let s3_bucket_for_task = request
                 .bucket
                 .clone()
-                .unwrap_or_else(|| self.s3_bucket.clone());
+                .unwrap_or_else(|| self.s3.bucket.clone());
             let s3_prefix_for_task = request
                 .s3_prefix
                 .clone()
                 .unwrap_or_else(|| format!("nesting/{}", request.correlation_id));
-            let aws_region_for_task = self.aws_region.clone();
-            let endpoint_url_for_task = self.endpoint_url.clone();
+            let s3_settings_for_task = Arc::clone(&self.s3);
             let output_queue_url_for_task = output_queue_url.to_string();
             let correlation_id_for_task = request.correlation_id.clone();
 
@@ -1156,13 +1215,12 @@ impl NestingProcessor {
                         match retry_with_backoff(&format!("upload improvement page {}", page_idx), || {
                             let client = s3_client_for_task.clone();
                             let bucket = s3_bucket_for_task.clone();
-                            let region = aws_region_for_task.clone();
-                            let endpoint = endpoint_url_for_task.clone();
+                            let s3 = Arc::clone(&s3_settings_for_task);
                             let bytes = page_bytes.clone();
                             let prefix = s3_prefix_for_task.clone();
                             let fname = filename.clone();
                             async move {
-                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &prefix, &fname, endpoint.as_deref()).await
+                                upload_svg_to_s3_internal(&client, &s3, &bucket, &bytes, &prefix, &fname).await
                             }
                         }).await {
                             Ok(url) => {
@@ -1185,12 +1243,11 @@ impl NestingProcessor {
                         match retry_with_backoff("upload improvement last page", || {
                             let client = s3_client_for_task.clone();
                             let bucket = s3_bucket_for_task.clone();
-                            let region = aws_region_for_task.clone();
-                            let endpoint = endpoint_url_for_task.clone();
+                            let s3 = Arc::clone(&s3_settings_for_task);
                             let bytes = last_page_bytes.clone();
                             let prefix = s3_prefix_for_task.clone();
                             async move {
-                                upload_svg_to_s3_internal(&client, &bucket, &region, &bytes, &prefix, "last-page.svg", endpoint.as_deref()).await
+                                upload_svg_to_s3_internal(&client, &s3, &bucket, &bytes, &prefix, "last-page.svg").await
                             }
                         }).await {
                             Ok(url) => {
@@ -1393,7 +1450,7 @@ impl NestingProcessor {
             let final_bucket = request
                 .bucket
                 .clone()
-                .unwrap_or_else(|| self.s3_bucket.clone());
+                .unwrap_or_else(|| self.s3.bucket.clone());
             let final_prefix = request
                 .s3_prefix
                 .clone()
@@ -1406,13 +1463,12 @@ impl NestingProcessor {
                 match retry_with_backoff(&format!("upload final page {}", page_idx), || {
                     let s3_client = self.s3_client.clone();
                     let bucket = final_bucket.clone();
-                    let region = self.aws_region.clone();
-                    let endpoint = self.endpoint_url.clone();
+                    let s3 = Arc::clone(&self.s3);
                     let bytes = page_bytes.clone();
                     let prefix = final_prefix.clone();
                     let fname = filename.clone();
                     async move {
-                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &prefix, &fname, endpoint.as_deref()).await
+                        upload_svg_to_s3_internal(&s3_client, &s3, &bucket, &bytes, &prefix, &fname).await
                     }
                 }).await {
                     Ok(url) => {
@@ -1444,12 +1500,11 @@ impl NestingProcessor {
                 match retry_with_backoff("upload final last page", || {
                     let s3_client = self.s3_client.clone();
                     let bucket = final_bucket.clone();
-                    let region = self.aws_region.clone();
-                    let endpoint = self.endpoint_url.clone();
+                    let s3 = Arc::clone(&self.s3);
                     let bytes = last_page_bytes.clone();
                     let prefix = final_prefix.clone();
                     async move {
-                        upload_svg_to_s3_internal(&s3_client, &bucket, &region, &bytes, &prefix, "last-page.svg", endpoint.as_deref()).await
+                        upload_svg_to_s3_internal(&s3_client, &s3, &bucket, &bytes, &prefix, "last-page.svg").await
                     }
                 }).await {
                     Ok(url) => {
@@ -2018,10 +2073,8 @@ mod tests {
         NestingProcessor::new(
             kafka.producer().expect("producer builds without a broker"),
             aws_sdk_s3::Client::new(&aws),
-            "test-bucket".to_string(),
-            "us-east-1".to_string(),
+            S3Settings::new("test-bucket", "us-east-1", None, None),
             kafka,
-            None,
         )
     }
 
@@ -2162,6 +2215,133 @@ mod tests {
             parse_s3_url("https://localhost:4566/my-bucket/path/to/file.svg").unwrap();
         assert_eq!(bucket, "my-bucket");
         assert_eq!(key, "path/to/file.svg");
+    }
+
+    // ── endpoint-config-aware parsing ──
+    // The nine tests above call `parse_s3_url`, i.e. `endpoint_host: None`, and are
+    // deliberately untouched: they are the proof that AWS behaviour is unchanged.
+
+    const VK_HOST: &str = "hb.ru-msk.vkcs.cloud";
+
+    #[test]
+    fn test_parse_s3_url_vk_virtual_host_needs_endpoint_config() {
+        let url = "https://cutl-staging-data.hb.ru-msk.vkcs.cloud/nesting/abc/page-0.svg";
+
+        // The gap this closes, and it is a silent one: with no endpoint configured
+        // the generic path-style fallback treats the whole host as the authority and
+        // reads the FIRST KEY SEGMENT as the bucket. No error — just a GET against a
+        // bucket named `nesting`.
+        assert_eq!(
+            parse_s3_url(url).unwrap(),
+            ("nesting".to_string(), "abc/page-0.svg".to_string())
+        );
+
+        let (bucket, key) = parse_s3_url_with(url, Some(VK_HOST)).unwrap();
+        assert_eq!(bucket, "cutl-staging-data");
+        assert_eq!(key, "nesting/abc/page-0.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_vk_virtual_host_single_segment_key() {
+        // The same URL shape with a one-segment key fails loudly instead of quietly.
+        let url = "https://cutl-staging-data.hb.ru-msk.vkcs.cloud/page-0.svg";
+        assert!(parse_s3_url(url).is_err());
+
+        let (bucket, key) = parse_s3_url_with(url, Some(VK_HOST)).unwrap();
+        assert_eq!(bucket, "cutl-staging-data");
+        assert_eq!(key, "page-0.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_vk_path_style() {
+        let url = "https://hb.ru-msk.vkcs.cloud/cutl-staging-data/nesting/abc/page-0.svg";
+        let (bucket, key) = parse_s3_url_with(url, Some(VK_HOST)).unwrap();
+        assert_eq!(bucket, "cutl-staging-data");
+        assert_eq!(key, "nesting/abc/page-0.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_endpoint_host_is_case_insensitive() {
+        let (bucket, key) = parse_s3_url_with(
+            "https://CUTL-DATA.HB.RU-MSK.VKCS.CLOUD/k.svg",
+            Some(VK_HOST),
+        )
+        .unwrap();
+        assert_eq!(bucket, "cutl-data");
+        assert_eq!(key, "k.svg");
+    }
+
+    #[test]
+    fn test_parse_s3_url_endpoint_suffix_match_requires_a_dot() {
+        // A lookalike host must NOT be read as bucket `evil` on our endpoint.
+        let (bucket, _) =
+            parse_s3_url_with("https://evil-hb.ru-msk.vkcs.cloud/b/k.svg", Some(VK_HOST)).unwrap();
+        assert_eq!(
+            bucket, "b",
+            "must fall through to the generic path-style branch"
+        );
+    }
+
+    #[test]
+    fn test_parse_s3_url_aws_still_parses_with_vk_endpoint_configured() {
+        // The flip-back safety property: VK config in place, AWS URLs still resolve.
+        let (bucket, key) = parse_s3_url_with(
+            "https://cutl-staging-uploads-ap-east-1.s3.ap-east-1.amazonaws.com/nesting/a/p.svg",
+            Some(VK_HOST),
+        )
+        .unwrap();
+        assert_eq!(bucket, "cutl-staging-uploads-ap-east-1");
+        assert_eq!(key, "nesting/a/p.svg");
+
+        let (bucket, key) =
+            parse_s3_url_with("s3://cutl-staging-data/nesting/a/p.svg", Some(VK_HOST)).unwrap();
+        assert_eq!(bucket, "cutl-staging-data");
+        assert_eq!(key, "nesting/a/p.svg");
+    }
+
+    #[test]
+    fn test_object_url_round_trips_through_the_parser() {
+        // The two halves of a job: `object_url` builds the URL we hand back, and a
+        // follow-up request feeds that same string in as `svgUrl`. If they ever
+        // disagree, results become unreadable — so pin the agreement in both
+        // addressing styles, and on AWS.
+        let cases = [
+            S3Settings::new(
+                "cutl-staging-data",
+                "ru-msk",
+                Some("https://hb.ru-msk.vkcs.cloud".into()),
+                None,
+            ),
+            S3Settings::new(
+                "cutl-staging-data",
+                "ru-msk",
+                Some("https://hb.ru-msk.vkcs.cloud".into()),
+                Some(false),
+            ),
+            S3Settings::new(
+                "cutl-test-uploads",
+                "ru-msk",
+                Some("http://minio:9000".into()),
+                None,
+            ),
+            S3Settings::new("cutl-staging-uploads-ap-east-1", "ap-east-1", None, None),
+        ];
+        let key = "nesting/abc/page-0.svg";
+        for s3 in cases {
+            let url = s3.object_url(&s3.bucket, key);
+            let parsed = parse_s3_url_with(&url, s3.endpoint_host())
+                .unwrap_or_else(|e| panic!("{url} should parse: {e}"));
+            assert_eq!(parsed, (s3.bucket.clone(), key.to_string()), "url {url}");
+        }
+    }
+
+    #[test]
+    fn test_parse_s3_url_minio_endpoint_agrees_with_generic_fallback() {
+        let url = "http://minio:9000/cutl-test-uploads/nesting/a/p.svg";
+        assert_eq!(
+            parse_s3_url_with(url, Some("minio:9000")).unwrap(),
+            parse_s3_url(url).unwrap()
+        );
     }
 
     #[test]

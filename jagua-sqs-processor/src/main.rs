@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::Client as S3Client;
 use jagua_sqs_processor::kafka::KafkaSettings;
 use jagua_sqs_processor::metrics::metrics;
 use jagua_sqs_processor::observability::{init_tracing, serve_health, Health};
+use jagua_sqs_processor::s3::S3Settings;
 use jagua_sqs_processor::NestingProcessor;
 use log::{error, info};
 // `fetch_metadata` lives on the Consumer trait, not on StreamConsumer itself.
@@ -19,8 +18,7 @@ const SERVICE_NAME: &str = "jagua-nesting";
 /// Everything the worker needs from the environment.
 struct Config {
     kafka: KafkaSettings,
-    s3_bucket: String,
-    aws_region: String,
+    s3: S3Settings,
 }
 
 /// Read and validate configuration.
@@ -30,23 +28,13 @@ struct Config {
 ///
 /// The Kafka variables are supplied verbatim by the `kafka-jagua-nesting` Secret,
 /// which cutl-infra mounts with `envFrom`; there is nothing to parse or decode.
-/// `S3_BUCKET` has no default on purpose: guessing a bucket name would write
-/// results somewhere nobody is reading.
+/// The storage variables are resolved by `S3Settings` — see that module for why
+/// empty is treated as absent throughout, and why `S3_BUCKET` has no default.
 fn load_config() -> Result<Config> {
     let kafka = KafkaSettings::from_env()?;
-    let s3_bucket = env::var("S3_BUCKET")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .context("S3_BUCKET is required")?;
-    // eu-north-1 is where the buckets live. Reaching them from VK needs the relay
-    // (AWS_ENDPOINT_URL); the region stays the bucket's real region either way.
-    let aws_region = env::var("AWS_REGION").unwrap_or_else(|_| "eu-north-1".to_string());
+    let s3 = S3Settings::from_env()?;
 
-    Ok(Config {
-        kafka,
-        s3_bucket,
-        aws_region,
-    })
+    Ok(Config { kafka, s3 })
 }
 
 /// Block until `fetch_metadata` succeeds, flipping `health` ready when it does.
@@ -171,11 +159,9 @@ async fn main() -> Result<()> {
     info!("  KAFKA_RESPONSE_TOPIC: {}", config.kafka.response_topic);
     info!("  KAFKA_SASL_MECHANISM: {}", config.kafka.sasl_mechanism);
     info!("  KAFKA_USERNAME: {}", config.kafka.username);
-    info!("  S3_BUCKET: {}", config.s3_bucket);
-    info!("  AWS_REGION: {}", config.aws_region);
+    info!("  S3: {}", config.s3.describe());
 
-    let (kafka_settings, s3_bucket, aws_region) =
-        (config.kafka, config.s3_bucket, config.aws_region);
+    let (kafka_settings, s3_settings) = (config.kafka, config.s3);
 
     // Create the `cutl_retries_exhausted_total` series before the first failure.
     // A labelled counter has no series until its child exists, and the alert's
@@ -188,10 +174,10 @@ async fn main() -> Result<()> {
         &kafka_settings.retry_topic(3),
     ]);
 
-    // Log AWS configuration
+    // Credentials are logged separately from the resolved `S3:` line above because
+    // at a storage cutover the two flip together, and a mismatch between them fails
+    // exactly like a wrong endpoint from the outside.
     info!("AWS Configuration:");
-    info!("  AWS_REGION: {:?}", env::var("AWS_REGION"));
-    info!("  AWS_ENDPOINT_URL: {:?}", env::var("AWS_ENDPOINT_URL"));
     info!(
         "  AWS_ACCESS_KEY_ID: {:?}",
         env::var("AWS_ACCESS_KEY_ID").map(|s| format!("{}...", &s[..10.min(s.len())]))
@@ -201,36 +187,9 @@ async fn main() -> Result<()> {
         env::var("AWS_SECRET_ACCESS_KEY").map(|_| "***")
     );
 
-    // Initialize AWS clients - both use LocalStack endpoint if provided
-    let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
-
-    // AWS_ENDPOINT_URL is what points S3 at MinIO locally — and it is also the
-    // hook the future eu-west-1 relay will use, since `s3.eu-north-1` is
-    // unreachable from a VK pod. Not test-only scaffolding.
-    let use_path_style = env::var("AWS_ENDPOINT_URL").is_ok();
-
-    if let Ok(endpoint_url) = env::var("AWS_ENDPOINT_URL") {
-        config_loader = config_loader.endpoint_url(&endpoint_url);
-        info!("Using S3 endpoint override: {}", endpoint_url);
-    } else {
-        info!("No AWS_ENDPOINT_URL set, using default AWS S3 endpoints");
-    }
-
-    let aws_config = config_loader.load().await;
-
-    // Path-style addressing for MinIO/LocalStack and for a relay: virtual-hosted
-    // style (bucket.host) cannot work against a host that is not the real S3.
-    let s3_client = if use_path_style {
-        info!("Using path-style S3 addressing");
-        let s3_config = aws_sdk_s3::config::Builder::from(&aws_config)
-            .force_path_style(true)
-            .build();
-        S3Client::from_conf(s3_config)
-    } else {
-        S3Client::new(&aws_config)
-    };
-
-    let endpoint_url = env::var("AWS_ENDPOINT_URL").ok();
+    // Built after the health server on purpose, so probes stay truthful if this
+    // hangs. Endpoint, addressing mode and region all come from `S3Settings`.
+    let s3_client = s3_settings.build_client().await;
 
     // Build the Kafka clients. Failure here is a dependency problem, not a code
     // problem, so it withholds readiness rather than exiting — same reasoning as
@@ -252,14 +211,7 @@ async fn main() -> Result<()> {
     // own clients from the same settings.
     let kafka_settings_for_tiers = kafka_settings.clone();
 
-    let processor = NestingProcessor::new(
-        producer,
-        s3_client,
-        s3_bucket,
-        aws_region,
-        kafka_settings,
-        endpoint_url,
-    );
+    let processor = NestingProcessor::new(producer, s3_client, s3_settings, kafka_settings);
 
     // Spawn signal handler
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())

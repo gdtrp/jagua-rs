@@ -101,10 +101,51 @@ spec:
             # THE BACKEND MUST POINT AT THE SAME BUCKET: it writes the input and
             # sends the object key over Kafka, so a region split turns a working
             # pipeline into NoSuchKey on every job.
+            #
+            # ── STORAGE BACKEND: switchable by configuration alone ──
+            # The five values below render from GitHub repository VARIABLES via
+            # envsubst in deploy.yml. With none of them set they render the AWS Hong
+            # Kong values above, i.e. exactly the behaviour that predates this block.
+            #
+            # TO MOVE STAGING TO VK OBJECT STORAGE — no code change, no PR:
+            #   JAGUA_STAGING_S3_BUCKET   = cutl-staging-data
+            #   JAGUA_STAGING_S3_REGION   = ru-msk
+            #   JAGUA_STAGING_S3_ENDPOINT = https://hb.ru-msk.vkcs.cloud
+            # and IN THE SAME CHANGE swap the credentials, which keep their names
+            # but not their values:
+            #   cutl-infra/scripts/vk-github-secrets.sh staging --s3-source=vk
+            # then use "Re-run all jobs" on the latest main push run. A dispatch run
+            # will NOT do it: deploy-vk-staging is gated on event_name == 'push'.
+            # Both halves then land on one rollout — which matters, because
+            # credentials that do not match the endpoint fail every single S3 call.
+            #
+            # TO GO BACK TO AWS: clear the three variables, re-run that script
+            # WITHOUT --s3-source=vk, re-run the workflow.
+            #
+            # An EMPTY value means "unset": S3Settings filters empty and
+            # whitespace-only on every variable it reads. That is load-bearing, not
+            # defensive — it is what lets envsubst emit an always-present key that
+            # is inert. PRODUCTION IS NOT PARAMETERISED; it stays on AWS Hong Kong.
             - name: S3_BUCKET
-              value: "cutl-staging-uploads-ap-east-1"
+              value: "${JAGUA_STAGING_S3_BUCKET}"
             - name: AWS_REGION
-              value: "ap-east-1"
+              value: "${JAGUA_STAGING_S3_REGION}"
+            # AWS_ENDPOINT_URL_S3, not AWS_ENDPOINT_URL: the suffix scopes the
+            # override to S3 and is the name cutl-infra's handoff specifies.
+            # S3Settings prefers it and falls back to the unsuffixed one, which is
+            # what the local MinIO harness sets — so both keep working.
+            - name: AWS_ENDPOINT_URL_S3
+              value: "${JAGUA_STAGING_S3_ENDPOINT}"
+            # Empty ⇒ derived: an endpoint override implies path-style, because only
+            # the real S3 has the wildcard DNS that virtual-host addressing needs.
+            # Escape hatch only; never set this false against MinIO.
+            - name: S3_FORCE_PATH_STYLE
+              value: "${JAGUA_STAGING_S3_FORCE_PATH_STYLE}"
+            # Empty ⇒ no ACL, the AWS behaviour. VK has no bucket policies, so if the
+            # backend ever hands jagua a `public/` s3Prefix whose objects a browser
+            # fetches through the CDN, those need `public-read` set per object.
+            - name: S3_UPLOAD_ACL
+              value: "${JAGUA_STAGING_S3_UPLOAD_ACL}"
             - name: HEALTH_PORT
               value: "8080"
             # Tempo's OTLP receiver. observability.rs treats an unset value as

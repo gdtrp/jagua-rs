@@ -667,7 +667,7 @@ async fn test_cancellation_request_handling() -> Result<()> {
 
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::Client as S3Client;
-    use jagua_sqs_processor::{KafkaSettings, NestingProcessor};
+    use jagua_sqs_processor::{KafkaSettings, NestingProcessor, S3Settings};
 
     // rdkafka connects lazily, so a producer pointed at a dead address constructs
     // fine. This test only exercises the cancellation registry, never the wire.
@@ -690,10 +690,8 @@ async fn test_cancellation_request_handling() -> Result<()> {
     let processor = NestingProcessor::new(
         kafka.producer().expect("producer builds without a broker"),
         S3Client::new(&config),
-        "test-bucket".to_string(),
-        "us-east-1".to_string(),
+        S3Settings::new("test-bucket", "us-east-1", None, None),
         kafka,
-        None,
     );
 
     // Create a cancellation request (only correlation_id and cancelled are required)

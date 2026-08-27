@@ -55,13 +55,37 @@ Optional:
 | `KAFKA_RESPONSE_TOPIC` | `nesting-response` | |
 | `KAFKA_ATTEMPT_BUDGET` | `3` | Handler invocations before a message is dropped |
 | `KAFKA_RETRY_DELAYS_MS` | `5000,60000,600000` | Tier delays; lowered in tests |
-| `AWS_REGION` | `eu-north-1` | Region of the S3 bucket |
-| `AWS_ENDPOINT_URL` | unset | S3 endpoint override — MinIO locally, and the hook for the eu-west-1 relay |
+| `AWS_REGION` | `eu-north-1` | Region of the S3 bucket, and the SigV4 signing region — it must move with the endpoint |
+| `AWS_DEFAULT_REGION` | — | Consulted only if `AWS_REGION` is unset |
+| `AWS_ENDPOINT_URL_S3` | unset | S3 endpoint override. Preferred over the unsuffixed name |
+| `AWS_ENDPOINT_URL` | unset | Fallback endpoint override — what the MinIO harness sets |
+| `S3_FORCE_PATH_STYLE` | endpoint set ⇒ `true` | `true/1/yes/on` or `false/0/no/off`; anything else holds `/ready` at 503 |
+| `S3_UPLOAD_ACL` | unset ⇒ no ACL | Canned ACL on every PUT, e.g. `public-read` |
 | `MAX_CONCURRENT_TASKS` | `20` | Concurrent nesting jobs |
 | `EXECUTION_TIMEOUT_SECS` | `600` | Per-job cap; `maxSeconds` may lower it |
 | `HEALTH_PORT` | `8080` | Serves `/health`, `/ready`, `/metrics` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Unset means stdout logging only, not an error |
 | `RUST_LOG` | `info` | |
+
+### Storage backend
+
+Bucket, region, endpoint, addressing mode and upload ACL are resolved in one place
+(`src/s3.rs`, `S3Settings`) and are switchable by configuration alone — moving
+staging between AWS and VK Object Storage needs no code change. Two rules make that
+work, and both are load-bearing:
+
+- **Empty means absent** for every variable above. `deploy/k8s/deployment-staging.yaml`
+  renders these keys from GitHub repository variables via `envsubst`, which has no
+  notion of "unset" — an unset variable becomes `value: ""`.
+- **The endpoint is applied explicitly, never left to the SDK.** `aws-sdk-s3` reads
+  `AWS_ENDPOINT_URL_S3` itself, but that path has no emptiness check, so an empty
+  value would become an empty endpoint and fail every request. `build_client` calls
+  `set_endpoint_url` unconditionally so `None` clears it. It also needs the value for
+  two things the SDK cannot do for us: the result URL handed back to the backend, and
+  endpoint-aware parsing of incoming S3 URLs.
+
+See the runbook comment in `deploy/k8s/deployment-staging.yaml` for the cutover and
+the rollback. Production is not parameterised and stays on AWS.
 
 **Missing configuration does not exit the process.** It logs the problem and keeps
 `/ready` at 503 so Kubernetes withholds traffic. Exiting produced a crash-loop that

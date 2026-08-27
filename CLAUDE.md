@@ -176,6 +176,31 @@ truthful if startup hangs. In `deploy/k8s/`, `terminationGracePeriodSeconds: 600
 are load-bearing: a nesting run is minutes long and single-owner, and the default 30s would SIGKILL a job
 mid-flight on every rollout.
 
+### Storage backend (`s3.rs`)
+
+All storage configuration resolves in `jagua-sqs-processor/src/s3.rs` (`S3Settings`),
+so switching staging between AWS and VK Object Storage is configuration only —
+`deploy/k8s/deployment-staging.yaml` renders `S3_BUCKET`/`AWS_REGION`/
+`AWS_ENDPOINT_URL_S3`/`S3_FORCE_PATH_STYLE`/`S3_UPLOAD_ACL` from `JAGUA_STAGING_S3_*`
+GitHub repository variables, defaulting to the AWS Hong Kong values. Production is
+not parameterised. Three things there are load-bearing:
+
+- **Empty is treated as absent everywhere.** `envsubst` has no "unset", so an unset
+  repository variable reaches the pod as `value: ""`.
+- **`build_client` calls `set_endpoint_url` unconditionally**, including with `None`.
+  `aws-sdk-s3` reads `AWS_ENDPOINT_URL_S3` itself via `service_config_key`, and that
+  path has *no* emptiness check — an empty value becomes an empty endpoint and every
+  request fails. Do not rewrite it as `if let Some(...)`.
+- **New manifest placeholders must be added to the `envsubst` allowlist** in
+  deploy.yml's render step, and must keep the `JAGUA_STAGING_` prefix: a bare
+  `${AWS_REGION}` would be shadowed by the workflow-level `AWS_REGION: eu-north-1`
+  (the ECR region) and render silently wrong.
+
+`parse_s3_url_with` recognises the configured endpoint in both addressing styles
+before falling back to the hardcoded `amazonaws` heuristics, so AWS URLs keep parsing
+while VK config is in place. `parse_s3_url` (the `None`-defaulting shim) is test-only
+and exists so the pre-existing parser tests stay untouched as the compatibility proof.
+
 ### AsyncAPI Wire Codegen (jagua-sqs-processor)
 
 The wire contract is **spec-governed**, not hand-written. The AsyncAPI spec (`jagua-sqs-processor/asyncapi/jagua-rs.yaml`) is the single source of truth, pulled from the `gdtrp/cutl-schemas` repo via `scripts/sync-schema.sh` (the file is **git-ignored** and must be synced before building the processor; CI does this automatically).
@@ -190,7 +215,7 @@ The wire contract is **spec-governed**, not hand-written. The AsyncAPI spec (`ja
 - `CDEConfig`: `quadtree_depth` (default 5), `cd_threshold` (default 16), `item_surrogate_config`
 - LBF config: `n_samples`, `ls_frac`, `poly_simpl_tolerance`, `min_item_separation`, `prng_seed`
 - Processor env vars — Kafka: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_USERNAME`, `KAFKA_PASSWORD` (all required; supplied verbatim by the `kafka-jagua-nesting` Secret via `envFrom`), `KAFKA_SASL_MECHANISM` (SCRAM-SHA-512), `KAFKA_CONSUMER_GROUP`, `KAFKA_REQUEST_TOPIC`, `KAFKA_RESPONSE_TOPIC`, `KAFKA_ATTEMPT_BUDGET` (3), `KAFKA_RETRY_DELAYS_MS` (5s,60s,600s — shorten in tests)
-- Processor env vars — rest: `S3_BUCKET` (required, no default on purpose), `AWS_REGION` (eu-north-1), `AWS_ENDPOINT_URL` (S3 relay / MinIO), `MAX_CONCURRENT_TASKS` (20), `EXECUTION_TIMEOUT_SECS` (600), `NEST_RUN_PARALLELISM`, `HEALTH_PORT` (8080), `OTEL_EXPORTER_OTLP_ENDPOINT` (unset ⇒ stdout only)
+- Processor env vars — rest: `S3_BUCKET` (required, no default on purpose), `AWS_REGION` (eu-north-1), `AWS_ENDPOINT_URL_S3` then `AWS_ENDPOINT_URL` (S3 endpoint override — VK Object Storage / MinIO), `S3_FORCE_PATH_STYLE` (defaults to "endpoint is set"), `S3_UPLOAD_ACL` (unset ⇒ no ACL), `MAX_CONCURRENT_TASKS` (20), `EXECUTION_TIMEOUT_SECS` (600), `NEST_RUN_PARALLELISM`, `HEALTH_PORT` (8080), `OTEL_EXPORTER_OTLP_ENDPOINT` (unset ⇒ stdout only)
 
 ### Important Conventions
 

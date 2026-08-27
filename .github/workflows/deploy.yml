@@ -276,14 +276,48 @@ jobs:
           IMAGE: ${{ env.VK_REGISTRY }}/${{ env.VK_IMAGE }}:${{ github.sha }}
           DEPLOYMENT_ENV: staging
           GIT_SHA: ${{ github.sha }}
+          # Storage backend, read at ROLLOUT time from repository variables (this
+          # job declares no `environment:`, so `vars.*` are the repo-level ones).
+          # Unset renders empty and the defaults below then apply, which is what
+          # makes the parameterisation inert until someone deliberately flips it.
+          #
+          # THE NAMES ARE PREFIXED ON PURPOSE. A placeholder called ${AWS_REGION}
+          # would be shadowed by the workflow-level `env: AWS_REGION: eu-north-1`
+          # at the top of this file — envsubst would silently render the ECR region
+          # into the staging Deployment, with no error anywhere.
+          JAGUA_STAGING_S3_BUCKET: ${{ vars.JAGUA_STAGING_S3_BUCKET }}
+          JAGUA_STAGING_S3_REGION: ${{ vars.JAGUA_STAGING_S3_REGION }}
+          JAGUA_STAGING_S3_ENDPOINT: ${{ vars.JAGUA_STAGING_S3_ENDPOINT }}
+          JAGUA_STAGING_S3_FORCE_PATH_STYLE: ${{ vars.JAGUA_STAGING_S3_FORCE_PATH_STYLE }}
+          JAGUA_STAGING_S3_UPLOAD_ACL: ${{ vars.JAGUA_STAGING_S3_UPLOAD_ACL }}
         run: |
           set -euo pipefail
+
+          # envsubst has no ${VAR:-default} syntax, so defaults are applied here.
+          # The AWS Hong Kong values are the defaults; the empty ones are read as
+          # "absent" by S3Settings, giving today's behaviour exactly.
+          export JAGUA_STAGING_S3_BUCKET="${JAGUA_STAGING_S3_BUCKET:-cutl-staging-uploads-ap-east-1}"
+          export JAGUA_STAGING_S3_REGION="${JAGUA_STAGING_S3_REGION:-ap-east-1}"
+          export JAGUA_STAGING_S3_ENDPOINT="${JAGUA_STAGING_S3_ENDPOINT:-}"
+          export JAGUA_STAGING_S3_FORCE_PATH_STYLE="${JAGUA_STAGING_S3_FORCE_PATH_STYLE:-}"
+          export JAGUA_STAGING_S3_UPLOAD_ACL="${JAGUA_STAGING_S3_UPLOAD_ACL:-}"
+          echo "storage: bucket=$JAGUA_STAGING_S3_BUCKET region=$JAGUA_STAGING_S3_REGION endpoint=${JAGUA_STAGING_S3_ENDPOINT:-<aws default>}"
+
           rendered=/tmp/jagua-manifests.yaml
           : > "$rendered"
           for f in deploy/k8s/deployment-staging.yaml deploy/k8s/service-staging.yaml; do
-            envsubst '${IMAGE} ${DEPLOYMENT_ENV} ${GIT_SHA}' < "$f" >> "$rendered"
+            envsubst '${IMAGE} ${DEPLOYMENT_ENV} ${GIT_SHA} ${JAGUA_STAGING_S3_BUCKET} ${JAGUA_STAGING_S3_REGION} ${JAGUA_STAGING_S3_ENDPOINT} ${JAGUA_STAGING_S3_FORCE_PATH_STYLE} ${JAGUA_STAGING_S3_UPLOAD_ACL}' < "$f" >> "$rendered"
             echo '---' >> "$rendered"
           done
+
+          # A placeholder missing from the allowlist above renders LITERALLY: the
+          # pod would come up with S3_BUCKET='${JAGUA_STAGING_S3_BUCKET}' and fail
+          # every job with NoSuchBucket. Cheap permanent guard against that.
+          if grep -n '\${' "$rendered"; then
+            echo "::error::unsubstituted placeholder in the rendered manifest — add it to the envsubst allowlist in this step"
+            exit 1
+          fi
+
           kubectl apply --server-side --force-conflicts --dry-run=server -f "$rendered"
           kubectl apply --server-side --force-conflicts -f "$rendered"
 
