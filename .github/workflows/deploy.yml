@@ -191,6 +191,13 @@ jobs:
     concurrency:
       group: jagua-vk-staging-deploy
       cancel-in-progress: false
+    # Resolves the staging-vk ENVIRONMENT secrets (VK_S3_SECRETS et al set by
+    # cutl-infra's vk-github-secrets.sh). Without this the job fell back to the
+    # 2026-08-08 repository-scoped secrets - the old AWS keys - and the staging
+    # pods ran AWS credentials against the VK endpoint after the storage
+    # cutover. Repo-level `vars.*` (JAGUA_STAGING_S3_*) still resolve: an
+    # environment only shadows same-named variables, and staging-vk defines none.
+    environment: staging-vk
     runs-on: ubuntu-latest
     permissions:
       contents: read
