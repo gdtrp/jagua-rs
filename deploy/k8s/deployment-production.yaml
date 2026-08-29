@@ -125,24 +125,34 @@ spec:
             - secretRef:
                 name: jagua-s3-secrets
           env:
-            # S3 stays on AWS — only the queue moved to Kafka, the payload path
-            # did not. ap-east-1 (Hong Kong) because VK's egress filtering is per
-            # AWS REGION and IP-prefix based on the Russian path: eu-north-1,
-            # where every other production bucket lives, measured 0/6 from a pod.
-            # TCP connects fine and only the TLS handshake is dropped regardless
-            # of SNI, so a connect-only probe reports a dead region as healthy.
-            #
-            # A SEPARATE BUCKET FROM STAGING'S: staging's stack is
-            # RemovalPolicy.DESTROY with autoDeleteObjects. Created by
-            # cutl-infra's cutl-relay-production-hk stack, which is RETAIN.
+            # S3 is VK Object Storage since the 2026-08-29 cutover. It used to be
+            # AWS Hong Kong: VK's egress filtering is per AWS REGION, so eu-north-1
+            # measured 0/6 from a pod and ap-east-1 was the reachable compromise.
+            # That path then started returning EAI_AGAIN on the resolver in waves
+            # and broke real uploads, which is what forced the move. There is now
+            # no cross-border hop at all.
             #
             # THE BACKEND MUST POINT AT THE SAME BUCKET: it writes the input and
-            # sends the object key over Kafka, so a region split turns a working
+            # sends the object key over Kafka, so a bucket split turns a working
             # pipeline into NoSuchKey on every job.
             - name: S3_BUCKET
-              value: "cutl-production-uploads-ap-east-1"
+              value: "cutl-production-data"
             - name: AWS_REGION
-              value: "ap-east-1"
+              value: "ru-msk"
+            # AWS_ENDPOINT_URL_S3, not AWS_ENDPOINT_URL: the suffix scopes the
+            # override to S3. S3Settings prefers it and falls back to the
+            # unsuffixed one, which is what the local MinIO harness sets.
+            - name: AWS_ENDPOINT_URL_S3
+              value: "https://hb.ru-msk.vkcs.cloud"
+            # An endpoint override implies path-style: only the real S3 has the
+            # wildcard DNS that virtual-host addressing needs.
+            - name: S3_FORCE_PATH_STYLE
+              value: "true"
+            # VK has NO bucket policies, so public reads are granted per object.
+            # jagua writes nesting results the browser fetches through the CDN,
+            # and an object without this ACL 403s there.
+            - name: S3_UPLOAD_ACL
+              value: "public-read"
             - name: HEALTH_PORT
               value: "8080"
             # Tempo's OTLP receiver. observability.rs treats an unset value as
