@@ -148,11 +148,21 @@ spec:
             # wildcard DNS that virtual-host addressing needs.
             - name: S3_FORCE_PATH_STYLE
               value: "true"
-            # VK has NO bucket policies, so public reads are granted per object.
-            # jagua writes nesting results the browser fetches through the CDN,
-            # and an object without this ACL 403s there.
-            - name: S3_UPLOAD_ACL
-              value: "public-read"
+            # S3_UPLOAD_ACL IS DELIBERATELY UNSET. It was briefly set to
+            # public-read in the 2026-08-29 cutover commit and that was wrong:
+            # the ACL applies to every PUT with no key awareness, and jagua
+            # writes {teamId}/private/nesting_result/... - private keys, served
+            # to the browser as short-TTL presigned URLs, never through the CDN.
+            # A blanket ACL would have made every customer's nesting result
+            # world-readable. Nothing leaked: every job was already failing at
+            # the download step, so no PUT ever ran with it.
+            #
+            # Staging never carried it either, which is the check that caught
+            # this - its pod has the value empty and works.
+            #
+            # If a genuinely public key ever needs an ACL here, copy
+            # dxf-processor's approach: match "/public/" as a substring per key
+            # (S3_PUBLIC_READ_KEY_PATTERNS), never a blanket setting.
             - name: HEALTH_PORT
               value: "8080"
             # Tempo's OTLP receiver. observability.rs treats an unset value as
