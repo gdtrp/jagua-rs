@@ -96,6 +96,23 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// librdkafka's `message.max.bytes`: a round **1,000,000**, not 1 MiB.
+///
+/// The distinction is load-bearing. A response of 1,024,000 bytes ("1000 KB")
+/// clears a `1024 * 1024` check and is then rejected by the producer, which is
+/// exactly how two finished production jobs were discarded on 2026-08-31. The
+/// rejection happens client-side in `rd_kafka_msg_new0()` — the broker never sees
+/// the message, so raising the broker's own limit would not have helped, and
+/// neither would compression: the check is against the UNCOMPRESSED wire size.
+pub const PRODUCER_MAX_MESSAGE_BYTES: usize = 1_000_000;
+
+/// Worst-case per-message framing librdkafka adds on top of key + value + headers
+/// (`RD_KAFKAP_MESSAGE_V2_MAX_OVERHEAD`: five 32-bit varints, one 64-bit varint and
+/// the attribute byte). The limit is checked against
+/// `overhead + keylen + valuelen + hdrslen`, so a guard that looks only at the
+/// payload is measuring the wrong thing.
+pub const PRODUCER_MESSAGE_OVERHEAD_BYTES: usize = 36;
+
 impl KafkaSettings {
     pub fn from_env() -> Result<Self> {
         let bootstrap_servers = std::env::var("KAFKA_BOOTSTRAP_SERVERS").context(
@@ -211,7 +228,12 @@ impl KafkaSettings {
         cfg.set("message.timeout.ms", "30000")
             // Responses are keyed by correlationId and a retry would otherwise be
             // able to reorder two responses for the same job.
-            .set("enable.idempotence", "true");
+            .set("enable.idempotence", "true")
+            // Set explicitly even though it equals librdkafka's own default, so the
+            // producer-side guard in `processor.rs` can be derived from the same
+            // number instead of restating it. They were allowed to drift once and it
+            // cost two completed nesting jobs — see PRODUCER_MAX_MESSAGE_BYTES.
+            .set("message.max.bytes", PRODUCER_MAX_MESSAGE_BYTES.to_string());
 
         cfg.create()
             .context("failed to create the Kafka producer (check SCRAM credentials)")

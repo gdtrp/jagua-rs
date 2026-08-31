@@ -438,6 +438,7 @@ async fn response_round_trips_through_the_wire_types() -> Result<()> {
         sheets_total: Some(2),
         page_svg_urls: Some(vec!["s3://bucket/p0.svg".to_string()]),
         pages: None,
+        pages_url: None,
         parts_placed: 7,
         utilisation: 0.625,
         is_improvement: false,

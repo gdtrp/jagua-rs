@@ -152,6 +152,7 @@ impl From<&SqsNestingResponse> for generated::NestingResponse {
             sheets_total: r.sheets_total.map(|v| v as i32),
             page_svg_urls: r.page_svg_urls.clone().unwrap_or_default(),
             pages: r.pages.clone().unwrap_or_default(),
+            pages_url: r.pages_url.clone(),
             parts_placed: r.parts_placed as i32,
             utilisation: r.utilisation as f64,
             improvement: r.is_improvement,
@@ -180,6 +181,7 @@ impl From<generated::NestingResponse> for SqsNestingResponse {
             } else {
                 Some(g.pages)
             },
+            pages_url: g.pages_url,
             parts_placed: g.parts_placed.max(0) as usize,
             utilisation: g.utilisation as f32,
             is_improvement: g.improvement,

@@ -17,7 +17,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use crate::kafka::{retry_headers, KafkaSettings, OffsetWatermark, RecordHeaders};
+use crate::kafka::{
+    retry_headers, KafkaSettings, OffsetWatermark, RecordHeaders, PRODUCER_MAX_MESSAGE_BYTES,
+    PRODUCER_MESSAGE_OVERHEAD_BYTES,
+};
 use crate::metrics::metrics;
 use crate::s3::S3Settings;
 
@@ -295,6 +298,12 @@ pub struct SqsNestingResponse {
     pub page_svg_urls: Option<Vec<String>>,
     /// Per-page results: utilisation and placements grouped by page
     pub pages: Option<Vec<PageResult>>,
+    /// S3 URL of the `NestingPagesManifest` holding this response's placements.
+    ///
+    /// Set only when the full response would not fit in one Kafka record; `pages` is
+    /// still sent, with each page's `placements` emptied. Spec'd in cutl-schemas
+    /// v1.18.0 — see `offload_placements`.
+    pub pages_url: Option<String>,
     /// Number of parts placed
     pub parts_placed: usize,
     /// Average bin utilisation ratio (0.0 to 1.0) across all pages
@@ -710,12 +719,51 @@ async fn upload_svg_to_s3_internal(
     Ok(s3_url)
 }
 
-/// Producer-side guard mirroring the broker's `message.max.bytes`.
+/// Filename of the placement manifest written to S3 when a response will not fit
+/// in one Kafka message. Deterministic and beside the page SVGs, so a consumer can
+/// find it from the page URLs without a new wire field.
+const PLACEMENTS_MANIFEST_FILENAME: &str = "placements.json";
+
+/// Bytes a record costs on the wire, the way librdkafka measures it before deciding
+/// whether to reject it: framing + key + payload + headers.
 ///
-/// The old constant was named for SQS's 1 MiB body limit; Kafka's default happens
-/// to be the same order, so the guard survives the port — but it is now a *broker*
-/// limit, and exceeding it fails the produce rather than the API call.
-const KAFKA_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+/// The old guard compared `payload.len()` against `1024 * 1024`. It was wrong twice
+/// over — the limit is 1,000,000 rather than 1 MiB, and key and headers count too —
+/// which let a 1,024,000-byte response through to a produce that could only fail.
+fn record_wire_size(key: &str, payload: &str, headers_len: usize) -> usize {
+    PRODUCER_MESSAGE_OVERHEAD_BYTES + key.len() + payload.len() + headers_len
+}
+
+/// Where the placement manifest for a response lives: beside the page SVGs, under
+/// the same request prefix. Derived from a page URL the response already carries,
+/// so no call site has to thread the request's `s3Prefix` down to the publisher.
+fn manifest_location(
+    response: &SqsNestingResponse,
+    endpoint_host: Option<&str>,
+) -> Option<(String, String)> {
+    let page_url = response
+        .page_svg_urls
+        .as_ref()
+        .and_then(|urls| urls.first())
+        .or(response.first_page_svg_url.as_ref())?;
+    let (bucket, key) = parse_s3_url_with(page_url, endpoint_host).ok()?;
+    let (prefix, _) = key.rsplit_once('/')?;
+    Some((bucket, format!("{prefix}/{PLACEMENTS_MANIFEST_FILENAME}")))
+}
+
+/// Serialized size of the W3C trace headers we attach to every response.
+///
+/// Measured rather than assumed: `inject_current` emits `traceparent` and sometimes
+/// `tracestate`, and the difference is enough to matter at the boundary.
+fn trace_headers_len(headers: &rdkafka::message::OwnedHeaders) -> usize {
+    use rdkafka::message::Headers;
+    (0..headers.count())
+        .map(|i| {
+            let h = headers.get(i);
+            h.key.len() + h.value.map(|v| v.len()).unwrap_or(0)
+        })
+        .sum()
+}
 
 impl NestingProcessor {
     /// Publish one response record.
@@ -732,12 +780,27 @@ impl NestingProcessor {
     ) -> Result<()> {
         let payload = serde_json::to_string(response).context("Failed to serialize response")?;
 
+        // Carry the current trace out with the response, so the backend's consumer
+        // links back to the job that produced it instead of opening a new trace.
+        let headers = crate::trace_context::inject_current(rdkafka::message::OwnedHeaders::new());
+
+        // Last line of defence only. Callers go through `send_to_output_queue`,
+        // which offloads an oversized manifest to S3 before ever getting here, so
+        // reaching this branch means the slimmed response is *still* too big.
+        let wire = record_wire_size(
+            &response.correlation_id,
+            &payload,
+            trace_headers_len(&headers),
+        );
         let size_kb = payload.len() / 1024;
-        if payload.len() > KAFKA_MAX_MESSAGE_BYTES {
+        if wire > PRODUCER_MAX_MESSAGE_BYTES {
             return Err(anyhow!(
-                "Message size {} KB exceeds the broker's message.max.bytes of {} KB",
+                "Response does not fit in one Kafka record: {} wire bytes exceeds \
+                 message.max.bytes of {} (payload {} KB, correlation_id={})",
+                wire,
+                PRODUCER_MAX_MESSAGE_BYTES,
                 size_kb,
-                KAFKA_MAX_MESSAGE_BYTES / 1024
+                response.correlation_id
             ));
         }
 
@@ -745,10 +808,6 @@ impl NestingProcessor {
             "Producing to {}: correlation_id={}, is_final={}, size={} KB",
             topic, response.correlation_id, response.is_final, size_kb
         );
-
-        // Carry the current trace out with the response, so the backend's consumer
-        // links back to the job that produced it instead of opening a new trace.
-        let headers = crate::trace_context::inject_current(rdkafka::message::OwnedHeaders::new());
 
         let record = FutureRecord::to(topic)
             .key(&response.correlation_id)
@@ -774,6 +833,96 @@ impl NestingProcessor {
         Ok(())
     }
 
+    /// Move the per-part placements out of a response that will not fit in one
+    /// Kafka record, into an S3 object beside the page SVGs.
+    ///
+    /// The nesting itself already succeeded and its SVGs are already durably in S3
+    /// by this point; only the manifest is too big to inline. Discarding the whole
+    /// response — which is what happened before this existed — threw away minutes of
+    /// completed optimisation over a payload that was ~2% over the limit.
+    ///
+    /// `placements` is emptied rather than removed, and `pages` is kept: cutl-backend
+    /// dereferences `getPages().stream()` and `getPlacements().stream()` without a
+    /// null check (`NestingResponseData:39`, `:141`), so omitting either would move
+    /// the failure into the backend's consumer instead of fixing it.
+    async fn offload_placements(&self, response: &mut SqsNestingResponse) {
+        let pages = match response.pages.as_ref() {
+            Some(pages) if pages.iter().any(|p| !p.placements.is_empty()) => pages.clone(),
+            // Nothing to move: the size is coming from somewhere else, and slimming
+            // would drop data without buying room.
+            _ => return,
+        };
+        let placements: usize = pages.iter().map(|p| p.placements.len()).sum();
+
+        match manifest_location(response, self.s3.endpoint_host()) {
+            Some((bucket, key)) => {
+                let manifest = serde_json::json!({
+                    "correlationId": response.correlation_id,
+                    "pages": pages,
+                });
+                match serde_json::to_vec(&manifest) {
+                    Ok(body) => {
+                        // Retried like every other upload here: a transient S3 blip
+                        // must not be what costs the placements, since a failure at
+                        // this point drops them from the response entirely.
+                        let put = retry_with_backoff("upload placements manifest", || {
+                            let client = self.s3_client.clone();
+                            let (bucket, key) = (bucket.clone(), key.clone());
+                            let body = body.clone();
+                            let acl = self.s3.upload_acl.clone();
+                            async move {
+                                client
+                                    .put_object()
+                                    .bucket(&bucket)
+                                    .key(&key)
+                                    .body(aws_sdk_s3::primitives::ByteStream::from(body))
+                                    .content_type("application/json")
+                                    .set_acl(acl)
+                                    .send()
+                                    .await
+                            }
+                        })
+                        .await;
+                        match put {
+                            Ok(_) => {
+                                // Only advertise the manifest once it is actually
+                                // durable: a URL for an object that failed to upload
+                                // is worse than no URL at all.
+                                response.pages_url = Some(self.s3.object_url(&bucket, &key));
+                                info!(
+                                    "Offloaded {} placements to s3 bucket={} key={} for correlation_id={}",
+                                    placements, bucket, key, response.correlation_id
+                                );
+                            }
+                            Err(e) => error!(
+                                "Failed to offload placements to s3 bucket={} key={}: {}. \
+                                 Responding without them so the layout is not lost entirely.",
+                                bucket, key, e
+                            ),
+                        }
+                    }
+                    Err(e) => error!("Failed to serialize the placement manifest: {e}"),
+                }
+            }
+            None => error!(
+                "Response for correlation_id={} is too large but carries no page URL to \
+                 derive a manifest location from; responding without placements.",
+                response.correlation_id
+            ),
+        }
+
+        if let Some(pages) = response.pages.as_mut() {
+            for page in pages.iter_mut() {
+                page.placements.clear();
+                page.offcuts.clear();
+            }
+        }
+        metrics()
+            .messages_failed
+            .with_label_values(&["response_placements_offloaded"])
+            .inc();
+    }
+
     /// Publish a response with retries. Retains the original method name so the
     /// ~8 call sites in this file are untouched by the transport swap.
     pub async fn send_to_output_queue(
@@ -783,7 +932,35 @@ impl NestingProcessor {
     ) -> Result<()> {
         let producer = self.producer.clone();
         let topic_owned = topic.to_string();
-        let response_clone = response.clone();
+        let mut response_clone = response.clone();
+
+        // Check the size ONCE, here, rather than inside the retried closure: a
+        // record that is too big is a deterministic failure, and the old code spent
+        // three attempts and two backoffs rediscovering that before dropping the job.
+        match serde_json::to_string(&response_clone) {
+            Ok(payload) => {
+                let headers =
+                    crate::trace_context::inject_current(rdkafka::message::OwnedHeaders::new());
+                let wire = record_wire_size(
+                    &response_clone.correlation_id,
+                    &payload,
+                    trace_headers_len(&headers),
+                );
+                if wire > PRODUCER_MAX_MESSAGE_BYTES {
+                    warn!(
+                        "Response for correlation_id={} is {} wire bytes, over message.max.bytes \
+                         of {}; offloading placements to S3.",
+                        response_clone.correlation_id, wire, PRODUCER_MAX_MESSAGE_BYTES
+                    );
+                    self.offload_placements(&mut response_clone).await;
+                }
+            }
+            // Serialization failure is reported by the produce path below, which
+            // already has the error handling for it.
+            Err(e) => debug!("Pre-flight size check skipped, response not serializable: {e}"),
+        }
+
+        let response_clone = response_clone;
 
         retry_with_backoff("send_to_output_queue", || {
             let producer = producer.clone();
@@ -832,6 +1009,7 @@ impl NestingProcessor {
                             sheets_total: None,
                             page_svg_urls: None,
                             pages: None,
+                            pages_url: None,
                             parts_placed: 0,
                             utilisation: 0.0,
                             is_improvement: false,
@@ -925,6 +1103,7 @@ impl NestingProcessor {
                 sheets_total: None,
                 page_svg_urls: None,
                 pages: None,
+                pages_url: None,
                 parts_placed: 0,
                 utilisation: 0.0,
                 is_improvement: false,
@@ -954,6 +1133,7 @@ impl NestingProcessor {
                 sheets_total: None,
                 page_svg_urls: None,
                 pages: None,
+                pages_url: None,
                 parts_placed: 0,
                 utilisation: 0.0,
                 is_improvement: false,
@@ -987,6 +1167,7 @@ impl NestingProcessor {
                     sheets_total: None,
                     page_svg_urls: None,
                     pages: None,
+                    pages_url: None,
                     parts_placed: 0,
                     utilisation: 0.0,
                     is_improvement: false,
@@ -1042,6 +1223,7 @@ impl NestingProcessor {
                 sheets_total: None,
                 page_svg_urls: None,
                 pages: None,
+                pages_url: None,
                 parts_placed: 0,
                 utilisation: 0.0,
                 is_improvement: false,
@@ -1283,6 +1465,7 @@ impl NestingProcessor {
                         sheets_total: result.sheets_total_estimate,
                         page_svg_urls: Some(page_svg_urls),
                         pages: Some(response_pages),
+                        pages_url: None,
                         parts_placed: result.parts_placed,
                         utilisation: result.utilisation,
                         is_improvement: true,
@@ -1542,6 +1725,7 @@ impl NestingProcessor {
                 sheets_total: nesting_result.sheets_total_estimate,
                 page_svg_urls: Some(page_svg_urls),
                 pages: Some(response_pages),
+                pages_url: None,
                 parts_placed: nesting_result.parts_placed,
                 utilisation: nesting_result.utilisation,
                 is_improvement: false,
@@ -2147,6 +2331,130 @@ mod tests {
         // Normal lock() would fail, but safe_lock should recover
         let value = safe_lock(&mutex);
         assert_eq!(*value, 42);
+    }
+
+    // ── Kafka record size (the 2026-08-31 production loss) ──
+
+    #[test]
+    fn wire_size_counts_key_headers_and_framing_not_just_payload() {
+        // The old guard compared payload.len() alone. Everything the producer
+        // actually measures is here.
+        let key = "64a49e3f-f79e-417b-90ba-e0a52c9cdaf8";
+        let payload = "x".repeat(1000);
+        assert_eq!(
+            record_wire_size(key, &payload, 120),
+            PRODUCER_MESSAGE_OVERHEAD_BYTES + key.len() + 1000 + 120
+        );
+    }
+
+    #[test]
+    fn the_payload_that_was_lost_is_now_rejected_by_the_guard() {
+        // "size=1000 KB" in the incident log: 1000 * 1024 = 1_024_000 bytes. It sits
+        // above librdkafka's 1_000_000 limit but below the old `1024 * 1024` guard,
+        // which is exactly why it passed the check and then failed the produce.
+        let lost = 1000 * 1024;
+        assert!(
+            lost < 1024 * 1024,
+            "the old guard would have let this through"
+        );
+        let wire = record_wire_size(
+            "64a49e3f-f79e-417b-90ba-e0a52c9cdaf8",
+            &"x".repeat(lost),
+            120,
+        );
+        assert!(
+            wire > PRODUCER_MAX_MESSAGE_BYTES,
+            "the guard must now catch it before the produce"
+        );
+    }
+
+    #[test]
+    fn a_response_just_under_the_limit_still_fits() {
+        // Guard against over-correcting into rejecting healthy responses.
+        let key = "64a49e3f-f79e-417b-90ba-e0a52c9cdaf8";
+        let headers = 200;
+        let payload = "x".repeat(
+            PRODUCER_MAX_MESSAGE_BYTES - PRODUCER_MESSAGE_OVERHEAD_BYTES - key.len() - headers,
+        );
+        assert_eq!(
+            record_wire_size(key, &payload, headers),
+            PRODUCER_MAX_MESSAGE_BYTES
+        );
+    }
+
+    fn response_with_page_urls(urls: Vec<String>) -> SqsNestingResponse {
+        SqsNestingResponse {
+            correlation_id: "64a49e3f".to_string(),
+            first_page_svg_url: None,
+            last_page_svg_url: None,
+            sheets: None,
+            sheets_total: None,
+            page_svg_urls: if urls.is_empty() { None } else { Some(urls) },
+            pages: None,
+            pages_url: None,
+            parts_placed: 0,
+            utilisation: 0.0,
+            is_improvement: false,
+            is_final: true,
+            timestamp: 0,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn manifest_lands_beside_the_page_svgs() {
+        let response = response_with_page_urls(vec![
+            "https://hb.ru-msk.vkcs.cloud/cutl-production-data/team/private/nesting/64a49e3f/page-0.svg"
+                .to_string(),
+        ]);
+        let (bucket, key) =
+            manifest_location(&response, Some("hb.ru-msk.vkcs.cloud")).expect("derivable");
+        assert_eq!(bucket, "cutl-production-data");
+        assert_eq!(key, "team/private/nesting/64a49e3f/placements.json");
+    }
+
+    #[test]
+    fn manifest_location_works_on_aws_urls_too() {
+        // The flip-back path: same derivation with no endpoint configured.
+        let response = response_with_page_urls(vec![
+            "https://cutl-production-uploads-ap-east-1.s3.ap-east-1.amazonaws.com/team/private/nesting/64a49e3f/page-0.svg"
+                .to_string(),
+        ]);
+        let (bucket, key) = manifest_location(&response, None).expect("derivable");
+        assert_eq!(bucket, "cutl-production-uploads-ap-east-1");
+        assert_eq!(key, "team/private/nesting/64a49e3f/placements.json");
+    }
+
+    #[test]
+    fn offloaded_manifest_url_matches_where_it_was_written() {
+        // The URL advertised in `pagesUrl` must resolve to the object the offload
+        // actually PUT, or the backend fetches a 404 for geometry it can see listed.
+        let s3 = S3Settings::new(
+            "cutl-production-data",
+            "ru-msk",
+            Some("https://hb.ru-msk.vkcs.cloud".into()),
+            None,
+        );
+        let response = response_with_page_urls(vec![
+            "https://hb.ru-msk.vkcs.cloud/cutl-production-data/team/private/nesting/64a49e3f/page-0.svg"
+                .to_string(),
+        ]);
+        let (bucket, key) = manifest_location(&response, s3.endpoint_host()).expect("derivable");
+        let url = s3.object_url(&bucket, &key);
+        assert_eq!(
+            url,
+            "https://hb.ru-msk.vkcs.cloud/cutl-production-data/team/private/nesting/64a49e3f/placements.json"
+        );
+        // …and it parses back to the same object.
+        assert_eq!(
+            parse_s3_url_with(&url, s3.endpoint_host()).unwrap(),
+            (bucket, key)
+        );
+    }
+
+    #[test]
+    fn manifest_location_is_none_without_a_page_url() {
+        assert!(manifest_location(&response_with_page_urls(vec![]), None).is_none());
     }
 
     #[test]

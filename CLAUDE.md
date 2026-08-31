@@ -176,6 +176,36 @@ truthful if startup hangs. In `deploy/k8s/`, `terminationGracePeriodSeconds: 600
 are load-bearing: a nesting run is minutes long and single-owner, and the default 30s would SIGKILL a job
 mid-flight on every rollout.
 
+### Oversized responses (`pagesUrl`)
+
+A nesting response carries `pages[].placements`, which grows with the part count and
+is unbounded. librdkafka rejects a produce **client-side** in `rd_kafka_msg_new0()`
+when `overhead(36) + key + payload + headers` exceeds `message.max.bytes`
+(**1,000,000** — a round million, *not* 1 MiB), before batching and before
+compression. So neither raising the broker's limit nor enabling compression helps.
+
+Two finished production jobs were discarded on 2026-08-31 because the old guard
+compared `payload.len()` against `1024 * 1024`: a 1,024,000-byte response cleared it
+and was then rejected by the producer, and the deterministic failure was retried
+three times before the work was thrown away.
+
+Now: `send_to_output_queue` checks the true wire size **once, before** the retry
+loop, and if it does not fit, `offload_placements` writes a `NestingPagesManifest`
+to `placements.json` beside the page SVGs, sets `pagesUrl`, and empties each page's
+`placements`. `PRODUCER_MAX_MESSAGE_BYTES` is set explicitly on the producer so the
+guard and the client cannot drift again.
+
+**`pages` stays non-null and `placements` is emptied rather than removed** — this is
+load-bearing, not tidiness: cutl-backend dereferences `getPages().stream()` and
+`getPlacements().stream()` with no null check (`NestingResponseData:39`, `:141`), so
+omitting either would move the failure into the backend's consumer.
+(`NestingOffcutsData` does guard both, so offcuts are safe to drop.)
+
+Contract: cutl-schemas **v1.18.0** — `NestingResponse.pagesUrl` plus the
+`NestingPagesManifest` payload. The manifest is declared as a channel + operation,
+not a bare `components.schemas` entry, because Modelina only emits schemas reachable
+from a channel message; as a plain schema it generated no bindings in any language.
+
 ### Storage backend (`s3.rs`)
 
 All storage configuration resolves in `jagua-sqs-processor/src/s3.rs` (`S3Settings`),

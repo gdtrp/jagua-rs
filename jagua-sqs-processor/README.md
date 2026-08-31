@@ -67,6 +67,16 @@ Optional:
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Unset means stdout logging only, not an error |
 | `RUST_LOG` | `info` | |
 
+### Oversized responses
+
+Placements scale with part count and the Kafka producer rejects anything over
+`message.max.bytes` (1,000,000) client-side, before compression. When a response
+would not fit, the worker writes a `NestingPagesManifest` to `placements.json`
+beside the page SVGs, sets `pagesUrl` to it, and sends `pages` with each page's
+`placements` emptied — so the layout still renders and only the per-part geometry
+moves out of band. Consumers should fetch `pagesUrl` whenever it is present
+(cutl-schemas v1.18.0).
+
 ### Storage backend
 
 Bucket, region, endpoint, addressing mode and upload ACL are resolved in one place
