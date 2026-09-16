@@ -1,5 +1,5 @@
 .PHONY: build fmt fmt-check lint lint-fix check sync-spec codegen \
-        test test-integration compose-up compose-down
+        test test-slow test-integration compose-up compose-down
 
 LINT_CRATES := -p jagua-utils -p jagua-sqs-processor
 
@@ -50,6 +50,11 @@ check: fmt-check lint
 test:
 	cargo test $(LINT_CRATES)
 
+# The long LBF-driven nesting tests (`#[cfg_attr(not(feature = "slow-tests"), ignore)]`
+# in both crates). Minutes per file; CI runs them nightly in the `slow` job.
+test-slow:
+	cargo test $(LINT_CRATES) --features slow-tests
+
 # Brings up Kafka (SASL_PLAINTEXT + SCRAM-SHA-512) and MinIO, waits for both to be
 # healthy, then provisions the SCRAM user and the five topics. Idempotent.
 #
@@ -66,4 +71,4 @@ compose-down:
 # no Docker still passes rather than failing for the wrong reason. This target is
 # the only thing that runs them.
 test-integration: compose-up
-	cargo test $(LINT_CRATES) -- --ignored --test-threads=1
+	cargo test -p jagua-sqs-processor --test kafka_integration_test --test s3_endpoint_integration_test -- --ignored --test-threads=1

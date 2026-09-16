@@ -247,6 +247,10 @@ fn run_case(case: &Case) -> Report {
 
 /// Batch report over all generated production cases. Runs 138 real requests; LBF-routed cases are
 /// bounded by a deadline so the run can't hang.
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real LBF packing (10-40 s alone, 60 s+ on CI) — run with --features slow-tests"
+)]
 #[test]
 fn production_cases_report() {
     let root = prod_root();

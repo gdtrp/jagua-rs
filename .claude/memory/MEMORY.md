@@ -7,3 +7,4 @@
 - [project_asyncapi_codegen.md](project_asyncapi_codegen.md) — API-first: SQS wire types generated from AsyncAPI spec via typify in build.rs (vendored spec, make sync-spec, jagua-utils type reuse)
 - [project_cutl160_nesting_rfc.md](project_cutl160_nesting_rfc.md) — CUTL-160 nesting overhaul RFC (docs/rfcs/): classifier + grid/periodic/pairing fast paths, progress contract, max/sheet bug; user to supply SVGs for per-case tests
 - [project_kafka_contract.md](project_kafka_contract.md) — VK Kafka port is governed by cutl-infra/docs/kafka-contract.md; 3 constraints that make the obvious implementation wrong
+- [CUTL-195 mixed grouping fix](project_cutl195_mixed_grouping.md) — group-mode nesting: per-type stencils + band leftovers in mixed.rs (Sep 2026), follow-ups (1+3 scheme, >4 types)

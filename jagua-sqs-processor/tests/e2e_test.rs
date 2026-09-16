@@ -2358,6 +2358,10 @@ async fn test_complex_svg_timeout() -> Result<()> {
 /// Multi-part placement test using 3 real SVGs (dr.svg, fireman.svg, fork.svg).
 /// Nests them together with a bin size tuned for 5-10 sheets, then writes
 /// page SVGs and placements JSON to disk for visual validation.
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real LBF packing (15-55 s alone, 60 s+ on CI) — run with --features slow-tests"
+)]
 #[test]
 fn test_multi_part_placements_real_svgs() -> Result<()> {
     use jagua_sqs_processor::{SqsNestingRequest, SqsNestingResponse, SvgPartSpec};
@@ -2583,6 +2587,10 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
 /// from a cutl-production calculation, nested on a 1250×2500 bin with 2.0 spacing and
 /// 4 rotations. Writes page SVGs, pages.json, request.json, and response.json for
 /// visual/manual validation of the centroid fix.
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real LBF packing (15-55 s alone, 60 s+ on CI) — run with --features slow-tests"
+)]
 #[test]
 fn test_cutl_production_request_three_parts() -> Result<()> {
     use jagua_sqs_processor::{SqsNestingRequest, SqsNestingResponse, SvgPartSpec};
@@ -2826,6 +2834,10 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
 /// max_fit happy path through the legacy single-part SQS request path.
 /// Sends a request with `max_fit: true` and a single base64-encoded SVG;
 /// the test helper mirrors the production processor branching.
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real LBF packing (15-55 s alone, 60 s+ on CI) — run with --features slow-tests"
+)]
 #[test]
 fn test_max_fit_legacy_single_part_returns_one_page() -> Result<()> {
     init_test_logging();
@@ -2886,6 +2898,10 @@ fn test_max_fit_legacy_single_part_returns_one_page() -> Result<()> {
 /// constructing a multi-`parts` request — but since `process_request_direct`
 /// only handles legacy single-part, we exercise the validation through the
 /// helper's own (mirrored) check on a hand-built `part_inputs` slice.
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real LBF packing (15-55 s alone, 60 s+ on CI) — run with --features slow-tests"
+)]
 #[test]
 fn test_max_fit_errors_on_multiple_part_types() {
     use jagua_utils::svg_nesting::{nest_max_fit_single_sheet, AdaptiveNestingStrategy, PartInput};

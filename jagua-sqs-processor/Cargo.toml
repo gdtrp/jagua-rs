@@ -88,6 +88,13 @@ regex = "1"
 # the /metrics scrape assertions; the Kafka side uses rdkafka directly.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
+[features]
+# Opt-in for the long-running nesting tests (real LBF packing, minutes on a 2-core
+# CI runner). Tests carry `#[cfg_attr(not(feature = "slow-tests"), ignore = ...)]`,
+# so a plain `cargo test` skips them (they show as "ignored") and the CI `test`
+# job stays fast; `make test-slow` / the nightly `slow` CI job enable the feature.
+slow-tests = []
+
 [lints.rust]
 warnings = "deny"
 rust_2018_idioms = { level = "warn", priority = -1 }

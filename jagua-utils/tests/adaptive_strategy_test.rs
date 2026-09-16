@@ -518,6 +518,10 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
 
     /// Test that single-part requests with 3+ pages skip SVG generation for middle pages,
     /// producing byte-identical SVGs for first and middle pages.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: real LBF packing (10-40 s alone, 60 s+ on CI) — run with --features slow-tests"
+    )]
     #[test]
     fn test_single_part_skips_middle_pages() {
         // Small squares (80x80) in a 300x300 bin with spacing → ~9 per page
@@ -688,6 +692,10 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
     }
 
     /// Test that multi-part requests do not apply the middle-page skip optimization.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: real LBF packing (10-40 s alone, 60 s+ on CI) — run with --features slow-tests"
+    )]
     #[test]
     fn test_multi_part_does_not_skip_middle_pages() {
         // Two different part types
@@ -831,6 +839,10 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
     /// max_fit on a small inline rectangle: must return exactly one page
     /// with a non-zero number of parts placed, and result counters must be
     /// trimmed to that single page.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: real LBF packing (10-40 s alone, 60 s+ on CI) — run with --features slow-tests"
+    )]
     #[test]
     fn test_max_fit_single_sheet_simple_rect() {
         let svg = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -887,6 +899,10 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
 
     /// max_fit using a real fixture SVG. Uses the small fork.svg shared with
     /// the sqs-processor test fixtures.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: real LBF packing (10-40 s alone, 60 s+ on CI) — run with --features slow-tests"
+    )]
     #[test]
     fn test_max_fit_single_sheet_with_real_svg() {
         let svg = include_bytes!("../../jagua-sqs-processor/tests/testdata/fork.svg").to_vec();
@@ -920,6 +936,10 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
     /// bin_stock=1 + scaling the budget by an effective single-bin capacity,
     /// we expect strictly more. Result SVG is written to test_output/ for
     /// visual validation.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: real LBF packing (10-40 s alone, 60 s+ on CI) — run with --features slow-tests"
+    )]
     #[test]
     fn test_max_fit_repro_1800_rounded_rect_cutouts() {
         use std::fs;

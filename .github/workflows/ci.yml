@@ -11,6 +11,9 @@ on:
     branches:
       - '**'
   workflow_dispatch:
+  schedule:
+    # Nightly run of the slow nesting suite (the `slow` job below). 03:17 UTC.
+    - cron: '17 3 * * *'
 
 # A second push to the same branch cancels the first: these jobs are pure
 # verification, so a superseded run has no value and CI minutes are not free.
@@ -66,6 +69,7 @@ jobs:
   # e2e. Runs everywhere, needs no services.
   # ---------------------------------------------------------------------------
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +87,36 @@ jobs:
       # Note [profile.test] sets opt-level = 3 with debug-assertions on, so this is
       # slower than a normal debug test run by design — it keeps jagua-rs's
       # correctness assertions live at production-like speed.
+      #
+      # The long LBF-driven tests are gated behind the `slow-tests` cargo feature
+      # and skipped here (they report as "ignored"): with them this job took 27 min
+      # on the 2-core runner, 13 of which were the processor e2e file alone. The
+      # `slow` job below runs them nightly and on demand.
       - run: cargo test -p jagua-utils -p jagua-sqs-processor
+
+  # ---------------------------------------------------------------------------
+  # The slow nesting suite: every test gated behind `slow-tests` (real LBF packing
+  # that takes minutes per file on this runner). Nightly + workflow_dispatch only,
+  # so it never gates a push; a failure here still means a real regression and
+  # should be looked at.
+  # ---------------------------------------------------------------------------
+  slow:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync AsyncAPI spec from cutl-schemas
+        env:
+          GH_TOKEN: ${{ secrets.CUTL_SCHEMAS_TOKEN }}
+        run: ./scripts/sync-schema.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libsasl2-dev zlib1g-dev libssl-dev libcurl4-openssl-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p jagua-utils -p jagua-sqs-processor --features slow-tests
 
   # ---------------------------------------------------------------------------
   # The tests that only fail at runtime: SCRAM auth, offset commits, partition
@@ -91,6 +124,7 @@ jobs:
   # above stays broker-free; this job is the only thing that runs them.
   # ---------------------------------------------------------------------------
   integration:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -111,8 +145,14 @@ jobs:
       - name: Start Kafka + MinIO harness
         run: make compose-up
 
+      # Only the two harness-backed binaries: a bare `-- --ignored` on the whole
+      # crate would also run everything else that is `#[ignore]`d, i.e. the
+      # wall-clock e2e test and the whole `slow-tests` suite.
       - name: Run broker-backed integration tests
-        run: cargo test -p jagua-sqs-processor -- --ignored --test-threads=1
+        run: >-
+          cargo test -p jagua-sqs-processor
+          --test kafka_integration_test --test s3_endpoint_integration_test
+          -- --ignored --test-threads=1
 
       # Container logs are the only way to tell a broker misconfiguration apart
       # from a genuine test failure, and they are gone once the job ends.

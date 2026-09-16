@@ -114,8 +114,11 @@ services:
   # result pages to. The worker already supports this via AWS_ENDPOINT_URL +
   # force_path_style (main.rs:70-104) — the same hook the future eu-west-1 relay
   # will use, so this path is not test-only scaffolding.
+  # quay.io, not Docker Hub: `minio/minio` on Docker Hub stopped resolving on
+  # 2026-09-16 ("pull access denied ... repository does not exist"), which killed
+  # the CI `integration` job in 27 s. quay.io is MinIO's own registry.
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     container_name: jagua-test-minio
     # 9200, not the usual 9000: sibling repos (tws, dxf-processor) run their own
     # MinIO on 9000/9100 and this harness must coexist with them on a dev machine.
@@ -133,7 +136,7 @@ services:
       start_period: 5s
 
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     container_name: jagua-test-minio-init
     depends_on:
       minio:
