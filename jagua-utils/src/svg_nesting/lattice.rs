@@ -561,7 +561,7 @@ fn decimate(ring: &[Point], tol: f32) -> Vec<Point> {
 /// lattice is missing or thinner (so the result is never worse than the trivial grid and a valid
 /// packing always exists). Returns the render context + the stencil placements. Shared by the
 /// periodic nest and the max-fit path so their per-sheet capacity is, by construction, identical.
-fn lattice_single_sheet(
+pub(crate) fn lattice_single_sheet(
     bin_w: f32,
     bin_h: f32,
     spacing: f32,

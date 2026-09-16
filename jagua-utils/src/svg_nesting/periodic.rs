@@ -6,24 +6,23 @@
 //! `render::render_periodic`), so bulk runs are fast and every full sheet is visually identical.
 
 use crate::svg_nesting::grid::grid_single_sheet;
-use crate::svg_nesting::render::{prepare, render_periodic};
+use crate::svg_nesting::render::{Placement, RenderContext, prepare, render_periodic};
 use crate::svg_nesting::strategy::PartInput;
 use crate::svg_nesting::svg_generation::NestingResult;
 use anyhow::Result;
 use jagua_rs::geometry::geo_enums::RotationRange;
 use std::f32::consts::FRAC_PI_2;
 
-/// Periodic packing of a single **rectangular** part type using a grid stencil.
-///
-/// `allow_swap` permits the 90° orientation (cardinal grid). Assumes `part` fits in the bin in the
-/// 0° orientation (the classifier guarantees this before routing here).
-pub(crate) fn nest_periodic_grid(
+/// Build the single-sheet grid stencil (render context + placements) for one **rectangular** part
+/// type. Shared by the periodic nest, the max-fit path and the mixed-types packer so their per-sheet
+/// capacity is, by construction, identical. `allow_swap` permits the 90° orientation.
+pub(crate) fn grid_stencil(
     bin_width: f32,
     bin_height: f32,
     spacing: f32,
     part: &PartInput,
     allow_swap: bool,
-) -> Result<NestingResult> {
+) -> Result<(RenderContext, Vec<Placement>)> {
     let rot_range = if allow_swap {
         RotationRange::Discrete(vec![0.0, FRAC_PI_2])
     } else {
@@ -42,8 +41,7 @@ pub(crate) fn nest_periodic_grid(
     let stencil = grid_single_sheet(
         p.bbox_w, p.bbox_h, bin_width, bin_height, spacing, 0, allow_swap,
     );
-    let cap = stencil.len();
-    if cap == 0 {
+    if stencil.is_empty() {
         anyhow::bail!(
             "Part (bbox {:.2}x{:.2}) does not fit in the bin ({:.2}x{:.2}) with spacing {:.2}",
             p.bbox_w,
@@ -53,7 +51,22 @@ pub(crate) fn nest_periodic_grid(
             spacing
         );
     }
+    Ok((ctx, stencil))
+}
 
+/// Periodic packing of a single **rectangular** part type using a grid stencil.
+///
+/// `allow_swap` permits the 90° orientation (cardinal grid). Assumes `part` fits in the bin in the
+/// 0° orientation (the classifier guarantees this before routing here).
+pub(crate) fn nest_periodic_grid(
+    bin_width: f32,
+    bin_height: f32,
+    spacing: f32,
+    part: &PartInput,
+    allow_swap: bool,
+) -> Result<NestingResult> {
+    let (ctx, stencil) = grid_stencil(bin_width, bin_height, spacing, part, allow_swap)?;
+    let cap = stencil.len();
     let qty = part.count;
     let full_sheets = qty / cap;
     let rem = qty % cap;
@@ -78,33 +91,7 @@ pub(crate) fn nest_max_fit_grid(
     part: &PartInput,
     allow_swap: bool,
 ) -> Result<NestingResult> {
-    let rot_range = if allow_swap {
-        RotationRange::Discrete(vec![0.0, FRAC_PI_2])
-    } else {
-        RotationRange::Discrete(vec![0.0])
-    };
-    let parts = std::slice::from_ref(part);
-    let (prepared, ctx) = prepare(
-        parts,
-        std::slice::from_ref(&rot_range),
-        bin_width,
-        bin_height,
-        1,
-    )?;
-    let p = &prepared[0];
-    let stencil = grid_single_sheet(
-        p.bbox_w, p.bbox_h, bin_width, bin_height, spacing, 0, allow_swap,
-    );
-    if stencil.is_empty() {
-        anyhow::bail!(
-            "Part (bbox {:.2}x{:.2}) does not fit in the bin ({:.2}x{:.2}) with spacing {:.2}",
-            p.bbox_w,
-            p.bbox_h,
-            bin_width,
-            bin_height,
-            spacing
-        );
-    }
+    let (ctx, stencil) = grid_stencil(bin_width, bin_height, spacing, part, allow_swap)?;
     let cap = stencil.len();
     Ok(render_periodic(&ctx, &stencil, 1, &[], cap))
 }

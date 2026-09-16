@@ -25,7 +25,7 @@ fn rotate(a: f32, b: f32, theta: f32) -> (f32, f32) {
 /// Build the single-sheet pairing stencil (render context + placements) for one half-bbox part type.
 /// Shared by the periodic nest and the max-fit path so their per-sheet capacity is, by construction,
 /// identical (the irregular/pairable analogue of the rectangle WS-7 fix).
-fn pairing_stencil(
+pub(crate) fn pairing_stencil(
     bin_width: f32,
     bin_height: f32,
     spacing: f32,

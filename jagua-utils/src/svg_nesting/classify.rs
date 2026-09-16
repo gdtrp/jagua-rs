@@ -4,11 +4,11 @@
 //! cheapest correct packer, falling back to the general LBF strategy (`AdaptiveNestingStrategy`)
 //! for anything the fast paths don't (yet) handle. The General path is byte-for-byte unchanged.
 
-use crate::svg_nesting::lattice::nest_max_fit_lattice;
+use crate::svg_nesting::lattice::{lattice_single_sheet, nest_max_fit_lattice};
 use crate::svg_nesting::mixed::nest_mixed;
-use crate::svg_nesting::pairing::{nest_max_fit_pairing, nest_pairing};
-use crate::svg_nesting::periodic::{nest_max_fit_grid, nest_periodic_grid};
-use crate::svg_nesting::render::measure_part;
+use crate::svg_nesting::pairing::{nest_max_fit_pairing, nest_pairing, pairing_stencil};
+use crate::svg_nesting::periodic::{grid_stencil, nest_max_fit_grid, nest_periodic_grid};
+use crate::svg_nesting::render::{Placement, measure_part};
 use crate::svg_nesting::strategy::{
     AdaptiveNestingStrategy, ImprovementCallback, NestingStrategy, PartInput, effective_allowed,
     fit_orientations,
@@ -43,7 +43,8 @@ pub(crate) enum PackingClass {
     SinglePairable,
     /// One irregular part type → General (periodic-LBF is a later phase).
     SingleIrregular,
-    /// 2–4 rectangular part types → mixed grouping (per-type identical sheets + shelf remainder).
+    /// 2–4 part types of any shape → mixed grouping: per-type identical full sheets (each type's own
+    /// deterministic stencil) + shared remainder sheets (CUTL-195).
     MixedFewTypes,
     /// Anything else → General LBF.
     General,
@@ -54,7 +55,6 @@ const RECT_RATIO: f32 = 0.98;
 const PAIR_LO: f32 = 0.40;
 const PAIR_HI: f32 = 0.62;
 const MIXED_MAX_TYPES: usize = 4;
-const MIXED_RECT_RATIO: f32 = 0.90;
 
 /// Classify a request by cheap per-part geometry. Never fails the caller — measurement errors fall
 /// back to `General` (the strategy then surfaces the real parse error).
@@ -78,12 +78,10 @@ pub(crate) fn classify(parts: &[PartInput], bin_w: f32, bin_h: f32) -> PackingCl
             PackingClass::SingleIrregular
         }
     } else if (2..=MIXED_MAX_TYPES).contains(&parts.len()) {
-        let all_rect = parts.iter().all(|p| {
-            measure_part(p)
-                .map(|m| m.rectangularity() >= MIXED_RECT_RATIO)
-                .unwrap_or(false)
-        });
-        if all_rect {
+        // Any shape qualifies: each type packs with its own single-type stencil (grid / pairing /
+        // lattice), so "rectangular only" is no longer a precondition. A part that cannot even be
+        // measured sends the whole request to General so the strategy surfaces the parse error.
+        if parts.iter().all(|p| measure_part(p).is_ok()) {
             PackingClass::MixedFewTypes
         } else {
             PackingClass::General
@@ -163,12 +161,12 @@ pub fn nest_auto(
             let allow_swap = fit_orientations(&parts[0].allowed_rotations).1;
             nest_pairing(bin_width, bin_height, spacing, &parts[0], allow_swap)
         }
-        // Mixed rectangular types: per-type identical sheets + shelf-packed shared remainder.
-        // nest_mixed is grain-aware (per-part 90° permission), so grain-locked parts
-        // (`allowedRotations: []` ⇒ 0° only) still grid-pack. Requires every part to be placeable
-        // at 0° (the grid's primary orientation); otherwise fall through to General, as does a
-        // part that doesn't fit (nest_mixed errors).
-        PackingClass::MixedFewTypes if parts.iter().all(single_part_allow_original) => {
+        // Mixed types (CUTL-195): every type gets its own run of identical full sheets — the exact
+        // stencil it would get when nested alone (grid / pairing / lattice, grain-aware) — and the
+        // leftovers of all types share the remainder sheets. Falls through to General when a part
+        // does not fit, or when no type fills even one sheet (then LBF's co-packing is the better
+        // tool and today's behaviour is kept).
+        PackingClass::MixedFewTypes => {
             match nest_mixed(bin_width, bin_height, spacing, parts, amount_of_rotations) {
                 Ok(r) => Ok(r),
                 Err(_) => general(improvement_callback),
@@ -197,7 +195,6 @@ pub fn nest_auto(
         | PackingClass::SingleRectangle
         | PackingClass::SinglePairable
         | PackingClass::SingleIrregular
-        | PackingClass::MixedFewTypes
         | PackingClass::General => general(improvement_callback),
     }
 }
@@ -221,6 +218,64 @@ fn lattice_rotations(part: &PartInput, amount_of_rotations: usize) -> (Vec<f32>,
                 .iter()
                 .any(|&d| (d.rem_euclid(360.0) - 180.0).abs() < 1.0);
             (if rots.is_empty() { vec![0.0] } else { rots }, allow_double)
+        }
+    }
+}
+
+/// Which deterministic packer produced a part type's single-sheet stencil.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StencilKind {
+    /// Axis-aligned bbox grid (rectangles / high-fill parts).
+    Grid,
+    /// Two-part pairing of half-bbox parts (right triangles).
+    Pairing,
+    /// No-fit-polygon lattice (everything else irregular).
+    Lattice,
+}
+
+/// The deterministic single-sheet stencil of ONE part type — routed exactly like a single-type
+/// request in [`nest_auto`] / [`nest_max_fit_auto`] (grid for rectangles and high-fill parts,
+/// pairing for half-bbox parts, the lattice for everything else irregular). The mixed-types packer
+/// repeats it for a type's full sheets, so a type packs identically whether nested alone or as one
+/// of several types (CUTL-195: "по отдельности всё красиво, а в групповом режиме каждый лист
+/// отдельно"). Placements carry `part_idx == 0`; the caller re-indexes. Errors when the part fits
+/// in no permitted orientation or cannot be parsed.
+pub(crate) fn single_sheet_stencil(
+    bin_width: f32,
+    bin_height: f32,
+    spacing: f32,
+    part: &PartInput,
+    amount_of_rotations: usize,
+) -> Result<(StencilKind, Vec<Placement>)> {
+    let class = classify(std::slice::from_ref(part), bin_width, bin_height);
+    match class {
+        PackingClass::SingleHighFill | PackingClass::SingleRectangle
+            if single_part_allow_original(part) =>
+        {
+            let allow_swap = single_part_allow_swap(part, amount_of_rotations);
+            let (_ctx, stencil) = grid_stencil(bin_width, bin_height, spacing, part, allow_swap)?;
+            Ok((StencilKind::Grid, stencil))
+        }
+        PackingClass::SinglePairable
+            if amount_of_rotations != 0 && effective_allowed(&part.allowed_rotations).is_none() =>
+        {
+            let allow_swap = fit_orientations(&part.allowed_rotations).1;
+            let (_ctx, stencil) =
+                pairing_stencil(bin_width, bin_height, spacing, part, allow_swap)?;
+            Ok((StencilKind::Pairing, stencil))
+        }
+        PackingClass::SingleHighFill
+        | PackingClass::SingleRectangle
+        | PackingClass::SinglePairable
+        | PackingClass::SingleIrregular => {
+            let (rots, allow_double) = lattice_rotations(part, amount_of_rotations);
+            let (_ctx, stencil) =
+                lattice_single_sheet(bin_width, bin_height, spacing, part, &rots, allow_double)?;
+            Ok((StencilKind::Lattice, stencil))
+        }
+        // `classify` of a single part yields these only when it could not be measured.
+        PackingClass::MixedFewTypes | PackingClass::General => {
+            anyhow::bail!("part could not be measured for a deterministic stencil")
         }
     }
 }
@@ -370,5 +425,46 @@ mod tests {
             part(&rect_svg(200.0, 50.0), 10),
         ];
         assert_eq!(classify(&parts, 980.0, 2000.0), PackingClass::MixedFewTypes);
+    }
+
+    /// CUTL-195: a rectangle plus an irregular part (triangle) is still a mixed request — each type
+    /// gets its own stencil, so the rectangular-only precondition is gone.
+    #[test]
+    fn rect_plus_irregular_classifies_as_mixed() {
+        let parts = vec![
+            part(&rect_svg(100.0, 60.0), 120),
+            part(&triangle_svg(120.0, 120.0), 120),
+        ];
+        assert_eq!(classify(&parts, 500.0, 600.0), PackingClass::MixedFewTypes);
+    }
+
+    #[test]
+    fn five_types_still_classify_as_general() {
+        let parts: Vec<PartInput> = (1..=5)
+            .map(|i| part(&rect_svg(50.0 * i as f32, 40.0), 10))
+            .collect();
+        assert_eq!(classify(&parts, 980.0, 2000.0), PackingClass::General);
+    }
+
+    #[test]
+    fn single_sheet_stencil_routes_like_the_single_type_path() {
+        let rect = part(&rect_svg(100.0, 60.0), 1);
+        let (kind, stencil) = single_sheet_stencil(500.0, 600.0, 2.0, &rect, 4).unwrap();
+        assert_eq!(kind, StencilKind::Grid);
+        assert!(!stencil.is_empty());
+
+        let tri = part(&triangle_svg(300.0, 100.0), 1);
+        let (kind, _) = single_sheet_stencil(980.0, 2000.0, 2.0, &tri, 4).unwrap();
+        assert_eq!(kind, StencilKind::Pairing);
+
+        // Grain-locked (0° only) triangle: pairing needs the 180° flip, so it takes the lattice.
+        let mut locked = part(&triangle_svg(300.0, 100.0), 1);
+        locked.allowed_rotations = Some(vec![0.0]);
+        let (kind, _) = single_sheet_stencil(980.0, 2000.0, 2.0, &locked, 4).unwrap();
+        assert_eq!(kind, StencilKind::Lattice);
+
+        // Too big for the sheet in every orientation → error (the caller falls back to General).
+        let huge = part(&rect_svg(700.0, 700.0), 1);
+        assert!(single_sheet_stencil(500.0, 600.0, 2.0, &huge, 4).is_err());
     }
 }
