@@ -128,6 +128,57 @@ fn request_multipart_with_output_queue_override() {
     assert_eq!(parts[0].allowed_rotations.as_deref(), Some(&[0, 180][..]));
 }
 
+/// CUTL-198: a final page under a row/column fill carries exactly one RECT offcut — the remnant
+/// — and it stays on the page next to `pagesUrl` when the placements were offloaded.
+#[test]
+fn final_page_with_one_rect_remnant_beside_pages_url() {
+    let response = SqsNestingResponse {
+        correlation_id: "c-198".to_string(),
+        first_page_svg_url: Some("https://s3/nesting/c-198/page-0.svg".to_string()),
+        last_page_svg_url: None,
+        sheets: Some(1),
+        sheets_total: Some(1),
+        page_svg_urls: Some(vec!["https://s3/nesting/c-198/page-0.svg".to_string()]),
+        pages: Some(vec![PageResult {
+            page_index: 0,
+            utilisation: 0.62,
+            svg_url: Some("https://s3/nesting/c-198/page-0.svg".to_string()),
+            parts_placed: 40,
+            placements: vec![],
+            offcuts: vec![Offcut::Rect {
+                x: 1860.0,
+                y: 0.0,
+                width: 1140.0,
+                height: 1500.0,
+            }],
+        }]),
+        pages_url: Some("https://s3/nesting/c-198/placements.json".to_string()),
+        parts_placed: 40,
+        utilisation: 0.62,
+        is_improvement: false,
+        is_final: true,
+        timestamp: 1_700_000_000,
+        error_message: None,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(
+        json.contains(r#""pagesUrl":"https://s3/nesting/c-198/placements.json""#),
+        "{json}"
+    );
+    assert!(
+        json.contains(r#""placements":[]"#),
+        "emptied, never removed: {json}"
+    );
+    assert!(
+        json.contains(
+            r#""offcuts":[{"kind":"RECT","x":1860.0,"y":0.0,"width":1140.0,"height":1500.0}]"#
+        ),
+        "{json}"
+    );
+    let back: SqsNestingResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.pages.unwrap()[0].offcuts.len(), 1);
+}
+
 /// The final response wire: camelCase keys, the literal `improvement`/`final` booleans, and the
 /// tagged offcut shape (`{"kind":"RECT",…}`) inside per-page `offcuts`.
 #[test]

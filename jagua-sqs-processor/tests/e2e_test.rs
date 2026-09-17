@@ -3096,6 +3096,83 @@ fn offcut_square_request(
     }
 }
 
+/// CUTL-198: a HORIZONTAL job through the in-process path returns exactly one RECT offcut on the
+/// final page — the remnant beside the packed block, touching the far edge — and a TOP_RIGHT
+/// start moves it to the left edge. Absent fields keep today's offcut-free response.
+#[test]
+fn horizontal_fill_returns_one_rect_remnant_per_page() -> Result<()> {
+    init_test_logging();
+    for (corner, expect_left_edge) in [
+        (jagua_utils::StartCorner::TopLeft, false),
+        (jagua_utils::StartCorner::TopRight, true),
+    ] {
+        let mut req = offcut_square_request(None, false);
+        req.correlation_id = format!("cutl198-{corner:?}");
+        req.fill_direction = Some(jagua_utils::FillDirection::Horizontal);
+        req.start_corner = Some(corner);
+        let json = serde_json::to_string(&req)?;
+        assert!(json.contains(r#""fillDirection":"HORIZONTAL""#), "{json}");
+
+        let (responses, result) = process_request_direct(&json, None, None)?;
+        let final_resp = responses.last().expect("final response");
+        assert!(final_resp.is_final);
+        assert_eq!(result.parts_placed, 2, "{corner:?}");
+        let pages = final_resp.pages.as_ref().expect("pages");
+        assert_eq!(pages.len(), 1, "{corner:?}: two squares fit one sheet");
+        assert_eq!(pages[0].offcuts.len(), 1, "{corner:?}: exactly one remnant");
+        match &pages[0].offcuts[0] {
+            jagua_utils::Offcut::Rect {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                assert!(
+                    y.abs() < 1e-3 && (height - 1000.0).abs() < 1e-3,
+                    "{corner:?}: full height"
+                );
+                assert!(*width > 0.0, "{corner:?}");
+                if expect_left_edge {
+                    assert!(
+                        x.abs() < 1e-3,
+                        "{corner:?}: remnant at the left edge, x = {x}"
+                    );
+                } else {
+                    assert!(
+                        (x + width - 2000.0).abs() < 1e-3,
+                        "{corner:?}: remnant touches the right edge"
+                    );
+                }
+                // The block itself sits on the other side of the remnant.
+                for p in &pages[0].placements {
+                    if expect_left_edge {
+                        assert!(p.x > x + width, "{corner:?}: part {p:?} inside the remnant");
+                    } else {
+                        assert!(p.x < *x, "{corner:?}: part {p:?} inside the remnant");
+                    }
+                }
+            }
+            other => panic!("{corner:?}: the remnant must be a RECT, got {other:?}"),
+        }
+        // The remnant is drawn on the page like a detected offcut.
+        let svg = String::from_utf8_lossy(&result.page_svgs[0]);
+        assert!(
+            svg.contains("offcut"),
+            "{corner:?}: remnant not drawn on the page SVG"
+        );
+        // A wire round-trip keeps it.
+        let wire = serde_json::to_string(final_resp)?;
+        assert!(wire.contains(r#""kind":"RECT""#), "{wire}");
+    }
+
+    // Absent fields ⇒ today's response: no offcuts key at all.
+    let req = offcut_square_request(None, false);
+    let (responses, _) = process_request_direct(&serde_json::to_string(&req)?, None, None)?;
+    let wire = serde_json::to_string(responses.last().unwrap())?;
+    assert!(!wire.contains("offcuts"), "{wire}");
+    Ok(())
+}
+
 fn rect_offcut_policy() -> jagua_utils::OffcutPolicy {
     jagua_utils::OffcutPolicy {
         min_offcut_width_mm: 200.0,

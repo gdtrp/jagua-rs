@@ -156,6 +156,7 @@ pub fn nest_auto(
             parts,
             amount_of_rotations,
             fill,
+            strategy.offcut_policy(),
         ) {
             Ok(r) => Ok(r),
             Err(e) => {

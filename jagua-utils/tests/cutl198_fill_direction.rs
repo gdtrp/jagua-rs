@@ -7,8 +7,8 @@
 //! deterministic (a second run is byte-identical).
 
 use jagua_utils::{
-    AdaptiveNestingStrategy, FillDirection, NestingResult, PackingMode, PageResult, PartInput,
-    PlacedPartInfo, StartCorner, nest_auto,
+    AdaptiveNestingStrategy, FillDirection, NestingResult, Offcut, OffcutPolicy, OffcutShape,
+    PackingMode, PageResult, PartInput, PlacedPartInfo, StartCorner, nest_auto,
 };
 use std::path::PathBuf;
 
@@ -187,6 +187,72 @@ fn check_page(page: &PageResult, fixtures: &[Fixture], label: &str) {
     }
 }
 
+/// The remnant contract (JG-198-3): at most one offcut per page, a RECT, `spacing` past the block
+/// along the growth axis, full size across, touching the far edge, containing no part cell.
+fn check_remnant(
+    page: &PageResult,
+    fixtures: &[Fixture],
+    direction: FillDirection,
+    corner: StartCorner,
+    label: &str,
+) {
+    assert!(
+        page.offcuts.len() <= 1,
+        "{label}: {} offcuts",
+        page.offcuts.len()
+    );
+    let cs = cells(page, fixtures);
+    let Some(off) = page.offcuts.first() else {
+        return;
+    };
+    let Offcut::Rect {
+        x,
+        y,
+        width,
+        height,
+    } = off
+    else {
+        panic!("{label}: remnant must be a RECT, got {off:?}");
+    };
+    let (x0, y0, x1, y1) = (*x, *y, x + width, y + height);
+    assert!(*width > 0.0 && *height > 0.0, "{label}: {off:?}");
+    assert!(
+        x0 >= -EPS && y0 >= -EPS && x1 <= BIN_W + EPS && y1 <= BIN_H + EPS,
+        "{label}: {off:?}"
+    );
+    let vertical = direction == FillDirection::Vertical;
+    let near = |a: f32, b: f32| (a - b).abs() < EPS;
+    // Full size across, touching the far edge along the growth axis; `spacing` after the block.
+    let (spans, block_edge, gap) = if vertical {
+        let spans = near(x0, 0.0) && near(x1, BIN_W);
+        if corner.is_bottom() {
+            let edge = cs.iter().map(|c| c.1).fold(BIN_H, f32::min);
+            (spans && near(y0, 0.0), edge, edge - y1)
+        } else {
+            let edge = cs.iter().map(|c| c.3).fold(0.0, f32::max);
+            (spans && near(y1, BIN_H), edge, y0 - edge)
+        }
+    } else {
+        let spans = near(y0, 0.0) && near(y1, BIN_H);
+        if corner.is_right() {
+            let edge = cs.iter().map(|c| c.0).fold(BIN_W, f32::min);
+            (spans && near(x0, 0.0), edge, edge - x1)
+        } else {
+            let edge = cs.iter().map(|c| c.2).fold(0.0, f32::max);
+            (spans && near(x1, BIN_W), edge, x0 - edge)
+        }
+    };
+    assert!(spans, "{label}: remnant {off:?} does not span the far side");
+    assert!(
+        near(gap, SPACING),
+        "{label}: gap between block edge {block_edge} and remnant {off:?} is {gap}"
+    );
+    for c in &cs {
+        let overlaps = c.0 < x1 - EPS && c.2 > x0 + EPS && c.1 < y1 - EPS && c.3 > y0 + EPS;
+        assert!(!overlaps, "{label}: cell {c:?} inside remnant {off:?}");
+    }
+}
+
 fn check_result(result: &NestingResult, fixtures: &[Fixture], total: usize, label: &str) {
     assert_eq!(result.parts_placed, total, "{label}: not every part placed");
     assert_eq!(result.total_parts_requested, total);
@@ -232,12 +298,30 @@ fn run_set(name: &str, fixtures: &[Fixture], parts: &[PartInput]) {
         let top_left = nest(parts, direction, StartCorner::TopLeft, 4);
         let label = format!("{name} {direction:?} TopLeft");
         check_result(&top_left, fixtures, total, &label);
+        for (i, page) in top_left.pages.iter().enumerate() {
+            check_remnant(
+                page,
+                fixtures,
+                direction,
+                StartCorner::TopLeft,
+                &format!("{label} page {i}"),
+            );
+        }
         write_output(&format!("{name}_{direction:?}_TopLeft"), &top_left);
 
         for corner in CORNERS.iter().skip(1) {
             let r = nest(parts, direction, *corner, 4);
             let label = format!("{name} {direction:?} {corner:?}");
             check_result(&r, fixtures, total, &label);
+            for (i, page) in r.pages.iter().enumerate() {
+                check_remnant(
+                    page,
+                    fixtures,
+                    direction,
+                    *corner,
+                    &format!("{label} page {i}"),
+                );
+            }
             write_output(&format!("{name}_{direction:?}_{corner:?}"), &r);
             assert_eq!(r.pages.len(), top_left.pages.len(), "{label}: page count");
             for (i, (page, tl)) in r.pages.iter().zip(&top_left.pages).enumerate() {
@@ -393,4 +477,98 @@ fn more_than_four_types_still_take_the_fill_path() {
         .collect();
     let r = nest(&parts, FillDirection::Vertical, StartCorner::TopRight, 4);
     check_result(&r, &fixtures, 35, "five types");
+}
+
+#[test]
+fn remnant_is_one_rect_per_page_and_absent_on_a_full_sheet_without_room() {
+    // 60 rects: 2 full sheets (block 9 × 102 − 2 = 916 wide ⇒ remnant 82 wide) + 6 leftovers.
+    let r = nest(
+        &[part(&RECT, 60, "rect")],
+        FillDirection::Horizontal,
+        StartCorner::TopLeft,
+        4,
+    );
+    assert_eq!(r.pages.len(), 3);
+    for page in &r.pages[..2] {
+        assert_eq!(
+            page.offcuts,
+            vec![Offcut::Rect {
+                x: 918.0,
+                y: 0.0,
+                width: 82.0,
+                height: 500.0
+            }]
+        );
+    }
+    assert_eq!(
+        r.pages[2].offcuts,
+        vec![Offcut::Rect {
+            x: 204.0,
+            y: 0.0,
+            width: 796.0,
+            height: 500.0
+        }]
+    );
+    // The remnant is drawn on every page that has one, like a detected offcut.
+    for svg in &r.page_svgs {
+        assert!(String::from_utf8_lossy(svg).contains("offcut"));
+    }
+
+    // A block that reaches the edge leaves nothing: 100-wide parts on a 1000-wide sheet with
+    // no spacing ⇒ 10 strips, used = 1000.
+    let strategy =
+        AdaptiveNestingStrategy::new().with_layout(FillDirection::Horizontal, StartCorner::TopLeft);
+    let tight = nest_auto(
+        &strategy,
+        1000.0,
+        500.0,
+        0.0,
+        &[part(&RECT, 30, "rect")],
+        4,
+        PackingMode::Auto,
+        None,
+    )
+    .expect("nest");
+    assert_eq!(tight.pages[0].parts_placed, 30);
+    assert!(
+        tight.pages[0].offcuts.is_empty(),
+        "{:?}",
+        tight.pages[0].offcuts
+    );
+}
+
+#[test]
+fn remnant_respects_the_policy_minimums_and_needs_no_policy() {
+    let parts = [part(&RECT, 27, "rect")]; // one full sheet, remnant 82 × 500
+    let with = |policy: Option<OffcutPolicy>| {
+        let mut strategy = AdaptiveNestingStrategy::new()
+            .with_layout(FillDirection::Horizontal, StartCorner::BottomLeft);
+        if let Some(p) = policy {
+            strategy = strategy.with_offcut_policy(p);
+        }
+        nest_auto(
+            &strategy,
+            BIN_W,
+            BIN_H,
+            SPACING,
+            &parts,
+            4,
+            PackingMode::Auto,
+            None,
+        )
+        .expect("nest")
+    };
+    let policy = |min_w: f32, min_h: f32| OffcutPolicy {
+        min_offcut_width_mm: min_w,
+        min_offcut_height_mm: min_h,
+        shape: OffcutShape::Rectangle,
+        kerf_mm: 0.0,
+    };
+    // No policy ⇒ any positive remnant is reported.
+    assert_eq!(with(None).pages[0].offcuts.len(), 1);
+    // Wider minimum than the strip ⇒ omitted; taller-than-sheet minimum ⇒ omitted.
+    assert!(with(Some(policy(100.0, 100.0))).pages[0].offcuts.is_empty());
+    assert!(with(Some(policy(50.0, 600.0))).pages[0].offcuts.is_empty());
+    // At or under the strip size ⇒ reported.
+    assert_eq!(with(Some(policy(82.0, 500.0))).pages[0].offcuts.len(), 1);
 }

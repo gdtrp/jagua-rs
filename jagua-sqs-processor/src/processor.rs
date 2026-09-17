@@ -758,6 +758,39 @@ fn manifest_location(
     Some((bucket, format!("{prefix}/{PLACEMENTS_MANIFEST_FILENAME}")))
 }
 
+/// Empty the per-page `placements` of a response that is being offloaded, and keep
+/// the per-page `offcuts` whenever they still fit.
+///
+/// The offcuts are small (for the CUTL-198 row/column fills, exactly one `RECT` per
+/// page — the remnant the editor shows) and the backend reads them from the inline
+/// page, so dropping them alongside the placements would lose the remnant on every
+/// big nest. They are cleared only if the record is still over the limit without
+/// the placements; the manifest carries the full pages either way, so nothing is
+/// lost in that case either. `pages` stays non-null and `placements` is emptied
+/// rather than removed, because the backend dereferences both without a null check.
+fn slim_pages_for_wire(response: &mut SqsNestingResponse, headers_len: usize) {
+    let Some(pages) = response.pages.as_mut() else {
+        return;
+    };
+    for page in pages.iter_mut() {
+        page.placements.clear();
+    }
+    let still_too_big = match serde_json::to_string(&*response) {
+        Ok(payload) => {
+            record_wire_size(&response.correlation_id, &payload, headers_len)
+                > PRODUCER_MAX_MESSAGE_BYTES
+        }
+        Err(_) => true,
+    };
+    if still_too_big {
+        if let Some(pages) = response.pages.as_mut() {
+            for page in pages.iter_mut() {
+                page.offcuts.clear();
+            }
+        }
+    }
+}
+
 /// Serialized size of the W3C trace headers we attach to every response.
 ///
 /// Measured rather than assumed: `inject_current` emits `traceparent` and sometimes
@@ -852,7 +885,7 @@ impl NestingProcessor {
     /// dereferences `getPages().stream()` and `getPlacements().stream()` without a
     /// null check (`NestingResponseData:39`, `:141`), so omitting either would move
     /// the failure into the backend's consumer instead of fixing it.
-    async fn offload_placements(&self, response: &mut SqsNestingResponse) {
+    async fn offload_placements(&self, response: &mut SqsNestingResponse, headers_len: usize) {
         let pages = match response.pages.as_ref() {
             Some(pages) if pages.iter().any(|p| !p.placements.is_empty()) => pages.clone(),
             // Nothing to move: the size is coming from somewhere else, and slimming
@@ -918,12 +951,7 @@ impl NestingProcessor {
             ),
         }
 
-        if let Some(pages) = response.pages.as_mut() {
-            for page in pages.iter_mut() {
-                page.placements.clear();
-                page.offcuts.clear();
-            }
-        }
+        slim_pages_for_wire(response, headers_len);
         metrics()
             .messages_failed
             .with_label_values(&["response_placements_offloaded"])
@@ -959,7 +987,8 @@ impl NestingProcessor {
                          of {}; offloading placements to S3.",
                         response_clone.correlation_id, wire, PRODUCER_MAX_MESSAGE_BYTES
                     );
-                    self.offload_placements(&mut response_clone).await;
+                    self.offload_placements(&mut response_clone, trace_headers_len(&headers))
+                        .await;
                 }
             }
             // Serialization failure is reported by the produce path below, which
@@ -2392,6 +2421,86 @@ mod tests {
         assert_eq!(
             record_wire_size(key, &payload, headers),
             PRODUCER_MAX_MESSAGE_BYTES
+        );
+    }
+
+    fn page_with(placements: usize, offcuts: Vec<jagua_utils::Offcut>) -> jagua_utils::PageResult {
+        jagua_utils::PageResult {
+            page_index: 0,
+            utilisation: 0.5,
+            svg_url: None,
+            parts_placed: placements,
+            placements: (0..placements)
+                .map(|i| jagua_utils::PlacedPartInfo {
+                    item_id: format!("part-{i}"),
+                    part_index: 0,
+                    x: i as f32,
+                    y: 0.0,
+                    rotation: 0.0,
+                    centroid_x: 0.0,
+                    centroid_y: 0.0,
+                })
+                .collect(),
+            offcuts,
+        }
+    }
+
+    fn remnant() -> jagua_utils::Offcut {
+        jagua_utils::Offcut::Rect {
+            x: 1860.0,
+            y: 0.0,
+            width: 1140.0,
+            height: 1500.0,
+        }
+    }
+
+    #[test]
+    fn slimming_keeps_the_remnant_when_only_the_placements_were_too_big() {
+        // CUTL-198: a big nest's per-page remnant must survive the pagesUrl offload.
+        let mut response = response_with_page_urls(vec![]);
+        response.pages = Some(vec![
+            page_with(20_000, vec![remnant()]),
+            page_with(20_000, vec![remnant()]),
+        ]);
+        let before = serde_json::to_string(&response).unwrap();
+        assert!(
+            record_wire_size(&response.correlation_id, &before, 120) > PRODUCER_MAX_MESSAGE_BYTES
+        );
+
+        slim_pages_for_wire(&mut response, 120);
+
+        let pages = response.pages.as_ref().expect("pages stay non-null");
+        assert!(pages.iter().all(|p| p.placements.is_empty()));
+        assert!(pages.iter().all(|p| p.offcuts == vec![remnant()]));
+        let after = serde_json::to_string(&response).unwrap();
+        assert!(
+            record_wire_size(&response.correlation_id, &after, 120) <= PRODUCER_MAX_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn slimming_drops_offcuts_only_when_they_alone_still_do_not_fit() {
+        // A pathological polygon offcut set that is itself over the limit: the manifest
+        // already carries it, so the inline copy goes rather than the whole response.
+        let poly = jagua_utils::Offcut::Poly {
+            vertices: (0..60_000)
+                .map(|i| jagua_utils::OffcutVertex {
+                    x: i as f32,
+                    y: 1.0,
+                })
+                .collect(),
+            holes: vec![],
+        };
+        let mut response = response_with_page_urls(vec![]);
+        response.pages = Some(vec![page_with(10, vec![poly])]);
+
+        slim_pages_for_wire(&mut response, 120);
+
+        let pages = response.pages.as_ref().unwrap();
+        assert!(pages[0].placements.is_empty());
+        assert!(
+            pages[0].offcuts.is_empty(),
+            "still over the limit ⇒ offcuts cleared too"
         );
     }
 

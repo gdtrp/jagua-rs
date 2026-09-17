@@ -14,6 +14,7 @@
 //! own vocabulary, not the picture.
 
 use crate::svg_nesting::grid::grid_dims;
+use crate::svg_nesting::offcut::{Offcut, OffcutPolicy, overlay_result_offcuts};
 use crate::svg_nesting::render::{Placement, PreparedPart, prepare, render_page_list};
 use crate::svg_nesting::strategy::{PartInput, effective_allowed, fit_orientations};
 use crate::svg_nesting::svg_generation::NestingResult;
@@ -227,7 +228,7 @@ fn choose_orientation(
 
 /// One packed page: its placements (in fill order, so any prefix is compact along the growth
 /// axis) and how far the block reaches along that axis, measured from the `TOP_LEFT` frame.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct FillPage {
     placements: Vec<Placement>,
     used_along: f32,
@@ -331,6 +332,84 @@ fn leftover_order(a: &FillType, b: &FillType, direction: FillDirection) -> std::
         .then(a.part_idx.cmp(&b.part_idx))
 }
 
+// ---------------------------------------------------------------------------
+// The remnant
+// ---------------------------------------------------------------------------
+
+/// The one rectangular remnant of a page: the strip beyond the packed block along the growth
+/// axis, `spacing` after the last part and touching the sheet edge, full size across. Reflected
+/// for the right / bottom corners. `None` when it has no area or, with a policy, when it is
+/// thinner than the policy's minimum width or height (then the UI shows no remnant size).
+fn remnant(
+    used_along: f32,
+    fill: SheetFill,
+    bin_w: f32,
+    bin_h: f32,
+    spacing: f32,
+    policy: Option<&OffcutPolicy>,
+) -> Option<Offcut> {
+    let (x, y, width, height) = match fill.direction {
+        FillDirection::Vertical => (
+            0.0,
+            used_along + spacing,
+            bin_w,
+            bin_h - used_along - spacing,
+        ),
+        _ => (
+            used_along + spacing,
+            0.0,
+            bin_w - used_along - spacing,
+            bin_h,
+        ),
+    };
+    if width <= EPS || height <= EPS {
+        return None;
+    }
+    if let Some(p) = policy
+        && (width < p.min_offcut_width_mm || height < p.min_offcut_height_mm)
+    {
+        return None;
+    }
+    let x = if fill.corner.is_right() {
+        bin_w - (x + width)
+    } else {
+        x
+    };
+    let y = if fill.corner.is_bottom() {
+        bin_h - (y + height)
+    } else {
+        y
+    };
+    Some(Offcut::Rect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+/// Write each page's remnant (0 or 1 RECT) into the rendered result and draw it on the page
+/// SVGs, the way the LBF path draws detected offcuts.
+fn apply_remnants(
+    result: &mut NestingResult,
+    used: &[f32],
+    fill: SheetFill,
+    bin_w: f32,
+    bin_h: f32,
+    spacing: f32,
+    policy: Option<&OffcutPolicy>,
+) {
+    for (page, &used_along) in result.pages.iter_mut().zip(used) {
+        page.offcuts = remnant(used_along, fill, bin_w, bin_h, spacing, policy)
+            .into_iter()
+            .collect();
+    }
+    if result.pages.iter().any(|p| !p.offcuts.is_empty()) {
+        let kerf = policy.map_or(0.0, |p| p.kerf_mm);
+        overlay_result_offcuts(result, kerf, bin_w, bin_h);
+    }
+}
+
 /// The row/column nest (`HORIZONTAL` / `VERTICAL`) for any number of part types of any shape.
 ///
 /// Every type gets its own run of identical full sheets — its single-type stencil, `cap` parts —
@@ -344,13 +423,14 @@ pub(crate) fn nest_fill(
     parts: &[PartInput],
     amount_of_rotations: usize,
     fill: SheetFill,
+    policy: Option<OffcutPolicy>,
 ) -> Result<NestingResult> {
     let rot_range = RotationRange::Discrete(vec![0.0, FRAC_PI_2]);
     let ranges: Vec<RotationRange> = vec![rot_range; parts.len()];
     let (prepared, ctx) = prepare(parts, &ranges, bin_w, bin_h, 1)?;
     let total: usize = parts.iter().map(|p| p.count).sum();
 
-    let mut pages: Vec<Vec<Placement>> = Vec::new();
+    let mut pages: Vec<FillPage> = Vec::new();
     let mut leftovers: Vec<FillType> = Vec::new();
     for (idx, part) in parts.iter().enumerate() {
         let (allow_original, allow_swapped) = orientations_allowed(part, amount_of_rotations);
@@ -371,13 +451,11 @@ pub(crate) fn nest_fill(
             );
             continue;
         };
-        let stencil = pack(&vec![t; cap], fill.direction, bin_w, bin_h, spacing);
-        let stencil = stencil
+        let stencil = pack(&vec![t; cap], fill.direction, bin_w, bin_h, spacing)
             .into_iter()
             .next()
-            .map(|p| p.placements)
             .unwrap_or_default();
-        let cap = stencil.len().max(1);
+        let cap = stencil.placements.len().max(1);
         let full = part.count / cap;
         let rem = part.count % cap;
         for _ in 0..full {
@@ -386,19 +464,27 @@ pub(crate) fn nest_fill(
         leftovers.extend(std::iter::repeat_n(t, rem));
     }
     leftovers.sort_by(|a, b| leftover_order(a, b, fill.direction));
-    pages.extend(
-        pack(&leftovers, fill.direction, bin_w, bin_h, spacing)
-            .into_iter()
-            .map(|p| p.placements),
-    );
+    pages.extend(pack(&leftovers, fill.direction, bin_w, bin_h, spacing));
     if pages.is_empty() {
         anyhow::bail!("no part fits the sheet ({bin_w:.2}x{bin_h:.2}) in a permitted orientation");
     }
+    let used: Vec<f32> = pages.iter().map(|p| p.used_along).collect();
+    let mut pages: Vec<Vec<Placement>> = pages.into_iter().map(|p| p.placements).collect();
     for page in pages.iter_mut() {
         reflect_to_corner(page, &prepared, fill.corner, bin_w, bin_h);
     }
 
-    Ok(render_page_list(&ctx, &pages, total))
+    let mut result = render_page_list(&ctx, &pages, total);
+    apply_remnants(
+        &mut result,
+        &used,
+        fill,
+        bin_w,
+        bin_h,
+        spacing,
+        policy.as_ref(),
+    );
+    Ok(result)
 }
 
 /// max_fit for the row/column fill: the single-type stencil (one full sheet) rendered as one page,
@@ -436,17 +522,27 @@ pub(crate) fn nest_max_fit_fill(
             prepared[0].bbox_h
         )
     })?;
-    let mut stencil = pack(&vec![t; cap], fill.direction, bin_w, bin_h, spacing)
+    let stencil = pack(&vec![t; cap], fill.direction, bin_w, bin_h, spacing)
         .into_iter()
         .next()
-        .map(|p| p.placements)
         .unwrap_or_default();
-    if stencil.is_empty() {
+    if stencil.placements.is_empty() {
         anyhow::bail!("Part does not fit in the bin ({bin_w:.2}x{bin_h:.2})");
     }
-    reflect_to_corner(&mut stencil, &prepared, fill.corner, bin_w, bin_h);
-    let cap = stencil.len();
-    Ok(render_page_list(&ctx, &[stencil], cap))
+    let mut placements = stencil.placements;
+    reflect_to_corner(&mut placements, &prepared, fill.corner, bin_w, bin_h);
+    let cap = placements.len();
+    let mut result = render_page_list(&ctx, &[placements], cap);
+    apply_remnants(
+        &mut result,
+        &[stencil.used_along],
+        fill,
+        bin_w,
+        bin_h,
+        spacing,
+        None,
+    );
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -578,6 +674,54 @@ mod tests {
         assert_eq!(t.rotation, 0.0);
         // Nothing fits ⇒ None.
         assert!(choose_orientation(&p, 0, true, true, 90.0, 30.0, 0.0).is_none());
+    }
+
+    fn policy(min_w: f32, min_h: f32) -> OffcutPolicy {
+        OffcutPolicy {
+            min_offcut_width_mm: min_w,
+            min_offcut_height_mm: min_h,
+            shape: crate::svg_nesting::offcut::OffcutShape::Rectangle,
+            kerf_mm: 0.0,
+        }
+    }
+
+    #[test]
+    fn remnant_is_the_far_strip_spacing_after_the_block() {
+        let h = |c| SheetFill::new(FillDirection::Horizontal, c);
+        let v = |c| SheetFill::new(FillDirection::Vertical, c);
+        let rect = |x, y, width, height| {
+            Some(Offcut::Rect {
+                x,
+                y,
+                width,
+                height,
+            })
+        };
+        let tl = StartCorner::TopLeft;
+        assert_eq!(
+            remnant(320.0, h(tl), 1000.0, 500.0, 2.0, None),
+            rect(322.0, 0.0, 678.0, 500.0)
+        );
+        assert_eq!(
+            remnant(320.0, h(StartCorner::BottomRight), 1000.0, 500.0, 2.0, None),
+            rect(0.0, 0.0, 678.0, 500.0)
+        );
+        assert_eq!(
+            remnant(150.0, v(tl), 1000.0, 500.0, 2.0, None),
+            rect(0.0, 152.0, 1000.0, 348.0)
+        );
+        assert_eq!(
+            remnant(150.0, v(StartCorner::BottomLeft), 1000.0, 500.0, 2.0, None),
+            rect(0.0, 0.0, 1000.0, 348.0)
+        );
+        // A block that reaches the edge (or within spacing of it) leaves no remnant.
+        assert_eq!(remnant(998.0, h(tl), 1000.0, 500.0, 2.0, None), None);
+        assert_eq!(remnant(1000.0, h(tl), 1000.0, 500.0, 2.0, None), None);
+        // Policy minimums: below either ⇒ omitted; at the minimum ⇒ kept.
+        let p = policy(700.0, 100.0);
+        assert_eq!(remnant(320.0, h(tl), 1000.0, 500.0, 2.0, Some(&p)), None);
+        let p = policy(678.0, 500.0);
+        assert!(remnant(320.0, h(tl), 1000.0, 500.0, 2.0, Some(&p)).is_some());
     }
 
     #[test]
