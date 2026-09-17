@@ -118,6 +118,13 @@ pub struct SqsNestingRequest {
     /// budget) and the cooperative execution timeout. Clamped to a 600s ceiling. Absent ⇒
     /// today's behaviour (max 600s).
     pub max_seconds: Option<u64>,
+    /// How each sheet is filled (CUTL-198): `HORIZONTAL` / `VERTICAL` are the deterministic
+    /// row/column fills that return one rectangular remnant per page; absent ⇒ `STAIRCASE`,
+    /// today's packing. Kept as `Option` so an absent field stays absent on the wire.
+    pub fill_direction: Option<jagua_utils::FillDirection>,
+    /// The sheet corner the fill starts from (CUTL-198), named as the SVG renders it. Absent ⇒
+    /// `TOP_LEFT`, today's anchor. Ignored under `STAIRCASE`.
+    pub start_corner: Option<jagua_utils::StartCorner>,
 }
 
 /// Generate an empty page SVG (used when all parts are placed)
@@ -1524,6 +1531,12 @@ impl NestingProcessor {
                 strategy = strategy.with_time_budget(Duration::from_secs(s));
                 info!("Time budget overridden to {}s via maxSeconds", s);
             }
+            // Fill direction + start corner (CUTL-198). Absent ⇒ STAIRCASE / TOP_LEFT, i.e.
+            // today's packing byte for byte.
+            let fill_direction = request.fill_direction.unwrap_or_default();
+            let start_corner = request.start_corner.unwrap_or_default();
+            strategy = strategy.with_layout(fill_direction, start_corner);
+            info!("Sheet fill: direction={:?} start_corner={:?}", fill_direction, start_corner);
             info!("Strategy created (took {:?})", strategy_start.elapsed());
 
             // Clone cancellation_check_count for logging after spawn_blocking
@@ -2868,6 +2881,8 @@ mod tests {
             s3_prefix: None,
             offcut_policy: None,
             max_seconds: None,
+            fill_direction: None,
+            start_corner: None,
         };
         let cancellation_body =
             serde_json::to_string(&cancellation_request).expect("serialize cancellation");

@@ -107,6 +107,9 @@ Existing fields unchanged (`correlationId`, `firstPageSvgUrl`,
   For `improvement=true` intermediate messages it must be `[]` — don't burn
   CPU on layouts that get superseded.
 - Coordinates: mm, bin origin bottom-left, same frame as `placements`.
+  *(Note, CUTL-198: "bottom-left" is the engine's own vocabulary — `grid.rs` calls high-y the
+  "bottom strip". The SVG output is y-down and unflipped, so engine `(0, 0)` **renders top-left**;
+  `startCorner` is named as the picture reads, see `docs/cutl198_fill_direction_jagua_handoff.md` §1.)*
 - `kind=RECT` ⇒ `x,y,width,height`; `kind=QUADRILATERAL`/`POLY` ⇒ `vertices`
   (closed, CCW).
 

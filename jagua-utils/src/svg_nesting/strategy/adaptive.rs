@@ -1,6 +1,7 @@
 //! Adaptive nesting strategy that starts with lower parameters and adaptively increases them
 
 use crate::svg_nesting::{
+    fill::{FillDirection, SheetFill, StartCorner},
     offcut::{OffcutPolicy, apply_offcuts},
     parsing::{
         build_inflatable_shape, calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path,
@@ -105,6 +106,9 @@ pub struct AdaptiveNestingStrategy {
     /// Optional per-request wall-clock budget. When set, overrides the default time budget
     /// (42s for max_fit, 600s for normal nesting).
     time_budget: Option<Duration>,
+    /// Fill direction + start corner (CUTL-198). Read by the `nest_auto` / `nest_max_fit_auto`
+    /// routers only; the LBF paths on this strategy never look at it.
+    sheet_fill: SheetFill,
 }
 
 impl AdaptiveNestingStrategy {
@@ -114,6 +118,7 @@ impl AdaptiveNestingStrategy {
             cancellation_checker: None,
             offcut_policy: None,
             time_budget: None,
+            sheet_fill: SheetFill::default(),
         }
     }
 
@@ -125,6 +130,7 @@ impl AdaptiveNestingStrategy {
             cancellation_checker: Some(cancellation_checker),
             offcut_policy: None,
             time_budget: None,
+            sheet_fill: SheetFill::default(),
         }
     }
 
@@ -138,6 +144,25 @@ impl AdaptiveNestingStrategy {
     pub fn with_time_budget(mut self, budget: Duration) -> Self {
         self.time_budget = Some(budget);
         self
+    }
+
+    /// Choose the fill direction and start corner (CUTL-198). `Staircase` + `TopLeft` (the
+    /// defaults) is today's packing; `Horizontal` / `Vertical` route `nest_auto` /
+    /// `nest_max_fit_auto` to the row/column packer, which honours the corner and returns one
+    /// rectangular remnant per page. The corner is ignored under `Staircase`.
+    pub fn with_layout(mut self, direction: FillDirection, corner: StartCorner) -> Self {
+        self.sheet_fill = SheetFill::new(direction, corner);
+        self
+    }
+
+    /// The layout choice set by [`Self::with_layout`] (default: today's packing).
+    pub fn sheet_fill(&self) -> SheetFill {
+        self.sheet_fill
+    }
+
+    /// The offcut policy set by [`Self::with_offcut_policy`], if any.
+    pub fn offcut_policy(&self) -> Option<OffcutPolicy> {
+        self.offcut_policy
     }
 
     /// Populate per-page offcuts on a final result from the solution that produced it.

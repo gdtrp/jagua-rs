@@ -1,6 +1,7 @@
 //! SVG nesting module
 
 mod classify;
+mod fill;
 mod grid;
 mod lattice;
 mod mixed;
@@ -13,6 +14,7 @@ mod strategy;
 mod svg_generation;
 
 pub use classify::{PackingMode, nest_auto, nest_max_fit_auto};
+pub use fill::{FillDirection, SheetFill, StartCorner};
 pub use offcut::{Offcut, OffcutPolicy, OffcutShape, OffcutVertex};
 pub use parsing::*;
 pub use strategy::{

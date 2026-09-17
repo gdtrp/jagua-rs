@@ -5,14 +5,15 @@
 //! response shape (camelCase, the `improvement`/`final` literals, and the tagged offcut format).
 
 use jagua_sqs_processor::{PageResult, PlacedPartInfo, SqsNestingRequest, SqsNestingResponse};
-use jagua_utils::{Offcut, OffcutVertex};
+use jagua_utils::{FillDirection, Offcut, OffcutVertex, StartCorner};
 
 /// Cancellation messages arrive with every nesting field set to explicit `null` (not omitted) and
 /// `amountOfRotations: null`. The boundary must accept that and apply the rotation default of 8.
 #[test]
 fn request_cancellation_with_explicit_nulls() {
     let body = r#"{"correlationId":"c-1","binWidth":null,"binHeight":null,"spacing":null,
-        "amountOfRotations":null,"cancelled":true,"parts":null}"#;
+        "amountOfRotations":null,"cancelled":true,"parts":null,
+        "fillDirection":null,"startCorner":null}"#;
     let req: SqsNestingRequest = serde_json::from_str(body).unwrap();
 
     assert_eq!(req.correlation_id, "c-1");
@@ -23,6 +24,83 @@ fn request_cancellation_with_explicit_nulls() {
     );
     assert!(req.bin_width.is_none());
     assert!(req.parts.is_none());
+    assert!(req.fill_direction.is_none(), "null fillDirection ⇒ absent");
+    assert!(req.start_corner.is_none(), "null startCorner ⇒ absent");
+}
+
+/// CUTL-198: both layout fields present map to the jagua-utils enums by their exact wire names.
+#[test]
+fn request_with_fill_direction_and_start_corner() {
+    let body = r#"{"correlationId":"c-198","binWidth":3000,"binHeight":1500,"spacing":0.2,
+        "parts":[{"svgUrl":"s3://b/p.svg","amountOfParts":10}],
+        "fillDirection":"HORIZONTAL","startCorner":"BOTTOM_RIGHT"}"#;
+    let req: SqsNestingRequest = serde_json::from_str(body).unwrap();
+
+    assert_eq!(req.fill_direction, Some(FillDirection::Horizontal));
+    assert_eq!(req.start_corner, Some(StartCorner::BottomRight));
+
+    // Serialize path: the exact enum names, nothing invented.
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(json.contains(r#""fillDirection":"HORIZONTAL""#), "{json}");
+    assert!(json.contains(r#""startCorner":"BOTTOM_RIGHT""#), "{json}");
+
+    for (name, value) in [
+        ("VERTICAL", FillDirection::Vertical),
+        ("STAIRCASE", FillDirection::Staircase),
+    ] {
+        let body = format!(r#"{{"correlationId":"c","fillDirection":"{name}"}}"#);
+        let req: SqsNestingRequest = serde_json::from_str(&body).unwrap();
+        assert_eq!(req.fill_direction, Some(value), "{name}");
+    }
+    for (name, value) in [
+        ("TOP_LEFT", StartCorner::TopLeft),
+        ("TOP_RIGHT", StartCorner::TopRight),
+        ("BOTTOM_LEFT", StartCorner::BottomLeft),
+    ] {
+        let body = format!(r#"{{"correlationId":"c","startCorner":"{name}"}}"#);
+        let req: SqsNestingRequest = serde_json::from_str(&body).unwrap();
+        assert_eq!(req.start_corner, Some(value), "{name}");
+    }
+}
+
+/// CUTL-198: one field alone is fine, and the other stays absent (never a worker-invented
+/// default on the wire — the defaults are applied at the nest call).
+#[test]
+fn request_with_only_fill_direction() {
+    let body = r#"{"correlationId":"c-198b","binWidth":3000,"binHeight":1500,"spacing":0.2,
+        "parts":[{"svgUrl":"s3://b/p.svg","amountOfParts":10}],"fillDirection":"VERTICAL"}"#;
+    let req: SqsNestingRequest = serde_json::from_str(body).unwrap();
+
+    assert_eq!(req.fill_direction, Some(FillDirection::Vertical));
+    assert!(req.start_corner.is_none());
+
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(json.contains(r#""fillDirection":"VERTICAL""#), "{json}");
+    assert!(!json.contains("startCorner"), "absent stays absent: {json}");
+}
+
+/// CUTL-198: a request without the fields deserializes to `None` for both and serializes without
+/// either key, so every pre-1.3.0 golden stays byte-identical.
+#[test]
+fn request_without_layout_fields_stays_absent() {
+    let body = r#"{"correlationId":"c-198c","binWidth":3000,"binHeight":1500,"spacing":0.2,
+        "parts":[{"svgUrl":"s3://b/p.svg","amountOfParts":10}]}"#;
+    let req: SqsNestingRequest = serde_json::from_str(body).unwrap();
+
+    assert!(req.fill_direction.is_none());
+    assert!(req.start_corner.is_none());
+
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(!json.contains("fillDirection"), "{json}");
+    assert!(!json.contains("startCorner"), "{json}");
+}
+
+/// CUTL-198: a value outside the enum is rejected at the boundary (spec-governed), not mapped to
+/// a default.
+#[test]
+fn request_with_unknown_fill_direction_is_rejected() {
+    let body = r#"{"correlationId":"c-198d","fillDirection":"DIAGONAL"}"#;
+    assert!(serde_json::from_str::<SqsNestingRequest>(body).is_err());
 }
 
 /// A normal multi-part request: omitted `cancelled` ⇒ false, the per-request `outputQueueUrl`
