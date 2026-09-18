@@ -13,9 +13,13 @@
 //! Remainder sheets:
 //! * every type rectangular (the pre-CUTL-195 domain) → the original next-fit **shelf** packer
 //!   (rotation 0°, tallest first), unchanged, so rectangular-only requests render as before;
-//! * otherwise → **band** packing: each type's leftovers are the lowest `rem` placements of its own
-//!   stencil (a dense, already-valid strip), and the strips are stacked vertically with `spacing`
-//!   between them, moving to a new sheet when one does not fit.
+//! * otherwise → **band** packing: each type's leftovers are the *shortest window* of its own stencil
+//!   that holds them (a dense, already-valid strip — never the stencil's ragged top fringe, which for
+//!   a double lattice is every other part: cutl-tests#77), and the strips are stacked vertically with
+//!   `spacing` between them. A strip that does not fit puts what a window of the remaining height
+//!   holds on the sheet and continues on the next; every waiting type gets a chance before a sheet is
+//!   closed, and the rectangular holes beside a partly filled last row and under the last band are
+//!   used up with bounding-box cells of the waiting types.
 //!
 //! If no type fills even one full sheet and a type is irregular, `nest_mixed` refuses so the caller
 //! falls back to LBF, whose interlocking co-pack is the better tool for a small one-off mix.
@@ -23,6 +27,7 @@
 //! optimisation left for later.
 
 use crate::svg_nesting::classify::{StencilKind, single_sheet_stencil};
+use crate::svg_nesting::fill::{extent, fill_rect};
 use crate::svg_nesting::render::{Placement, PreparedPart, prepare, render_page_list};
 use crate::svg_nesting::strategy::PartInput;
 use crate::svg_nesting::svg_generation::NestingResult;
@@ -126,140 +131,293 @@ pub(crate) fn nest_mixed(
         ));
     } else {
         pages.extend(band_pack_leftovers(
-            &groups, &stencils, &prepared, bin_height, spacing,
+            &groups,
+            &stencils,
+            &prepared,
+            parts,
+            amount_of_rotations,
+            bin_width,
+            bin_height,
+            spacing,
         ));
     }
 
     Ok(render_page_list(&ctx, &pages, total))
 }
 
-/// Vertical extent `(y_min, y_max)` in bin coordinates of a placed part's rotated bounding box.
-/// Exact for the cardinal rotations every stencil uses (a rotated rectangle's bbox is the rotated
-/// rectangle); a safe over-estimate otherwise.
-fn placement_y_extent(p: &PreparedPart, pl: &Placement) -> (f32, f32) {
-    let (s, c) = pl.rotation.sin_cos();
-    // bbox corners relative to the centroid (the placement's reference point).
-    let corners = [
-        (-p.cx_off, -p.cy_off),
-        (p.bbox_w - p.cx_off, -p.cy_off),
-        (p.bbox_w - p.cx_off, p.bbox_h - p.cy_off),
-        (-p.cx_off, p.bbox_h - p.cy_off),
-    ];
-    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    for (x, y) in corners {
-        // jagua-rs rotation is the standard CCW matrix: y' = x·sinθ + y·cosθ.
-        let ry = pl.y + x * s + y * c;
-        lo = lo.min(ry);
-        hi = hi.max(ry);
-    }
-    (lo, hi)
+/// A stencil placement with the extents `(x0, y0, x1, y1)` of its rotated bounding box, in the
+/// stencil's own sheet coordinates. Exact for the cardinal rotations, a safe over-estimate otherwise.
+#[derive(Clone, Copy)]
+struct Boxed {
+    pl: Placement,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
 }
 
-/// Stack each type's leftover strip onto shared remainder sheets.
+fn boxed(p: &PreparedPart, pl: &Placement) -> Boxed {
+    let (xmin, xmax, ymin, ymax) = extent(p, pl.rotation);
+    Boxed {
+        pl: *pl,
+        x0: pl.x + xmin,
+        y0: pl.y + ymin,
+        x1: pl.x + xmax,
+        y1: pl.y + ymax,
+    }
+}
+
+const EPS: f32 = 1e-3;
+/// Upper bound on the window starts tried per selection, so huge stencils stay cheap.
+const MAX_WINDOW_STARTS: usize = 256;
+/// Above this many parts in a band the O(k²) gap search beside its last row is skipped.
+const MAX_GAP_SEARCH: usize = 2000;
+
+/// The `n` parts of a stencil (sorted by top edge `y0`) that span the **least height**: the
+/// shortest y-window `[y0_i, y_hi]` holding `n` whole parts. Returns `(height, parts)`.
 ///
-/// A type's strip is the `count` placements of its own stencil with the lowest top edge (so the strip
-/// is as short as possible and complete rows come first); the stencil is already a valid, dense
-/// single-sheet packing, so the strip is valid as-is and stays valid when shifted up. Strips are
-/// laid tallest-first with `spacing` between them. When a strip does not fit in the height left on
-/// the current sheet, the rows that do fit are placed there and the rest continue on a new sheet
-/// (a strip is only ever cut between placements, never through one). Deterministic, O(n log n).
+/// Why a window and not "the `n` lowest": a lattice stencil's top edge is ragged — the first rows
+/// of a double lattice keep only the members that still fit on the sheet (every other part), so
+/// the lowest-`n` slice of a short remainder was exactly that sparse fringe, strewn ~one part
+/// apart along the sheet (cutl-tests#77). The densest rows span the least height for a given
+/// count, so the shortest window lands in the stencil's dense interior. Any subset of a valid
+/// packing is valid, and it stays valid when shifted up.
+fn shortest_window(sorted: &[Boxed], n: usize) -> Option<(f32, Vec<Boxed>)> {
+    if n == 0 || n > sorted.len() {
+        return None;
+    }
+    let last_start = sorted.len() - n;
+    let step = (last_start / MAX_WINDOW_STARTS).max(1);
+    let mut best: Option<(f32, usize, f32)> = None; // (height, start, y_hi)
+    let mut tops: Vec<f32> = Vec::with_capacity(sorted.len());
+    let mut start = 0;
+    while start <= last_start {
+        tops.clear();
+        tops.extend(sorted[start..].iter().map(|b| b.y1));
+        let (_, y_hi, _) = tops.select_nth_unstable_by(n - 1, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let height = *y_hi - sorted[start].y0;
+        if best.is_none_or(|(h, _, _)| height < h - EPS) {
+            best = Some((height, start, *y_hi));
+        }
+        start += step;
+    }
+    let (height, start, y_hi) = best?;
+    let mut chosen: Vec<Boxed> = sorted[start..]
+        .iter()
+        .filter(|b| b.y1 <= y_hi + EPS)
+        .copied()
+        .collect();
+    // Bottom rows first, left to right, so a partly used last row is one contiguous run.
+    chosen.sort_by(|a, b| {
+        a.y1.partial_cmp(&b.y1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    chosen.truncate(n);
+    Some((height, chosen))
+}
+
+/// The most parts (≤ `count`) of a stencil whose shortest window fits in `max_height`.
+fn most_that_fit(sorted: &[Boxed], count: usize, max_height: f32) -> usize {
+    let fits = |n: usize| shortest_window(sorted, n).is_some_and(|(h, _)| h <= max_height + EPS);
+    let count = count.min(sorted.len());
+    if count == 0 || !fits(1) {
+        return 0;
+    }
+    // The window height is monotone in the count, so bisect.
+    let (mut lo, mut hi) = (1, count);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// The largest empty rectangle to the right of a just-placed band, inside the band's own height:
+/// `x ∈ [x0, bin_width]`, from below every band part that reaches past `x0` down to the band's
+/// bottom. This is the hole beside a partly filled last row.
+fn gap_beside(
+    band: &[Boxed],
+    band_top: f32,
+    band_bottom: f32,
+    bin_width: f32,
+    spacing: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    if band.len() > MAX_GAP_SEARCH {
+        return None;
+    }
+    let mut best: Option<(f32, (f32, f32, f32, f32))> = None;
+    for p in band {
+        let x0 = p.x1 + spacing;
+        let y0 = band
+            .iter()
+            .filter(|q| q.x1 > p.x1 + EPS)
+            .map(|q| q.y1 + spacing)
+            .fold(band_top, f32::max);
+        let (w, h) = (bin_width - x0, band_bottom - y0);
+        if w <= EPS || h <= EPS {
+            continue;
+        }
+        if best.is_none_or(|(area, _)| w * h > area + EPS) {
+            best = Some((w * h, (x0, y0, w, h)));
+        }
+    }
+    best.map(|(_, rect)| rect)
+}
+
+/// Stack each type's leftovers onto shared remainder sheets.
+///
+/// A type's strip is the shortest window of its own stencil that holds the parts still to place
+/// (see [`shortest_window`]) — a dense, already-valid piece of its single-type packing — shifted up
+/// under the previous strip with `spacing` between them. Strips go tallest-first. When a strip does
+/// not fit in the height left, as many of its parts as a window of that height holds go there and
+/// the rest continue on a new sheet; before a sheet is closed every other waiting type gets the
+/// same chance. Two rectangular holes are then used up with bounding-box cells of the waiting
+/// types: the gap beside a band's partly filled last row, and the sliver under the last band.
+/// Deterministic.
+#[allow(clippy::too_many_arguments)]
 fn band_pack_leftovers(
     groups: &[LeftoverGroup],
     stencils: &[(StencilKind, Vec<Placement>)],
     prepared: &[PreparedPart],
+    parts: &[PartInput],
+    amount_of_rotations: usize,
+    bin_width: f32,
     bin_height: f32,
     spacing: f32,
 ) -> Vec<Vec<Placement>> {
-    /// A placement with the vertical extent of its rotated bbox, in stencil coordinates.
-    type Extent = (Placement, f32, f32);
+    // Per type: its stencil with extents, sorted by top edge (then x) for the window search.
+    let sorted: Vec<Vec<Boxed>> = stencils
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, stencil))| {
+            let mut v: Vec<Boxed> = stencil.iter().map(|pl| boxed(&prepared[idx], pl)).collect();
+            v.sort_by(|a, b| {
+                a.y0.partial_cmp(&b.y0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            v
+        })
+        .collect();
 
-    struct Band {
-        part_idx: usize,
-        /// Sorted by top edge, then x.
-        placements: Vec<Extent>,
-    }
-
-    fn height(band: &[Extent]) -> f32 {
-        let y_min = band.iter().map(|t| t.1).fold(f32::INFINITY, f32::min);
-        let y_max = band.iter().map(|t| t.2).fold(f32::NEG_INFINITY, f32::max);
-        y_max - y_min
-    }
-
-    let mut bands: Vec<Band> = Vec::with_capacity(groups.len());
-    for g in groups {
-        let p = &prepared[g.part_idx];
-        let mut pls: Vec<Extent> = stencils[g.part_idx]
-            .1
-            .iter()
-            .map(|pl| {
-                let (lo, hi) = placement_y_extent(p, pl);
-                (*pl, lo, hi)
-            })
-            .collect();
-        pls.sort_by(|a, b| {
-            a.2.partial_cmp(&b.2)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(
-                    a.0.x
-                        .partial_cmp(&b.0.x)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-        });
-        pls.truncate(g.count);
-        bands.push(Band {
-            part_idx: g.part_idx,
-            placements: pls,
-        });
-    }
-    // Tallest first (first-fit decreasing), request order on ties — deterministic.
-    bands.sort_by(|a, b| {
-        height(&b.placements)
-            .partial_cmp(&height(&a.placements))
+    // Tallest strip first (first-fit decreasing), request order on ties.
+    let mut order: Vec<(f32, usize, usize)> = groups
+        .iter()
+        .map(|g| {
+            let height = shortest_window(&sorted[g.part_idx], g.count).map_or(0.0, |(h, _)| h);
+            (height, g.part_idx, g.count)
+        })
+        .collect();
+    order.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.part_idx.cmp(&b.part_idx))
+            .then(a.1.cmp(&b.1))
     });
+    // (part_idx, parts still to place)
+    let mut queue: std::collections::VecDeque<(usize, usize)> = order
+        .into_iter()
+        .map(|(_, idx, count)| (idx, count))
+        .collect();
 
-    const EPS: f32 = 1e-3;
+    // Use up a rectangle with bbox cells of the waiting types, front of the queue first.
+    let fill_gap = |cur: &mut Vec<Placement>,
+                    queue: &mut std::collections::VecDeque<(usize, usize)>,
+                    (mut x0, y0, mut w, h): (f32, f32, f32, f32)| {
+        for slot in queue.iter_mut() {
+            let (idx, remaining) = *slot;
+            let (cells, used) = fill_rect(
+                &prepared[idx],
+                idx,
+                &parts[idx],
+                amount_of_rotations,
+                (x0, y0, w, h),
+                spacing,
+                remaining,
+            );
+            if cells.is_empty() {
+                continue;
+            }
+            slot.1 -= cells.len();
+            cur.extend(cells);
+            x0 += used + spacing;
+            w -= used + spacing;
+            if w <= EPS {
+                break;
+            }
+        }
+        queue.retain(|&(_, remaining)| remaining > 0);
+    };
+
     let mut pages: Vec<Vec<Placement>> = Vec::new();
     let mut cur: Vec<Placement> = Vec::new();
     let mut cursor = 0.0f32; // next free y on the current sheet
-    let mut queue: std::collections::VecDeque<Vec<Extent>> =
-        bands.into_iter().map(|b| b.placements).collect();
-    while let Some(strip) = queue.pop_front() {
-        if strip.is_empty() {
-            continue;
-        }
-        let y_min = strip.iter().map(|t| t.1).fold(f32::INFINITY, f32::min);
-        let dy = cursor - y_min;
-        // The strip is sorted by top edge, so the placements that fit form a prefix.
-        let n_fit = strip
+
+    while !queue.is_empty() {
+        // The first waiting type that can put anything into the height left.
+        let room = bin_height - cursor;
+        let pick = queue
             .iter()
-            .take_while(|t| t.2 + dy <= bin_height + EPS)
-            .count();
-        if n_fit == 0 {
-            // Nothing fits above the cursor: start a new sheet (a strip always fits an empty one).
+            .enumerate()
+            .find_map(|(pos, &(idx, remaining))| {
+                let n = most_that_fit(&sorted[idx], remaining, room);
+                (n > 0).then_some((pos, idx, remaining, n))
+            });
+        let Some((pos, idx, remaining, n)) = pick else {
             if cur.is_empty() {
                 // Degenerate (a part taller than the sheet); the stencil builder would have
                 // rejected it, so this is unreachable — but never spin.
                 break;
             }
+            // Nothing fits as a strip: use the sliver under the last band, then a new sheet.
+            fill_gap(&mut cur, &mut queue, (0.0, cursor, bin_width, room));
             pages.push(std::mem::take(&mut cur));
             cursor = 0.0;
-            queue.push_front(strip);
             continue;
-        }
-        let (fits, rest) = strip.split_at(n_fit);
-        let top = fits.iter().map(|t| t.2).fold(f32::NEG_INFINITY, f32::max);
-        cur.extend(fits.iter().map(|t| Placement {
-            y: t.0.y + dy,
-            ..t.0
-        }));
-        cursor = top + dy + spacing;
-        if !rest.is_empty() {
-            // Continue the same type on the next sheet before any other strip.
+        };
+        queue.remove(pos);
+
+        let Some((_, window)) = shortest_window(&sorted[idx], n) else {
+            break;
+        };
+        let y_min = window.iter().map(|b| b.y0).fold(f32::INFINITY, f32::min);
+        let dy = cursor - y_min;
+        let band: Vec<Boxed> = window
+            .iter()
+            .map(|b| Boxed {
+                pl: Placement {
+                    y: b.pl.y + dy,
+                    ..b.pl
+                },
+                y0: b.y0 + dy,
+                y1: b.y1 + dy,
+                ..*b
+            })
+            .collect();
+        let band_top = cursor;
+        let band_bottom = band.iter().map(|b| b.y1).fold(f32::NEG_INFINITY, f32::max);
+        cur.extend(band.iter().map(|b| b.pl));
+        cursor = band_bottom + spacing;
+
+        if remaining > n {
+            // The sheet is full for this type: its remaining parts open the next sheet, before any
+            // other strip. Whatever else is waiting may still use the sliver left under the band.
+            fill_gap(
+                &mut cur,
+                &mut queue,
+                (0.0, cursor, bin_width, bin_height - cursor),
+            );
             pages.push(std::mem::take(&mut cur));
             cursor = 0.0;
-            queue.push_front(rest.to_vec());
+            queue.push_front((idx, remaining - n));
+        } else if let Some(rect) = gap_beside(&band, band_top, band_bottom, bin_width, spacing) {
+            fill_gap(&mut cur, &mut queue, rect);
         }
     }
     if !cur.is_empty() {
