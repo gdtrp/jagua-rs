@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::generated;
 use crate::processor::{SqsNestingRequest, SqsNestingResponse, SvgPartSpec};
+use jagua_utils::{FillDirection, StartCorner};
 
 /// Recursively drop object keys whose value is JSON `null`. In this contract `null` always means
 /// "absent" (cancellation messages send `binWidth`/`spacing`/`parts`/… as `null`), and several
@@ -76,6 +77,57 @@ impl From<generated::NestingRequest> for SqsNestingRequest {
             s3_prefix: g.s3_prefix,
             offcut_policy: g.offcut_policy,
             max_seconds: g.max_seconds.map(|v| v.max(0) as u64),
+            // Absent / null ⇒ None; the worker applies STAIRCASE / TOP_LEFT at the nest call.
+            fill_direction: g.fill_direction.map(FillDirection::from),
+            start_corner: g.start_corner.map(StartCorner::from),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request enums (CUTL-198): generated <-> jagua-utils. The spec declares them inline (titled
+// `NestingFillDirection` / `NestingStartCorner`), so typify's `with_replacement` cannot map them
+// to the jagua-utils types the way it does `OffcutPolicy`; the four-arm matches live here.
+// ---------------------------------------------------------------------------
+
+impl From<generated::NestingFillDirection> for FillDirection {
+    fn from(d: generated::NestingFillDirection) -> Self {
+        match d {
+            generated::NestingFillDirection::Horizontal => FillDirection::Horizontal,
+            generated::NestingFillDirection::Vertical => FillDirection::Vertical,
+            generated::NestingFillDirection::Staircase => FillDirection::Staircase,
+        }
+    }
+}
+
+impl From<FillDirection> for generated::NestingFillDirection {
+    fn from(d: FillDirection) -> Self {
+        match d {
+            FillDirection::Horizontal => generated::NestingFillDirection::Horizontal,
+            FillDirection::Vertical => generated::NestingFillDirection::Vertical,
+            FillDirection::Staircase => generated::NestingFillDirection::Staircase,
+        }
+    }
+}
+
+impl From<generated::NestingStartCorner> for StartCorner {
+    fn from(c: generated::NestingStartCorner) -> Self {
+        match c {
+            generated::NestingStartCorner::TopLeft => StartCorner::TopLeft,
+            generated::NestingStartCorner::TopRight => StartCorner::TopRight,
+            generated::NestingStartCorner::BottomLeft => StartCorner::BottomLeft,
+            generated::NestingStartCorner::BottomRight => StartCorner::BottomRight,
+        }
+    }
+}
+
+impl From<StartCorner> for generated::NestingStartCorner {
+    fn from(c: StartCorner) -> Self {
+        match c {
+            StartCorner::TopLeft => generated::NestingStartCorner::TopLeft,
+            StartCorner::TopRight => generated::NestingStartCorner::TopRight,
+            StartCorner::BottomLeft => generated::NestingStartCorner::BottomLeft,
+            StartCorner::BottomRight => generated::NestingStartCorner::BottomRight,
         }
     }
 }
@@ -118,6 +170,8 @@ impl From<&SqsNestingRequest> for generated::NestingRequest {
             s3_prefix: r.s3_prefix.clone(),
             offcut_policy: r.offcut_policy,
             max_seconds: r.max_seconds.map(|v| v as i32),
+            fill_direction: r.fill_direction.map(Into::into),
+            start_corner: r.start_corner.map(Into::into),
         }
     }
 }

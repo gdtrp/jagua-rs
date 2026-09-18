@@ -10,7 +10,13 @@ use crate::svg_nesting::render::Placement;
 use std::f32::consts::FRAC_PI_2;
 
 /// How many `cell_w × cell_h` cells (with `spacing` gaps) fit along each axis of a `rw × rh` region.
-fn grid_dims(rw: f32, rh: f32, cell_w: f32, cell_h: f32, spacing: f32) -> (usize, usize) {
+pub(crate) fn grid_dims(
+    rw: f32,
+    rh: f32,
+    cell_w: f32,
+    cell_h: f32,
+    spacing: f32,
+) -> (usize, usize) {
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return (0, 0);
     }

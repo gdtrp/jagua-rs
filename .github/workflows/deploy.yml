@@ -27,7 +27,7 @@ env:
   # conditions (GitHub Actions does not expose `env.*` to job-level `if:`
   # expressions — only `needs.*.outputs.*` works there). The `on.push.branches`
   # trigger above matches `**` so renames here take effect with no other edits.
-  STAGING_BRANCH: chore/consume-cutl-schemas
+  STAGING_BRANCH: staging-deployable
   # ─────────────── VK Cloud migration (T7) ───────────────
   # Built once, pushed to BOTH registries for the length of the overlap.
   #
@@ -45,7 +45,7 @@ env:
   VK_IMAGE: jagua-sqs-processor
   # Pushing this branch builds and rolls the VK cluster without touching ECR or
   # main, so the platform can be exercised before any of it merges.
-  VK_DEPLOY_BRANCH: vk-cloud
+  VK_DEPLOY_BRANCH: staging-deployable
 
 jobs:
   # ---------------------------------------------------------------------------

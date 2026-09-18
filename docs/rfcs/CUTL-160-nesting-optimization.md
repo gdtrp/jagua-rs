@@ -191,3 +191,15 @@ Stored in [`docs/bugfix/`](../bugfix/), ordered as in the ticket:
 | `image (9)/(10).png` | 107/108 | **bug:** max/sheet 44 but a sheet has 45; blank preview |
 | `image (11).png` | 109 | triangles at 66.7%, misaligned bottom row |
 | (video) | 110 | 6 different sheets; sheet 1 (32 pcs) instant |
+
+## Addendum (2026-09-18, CUTL-198): utilisation is not one number
+
+The two packer families report `utilisation` differently, and the backend shows the figure as is:
+
+- **fast paths** (grid / pairing / lattice / mixed / the CUTL-198 row-column fill): bare `density` of the
+  jagua-rs layout — part outlines over sheet area, spacing counted as waste;
+- **LBF** (`AdaptiveNestingStrategy`): halo-inclusive `sheet_utilisation` — each part's `spacing/2` halo counts
+  as consumed, so a sheet with no room for another part reads higher than the same layout would on a fast path.
+
+A request that moves between families (e.g. `STAIRCASE` → `HORIZONTAL`) can therefore show a lower number for a
+layout that wastes no more material. Compare within a family only, or compare `material_utilisation`.

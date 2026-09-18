@@ -129,7 +129,36 @@ fn process_request_direct(
     if let Some(s) = request.max_seconds {
         strategy = strategy.with_time_budget(std::time::Duration::from_secs(s.min(600)));
     }
-    let nesting_result = if max_fit {
+    // A fill direction (CUTL-198) is only honoured by the `nest_auto` routers, exactly as the
+    // real processor calls them; the plain strategy paths below stay for every other test so
+    // their output is untouched.
+    let fill_direction = request.fill_direction.unwrap_or_default();
+    let start_corner = request.start_corner.unwrap_or_default();
+    strategy = strategy.with_layout(fill_direction, start_corner);
+    let routed = fill_direction != jagua_utils::FillDirection::Staircase;
+    let nesting_result = if max_fit && routed {
+        jagua_utils::nest_max_fit_auto(
+            &strategy,
+            bin_width,
+            bin_height,
+            spacing,
+            &part_inputs[0],
+            request.amount_of_rotations,
+            jagua_utils::PackingMode::Auto,
+            Some(Box::new(callback)),
+        )?
+    } else if routed {
+        jagua_utils::nest_auto(
+            &strategy,
+            bin_width,
+            bin_height,
+            spacing,
+            &part_inputs,
+            request.amount_of_rotations,
+            jagua_utils::PackingMode::Auto,
+            Some(Box::new(callback)),
+        )?
+    } else if max_fit {
         jagua_utils::svg_nesting::nest_max_fit_single_sheet(
             &strategy,
             bin_width,
@@ -205,6 +234,8 @@ async fn test_e2e_processing() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -270,6 +301,8 @@ async fn test_single_page_last_page_matches_first() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -338,6 +371,8 @@ async fn test_multiple_pages_last_page_is_set() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -424,6 +459,8 @@ async fn test_svg_with_circles() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -510,6 +547,8 @@ async fn test_all_parts_fit_last_page_empty() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -716,6 +755,8 @@ async fn test_cancellation_request_handling() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&cancellation_request)?;
@@ -777,6 +818,8 @@ async fn test_optimization_cancellation_during_execution() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -869,6 +912,8 @@ async fn test_cancellation_before_optimization_starts() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -936,6 +981,8 @@ async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> 
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_b = SqsNestingRequest {
@@ -955,6 +1002,8 @@ async fn test_parallel_requests_respect_individual_cancellation() -> Result<()> 
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let registry: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1061,6 +1110,8 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_cancelled = SqsNestingRequest {
@@ -1080,6 +1131,8 @@ async fn test_parallel_preemptive_cancellation_only_affects_target() -> Result<(
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let registry: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1179,6 +1232,8 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -1625,6 +1680,8 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -2049,6 +2106,8 @@ async fn test_execution_timeout() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -2309,6 +2368,8 @@ async fn test_complex_svg_timeout() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
 
     let request_json = serde_json::to_string(&request)?;
@@ -2522,6 +2583,8 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
     let request_json =
         serde_json::to_string_pretty(&sqs_request).context("serialize SQS request")?;
@@ -2764,6 +2827,8 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
     fs::write(
         output_dir.join("request.json"),
@@ -2862,6 +2927,8 @@ fn test_max_fit_legacy_single_part_returns_one_page() -> Result<()> {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
     let request_json = serde_json::to_string(&request)?;
 
@@ -2969,6 +3036,8 @@ fn test_max_fit_dto_serialization() {
         s3_prefix: None,
         offcut_policy: None,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     };
     let json = serde_json::to_string(&with_max_fit).unwrap();
     assert!(
@@ -3022,7 +3091,86 @@ fn offcut_square_request(
         s3_prefix: None,
         offcut_policy,
         max_seconds: None,
+        fill_direction: None,
+        start_corner: None,
     }
+}
+
+/// CUTL-198: a HORIZONTAL job through the in-process path returns exactly one RECT offcut on the
+/// final page — the remnant beside the packed block, touching the far edge — and a TOP_RIGHT
+/// start moves it to the left edge. Absent fields keep today's offcut-free response.
+#[test]
+fn horizontal_fill_returns_one_rect_remnant_per_page() -> Result<()> {
+    init_test_logging();
+    for (corner, expect_left_edge) in [
+        (jagua_utils::StartCorner::TopLeft, false),
+        (jagua_utils::StartCorner::TopRight, true),
+    ] {
+        let mut req = offcut_square_request(None, false);
+        req.correlation_id = format!("cutl198-{corner:?}");
+        req.fill_direction = Some(jagua_utils::FillDirection::Horizontal);
+        req.start_corner = Some(corner);
+        let json = serde_json::to_string(&req)?;
+        assert!(json.contains(r#""fillDirection":"HORIZONTAL""#), "{json}");
+
+        let (responses, result) = process_request_direct(&json, None, None)?;
+        let final_resp = responses.last().expect("final response");
+        assert!(final_resp.is_final);
+        assert_eq!(result.parts_placed, 2, "{corner:?}");
+        let pages = final_resp.pages.as_ref().expect("pages");
+        assert_eq!(pages.len(), 1, "{corner:?}: two squares fit one sheet");
+        assert_eq!(pages[0].offcuts.len(), 1, "{corner:?}: exactly one remnant");
+        match &pages[0].offcuts[0] {
+            jagua_utils::Offcut::Rect {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                assert!(
+                    y.abs() < 1e-3 && (height - 1000.0).abs() < 1e-3,
+                    "{corner:?}: full height"
+                );
+                assert!(*width > 0.0, "{corner:?}");
+                if expect_left_edge {
+                    assert!(
+                        x.abs() < 1e-3,
+                        "{corner:?}: remnant at the left edge, x = {x}"
+                    );
+                } else {
+                    assert!(
+                        (x + width - 2000.0).abs() < 1e-3,
+                        "{corner:?}: remnant touches the right edge"
+                    );
+                }
+                // The block itself sits on the other side of the remnant.
+                for p in &pages[0].placements {
+                    if expect_left_edge {
+                        assert!(p.x > x + width, "{corner:?}: part {p:?} inside the remnant");
+                    } else {
+                        assert!(p.x < *x, "{corner:?}: part {p:?} inside the remnant");
+                    }
+                }
+            }
+            other => panic!("{corner:?}: the remnant must be a RECT, got {other:?}"),
+        }
+        // The remnant is drawn on the page like a detected offcut.
+        let svg = String::from_utf8_lossy(&result.page_svgs[0]);
+        assert!(
+            svg.contains("offcut"),
+            "{corner:?}: remnant not drawn on the page SVG"
+        );
+        // A wire round-trip keeps it.
+        let wire = serde_json::to_string(final_resp)?;
+        assert!(wire.contains(r#""kind":"RECT""#), "{wire}");
+    }
+
+    // Absent fields ⇒ today's response: no offcuts key at all.
+    let req = offcut_square_request(None, false);
+    let (responses, _) = process_request_direct(&serde_json::to_string(&req)?, None, None)?;
+    let wire = serde_json::to_string(responses.last().unwrap())?;
+    assert!(!wire.contains("offcuts"), "{wire}");
+    Ok(())
 }
 
 fn rect_offcut_policy() -> jagua_utils::OffcutPolicy {

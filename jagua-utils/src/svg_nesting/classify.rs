@@ -4,6 +4,7 @@
 //! cheapest correct packer, falling back to the general LBF strategy (`AdaptiveNestingStrategy`)
 //! for anything the fast paths don't (yet) handle. The General path is byte-for-byte unchanged.
 
+use crate::svg_nesting::fill::{nest_fill, nest_max_fit_fill};
 use crate::svg_nesting::lattice::{lattice_single_sheet, nest_max_fit_lattice};
 use crate::svg_nesting::mixed::nest_mixed;
 use crate::svg_nesting::pairing::{nest_max_fit_pairing, nest_pairing, pairing_stencil};
@@ -141,6 +142,31 @@ pub fn nest_auto(
             return general(improvement_callback);
         }
         PackingMode::Auto => {}
+    }
+
+    // CUTL-198: a row/column fill direction bypasses the classifier — every shape and any number
+    // of types go to the bbox strip packer, which honours the start corner. The strategy's
+    // `Staircase` default leaves everything below byte-for-byte as it was.
+    let fill = strategy.sheet_fill();
+    if !fill.is_staircase() {
+        return match nest_fill(
+            bin_width,
+            bin_height,
+            spacing,
+            parts,
+            amount_of_rotations,
+            fill,
+            strategy.offcut_policy(),
+        ) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                log::warn!(
+                    "{:?} fill failed ({e:#}); falling back to the general strategy",
+                    fill.direction
+                );
+                general(improvement_callback)
+            }
+        };
     }
 
     let class = classify(parts, bin_width, bin_height);
@@ -297,6 +323,36 @@ pub fn nest_max_fit_auto(
     mode: PackingMode,
     improvement_callback: Option<ImprovementCallback>,
 ) -> Result<NestingResult> {
+    // CUTL-198: under a row/column fill direction the max-fit stencil is the fill packer's own
+    // full sheet, so it can never disagree with the sheets `nest_auto` repeats.
+    let fill = strategy.sheet_fill();
+    if mode == PackingMode::Auto && !fill.is_staircase() {
+        return match nest_max_fit_fill(
+            bin_width,
+            bin_height,
+            spacing,
+            part,
+            amount_of_rotations,
+            fill,
+        ) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                log::warn!(
+                    "{:?} max-fit fill failed ({e:#}); falling back to the general strategy",
+                    fill.direction
+                );
+                strategy.nest_max_fit(
+                    bin_width,
+                    bin_height,
+                    spacing,
+                    part,
+                    amount_of_rotations,
+                    improvement_callback,
+                )
+            }
+        };
+    }
+
     if mode != PackingMode::General {
         // Forced grid/periodic: deterministic grid stencil (single part that can sit at 0°).
         if matches!(mode, PackingMode::Grid | PackingMode::Periodic) {

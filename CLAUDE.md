@@ -134,6 +134,7 @@ paths don't handle:
 | `SinglePairable` | 1 part type, area ≈ ½ bbox, ≤ 5 vertices, no holes | `pairing.rs` |
 | `MixedFewTypes` | 2–4 part types, any shape | `mixed.rs` (each type's own single-type stencil repeated for its full sheets; leftovers band/shelf-packed on shared remainder sheets; falls to LBF if no type fills one sheet) |
 | `SingleIrregular` / `General` | everything else | `AdaptiveNestingStrategy` (byte-for-byte unchanged) |
+| *(any)* with `fillDirection` `HORIZONTAL` / `VERTICAL` | the request asked for a row/column fill (CUTL-198) | `fill.rs` — classifier bypassed: any shape, any number of types; bbox strip packer, start corner honoured, **one `RECT` remnant per page** in `offcuts` |
 
 `lattice.rs` backs the max-fit variants. `PackingMode::{Grid,Periodic,General}` exists only so tests can
 force a path; production is always `Auto`. Classification never fails the caller — a measurement error
@@ -142,6 +143,16 @@ falls back to `General` so the strategy surfaces the real parse error. Design ra
 
 Rotation semantics are subtle and contract-fixed (`strategy.rs`): per-part `allowed_rotations` is in
 **degrees**; `None` **and** an empty list both mean unconstrained; a single `[0]` means 0°-only.
+
+**Fill direction / start corner (CUTL-198, `fill.rs`)** ride on the strategy (`with_layout`), not on the
+`nest_auto` signature. `STAIRCASE` + `TOP_LEFT` (the wire defaults) is byte-identical to before — pinned by
+`cutl198_defaults.rs`. `HORIZONTAL` grows the packed block along x from the corner (remnant = full-height
+strip on the far x side), `VERTICAL` along y; each type keeps identical full sheets, leftovers share pages.
+`startCorner` is honoured **only** for the two row/column fills and ignored under `STAIRCASE`: it is a
+reflection of bbox cells with the part re-seated at its own orientation, which is only valid when every part
+owns a disjoint cell (pairing shares a cell, lattice/LBF interlock). Engine `(0,0)` renders **top-left** (the
+SVG is y-down, unflipped), so `TOP_LEFT` is today's anchor. The remnant survives the `pagesUrl` offload:
+`slim_pages_for_wire` empties `placements` and clears `offcuts` only if the record still does not fit.
 
 ### Processor flow and Kafka transport (`vk-cloud`)
 

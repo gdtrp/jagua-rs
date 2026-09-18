@@ -102,10 +102,20 @@ pub(crate) fn apply_offcuts(
     spacing: f32,
 ) {
     write_page_offcuts(&mut result.pages, solution, policy, spacing);
+    overlay_result_offcuts(result, policy.kerf_mm, bin_width, bin_height);
+}
 
+/// Draw every page's `offcuts` onto its page SVG and rebuild the combined SVG. Pages with no
+/// offcuts are returned untouched. Shared by the LBF path (after detection) and the row/column
+/// fill (whose single remnant is closed-form, see `fill.rs`).
+pub(crate) fn overlay_result_offcuts(
+    result: &mut NestingResult,
+    kerf: f32,
+    bin_width: f32,
+    bin_height: f32,
+) {
     // Stroke sized to the sheet so the overlay is visible at any scale.
     let stroke = (bin_width.min(bin_height) * 0.002).max(0.5);
-    let kerf = policy.kerf_mm;
     let patched: Vec<String> = result
         .page_svgs
         .iter()
