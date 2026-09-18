@@ -146,7 +146,7 @@ impl FillType {
 /// Extents `(xmin, xmax, ymin, ymax)` of a part's bounding box rotated by `rotation` about its
 /// centroid, relative to the centroid. Enumerating the four corners keeps the cardinal cases
 /// exact up to the f32 residue of `sin_cos` and stays a safe over-estimate otherwise.
-fn extent(p: &PreparedPart, rotation: f32) -> (f32, f32, f32, f32) {
+pub(crate) fn extent(p: &PreparedPart, rotation: f32) -> (f32, f32, f32, f32) {
     let (s, c) = rotation.sin_cos();
     let corners = [
         (-p.cx_off, -p.cy_off),
@@ -296,6 +296,49 @@ fn pack(
         });
     }
     pages
+}
+
+/// Fill the rectangle `(x0, y0, w, h)` with up to `max_count` bounding-box cells of one part type,
+/// in the cardinal orientation that fits the rectangle best (same grain rules as the row/column
+/// fill). The block is compact from the rectangle's left edge. Returns the placements in sheet
+/// coordinates and how far the block reaches along x inside the rectangle. Used by the mixed-types
+/// packer to use up rectangular gaps on shared leftover sheets (cutl-tests#77).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_rect(
+    p: &PreparedPart,
+    part_idx: usize,
+    part: &PartInput,
+    amount_of_rotations: usize,
+    (x0, y0, w, h): (f32, f32, f32, f32),
+    spacing: f32,
+    max_count: usize,
+) -> (Vec<Placement>, f32) {
+    if w <= 0.0 || h <= 0.0 || max_count == 0 {
+        return (Vec::new(), 0.0);
+    }
+    let (allow_original, allow_swapped) = orientations_allowed(part, amount_of_rotations);
+    let Some((t, cap)) =
+        choose_orientation(p, part_idx, allow_original, allow_swapped, w, h, spacing)
+    else {
+        return (Vec::new(), 0.0);
+    };
+    let n = cap.min(max_count);
+    let Some(page) = pack(&vec![t; n], FillDirection::Horizontal, w, h, spacing)
+        .into_iter()
+        .next()
+    else {
+        return (Vec::new(), 0.0);
+    };
+    let placements = page
+        .placements
+        .into_iter()
+        .map(|pl| Placement {
+            x: pl.x + x0,
+            y: pl.y + y0,
+            ..pl
+        })
+        .collect();
+    (placements, page.used_along)
 }
 
 /// Move a page packed in the `TOP_LEFT` frame to `corner`: every part's bounding-box cell is
