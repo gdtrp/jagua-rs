@@ -160,7 +160,7 @@ fn write_case_artifacts(case: &Case, result: &NestingResult) {
     std::fs::write(dir.join("index.md"), index).expect("index");
     // Full combined view only for small cases (avoid huge files for hundred-sheet runs).
     if result.pages.len() <= 6 {
-        std::fs::write(dir.join("combined.svg"), &result.combined_svg).expect("combined");
+        std::fs::write(dir.join("combined.svg"), result.combined_svg()).expect("combined");
     }
 }
 

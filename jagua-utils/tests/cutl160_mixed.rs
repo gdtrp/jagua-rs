@@ -21,7 +21,7 @@ fn write_output(case: &str, result: &jagua_utils::NestingResult) {
     for (i, page) in result.page_svgs.iter().enumerate() {
         std::fs::write(dir.join(format!("page-{i}.svg")), page).expect("write page");
     }
-    std::fs::write(dir.join("combined.svg"), &result.combined_svg).expect("write combined");
+    std::fs::write(dir.join("combined.svg"), result.combined_svg()).expect("write combined");
     std::fs::write(
         dir.join("pages.json"),
         serde_json::to_string_pretty(&result.pages).expect("serialize pages"),
@@ -90,7 +90,8 @@ fn mixed_types_place_all_parts_deterministically() {
     // Deterministic: a second run is byte-identical.
     let again = run();
     assert_eq!(
-        result.combined_svg, again.combined_svg,
+        result.combined_svg(),
+        again.combined_svg(),
         "mixed packing must be deterministic"
     );
 }

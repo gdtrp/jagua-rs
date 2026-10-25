@@ -68,7 +68,7 @@ M -1.41797,31.7402 L -2.99414,30.6523 L -3.88379,28.957 L -3.88379,27.043 L -2.9
             "offcuts must be empty without an offcut policy"
         );
 
-        let svg_string = String::from_utf8(result.combined_svg.clone())?;
+        let svg_string = String::from_utf8(result.combined_svg().clone())?;
         debug!(
             "Best placement SVG ({} parts placed):\n{}",
             max_parts_placed, svg_string
@@ -135,7 +135,7 @@ M 364.5,333.381 L 362.619,333.049 L 360.965,332.094 L 359.737,330.631 L 359.084,
 
         debug!("Placed {} parts out of 25 requested", result.parts_placed);
 
-        let svg_string = String::from_utf8(result.combined_svg.clone())?;
+        let svg_string = String::from_utf8(result.combined_svg().clone())?;
         debug!(
             "Best placement SVG ({} parts placed):\n{}",
             result.parts_placed, svg_string
@@ -329,7 +329,7 @@ M 364.5,333.381 L 362.619,333.049 L 360.965,332.094 L 359.737,330.631 L 359.084,
         );
 
         // Verify the combined SVG contains all placed items
-        let combined_svg_str = String::from_utf8(result.combined_svg.clone())?;
+        let combined_svg_str = String::from_utf8(result.combined_svg().clone())?;
         // Use regex to match <use> tags with href="#item_" pattern (same as in simple.rs)
         use regex::Regex;
         let re_item_use = Regex::new(r##"<use[^>]*href=["']#item_\d+["']"##).unwrap();
@@ -394,7 +394,7 @@ M 364.5,333.381 L 362.619,333.049 L 360.965,332.094 L 359.737,330.631 L 359.084,
         );
 
         // Verify the combined SVG is valid
-        let combined_svg_str = String::from_utf8(result.combined_svg.clone())?;
+        let combined_svg_str = String::from_utf8(result.combined_svg().clone())?;
         assert!(
             combined_svg_str.contains("<?xml"),
             "Combined SVG should be a valid SVG document"
