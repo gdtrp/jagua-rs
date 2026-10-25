@@ -55,14 +55,15 @@ test:
 test-slow:
 	cargo test $(LINT_CRATES) --features slow-tests
 
-# Brings up Kafka (SASL_PLAINTEXT + SCRAM-SHA-512) and MinIO, waits for both to be
+# Brings up Kafka (SASL_PLAINTEXT + SCRAM-SHA-512) and S3Mock, waits for both to be
 # healthy, then provisions the SCRAM user and the five topics. Idempotent.
 #
 # The broker advertises its SASL listener as localhost:9092 because the tests run
 # on the host via `cargo test`, not inside the compose network.
 compose-up:
-	$(COMPOSE) up -d --wait kafka minio
-	$(COMPOSE) up kafka-init minio-init
+	$(COMPOSE) up -d --wait kafka s3
+	$(COMPOSE) up kafka-init
+	$(COMPOSE) run --rm s3-init
 
 compose-down:
 	$(COMPOSE) down -v

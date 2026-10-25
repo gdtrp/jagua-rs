@@ -139,10 +139,10 @@ jobs:
           sudo apt-get install -y cmake g++ libsasl2-dev zlib1g-dev libssl-dev libcurl4-openssl-dev pkg-config
       - uses: Swatinem/rust-cache@v2
 
-      # Kafka advertises its SASL listener as localhost:9092 and MinIO is published
+      # Kafka advertises its SASL listener as localhost:9092 and S3Mock is published
       # on 9200; the runner executes cargo on the host, so both resolve. `compose-up`
-      # waits for health and then provisions the SCRAM user and topics.
-      - name: Start Kafka + MinIO harness
+      # waits for health, provisions the SCRAM user and topics, and waits for the bucket.
+      - name: Start Kafka + S3Mock harness
         run: make compose-up
 
       # Only the two harness-backed binaries: a bare `-- --ignored` on the whole

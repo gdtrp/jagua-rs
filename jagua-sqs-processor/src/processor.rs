@@ -68,7 +68,9 @@ pub struct SvgPartSpec {
 /// Trait for downloading SVG bytes from a URL.
 /// Abstracts S3 access so strategies and tests stay S3-agnostic.
 #[async_trait::async_trait]
-#[allow(dead_code)]
+// `double_must_use` (clippy 1.99): async_trait marks the generated boxed-future fn
+// `#[must_use]`, and the future already is. Nothing in our code to change.
+#[allow(dead_code, clippy::double_must_use)]
 pub trait SvgDownloader: Send + Sync {
     /// Download SVG bytes from the given URL
     async fn download(&self, url: &str) -> Result<Vec<u8>>;

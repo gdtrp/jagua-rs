@@ -35,7 +35,7 @@ if docker network inspect jagua-test_default >/dev/null 2>&1; then
   NETWORK_ARGS=(
     --network jagua-test_default
     -e KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-    -e AWS_ENDPOINT_URL=http://minio:9000
+    -e AWS_ENDPOINT_URL=http://s3:9090
   )
 fi
 
