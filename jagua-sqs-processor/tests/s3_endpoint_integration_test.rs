@@ -1,6 +1,6 @@
 //! Round-trip against a real S3-compatible endpoint that is not AWS.
 //!
-//! MinIO stands in for VK Object Storage here: both are reached by pointing
+//! S3Mock (the compose `s3` service) stands in for VK Object Storage here: both are reached by pointing
 //! `AWS_ENDPOINT_URL_S3` at a custom host, and neither has the wildcard DNS that
 //! virtual-host addressing needs. What this proves is the part unit tests cannot —
 //! that the client `S3Settings::build_client` returns actually talks to the
@@ -16,7 +16,7 @@ use jagua_sqs_processor::S3Settings;
 const ENDPOINT: &str = "http://localhost:9200";
 const BUCKET: &str = "cutl-test-uploads";
 
-fn minio_settings() -> S3Settings {
+fn harness_settings() -> S3Settings {
     // Same static credentials the compose harness provisions.
     std::env::set_var("AWS_ACCESS_KEY_ID", "jagua-test");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "jagua-test-secret");
@@ -27,9 +27,9 @@ fn minio_settings() -> S3Settings {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the MinIO harness: make compose-up"]
+#[ignore = "needs the S3 harness: make compose-up"]
 async fn put_and_get_round_trip_through_the_configured_endpoint() {
-    let s3 = minio_settings();
+    let s3 = harness_settings();
     assert!(
         s3.force_path_style,
         "an endpoint override must derive path-style addressing"
@@ -73,10 +73,10 @@ async fn put_and_get_round_trip_through_the_configured_endpoint() {
 /// The SDK reads that variable itself and does not check for emptiness, so this is
 /// the case that would break every request if `build_client` stopped clearing it.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the MinIO harness: make compose-up"]
+#[ignore = "needs the S3 harness: make compose-up"]
 async fn empty_endpoint_env_does_not_leak_into_the_client() {
     std::env::set_var("AWS_ENDPOINT_URL_S3", "");
-    let s3 = minio_settings();
+    let s3 = harness_settings();
     let client = s3.build_client().await;
 
     // Endpoint still honoured despite the empty variable being present.
