@@ -293,7 +293,7 @@ mod tests {
         std::fs::create_dir_all(out_dir).unwrap();
         std::fs::write(
             out_dir.join("prod1_rect_combined.svg"),
-            &result.combined_svg,
+            result.combined_svg(),
         )
         .unwrap();
         for (i, svg) in result.page_svgs.iter().enumerate() {
@@ -350,7 +350,7 @@ mod tests {
         std::fs::create_dir_all(out_dir).unwrap();
         std::fs::write(
             out_dir.join("prod1_quad_combined.svg"),
-            &result.combined_svg,
+            result.combined_svg(),
         )
         .unwrap();
         for (i, svg) in result.page_svgs.iter().enumerate() {
@@ -441,7 +441,7 @@ mod tests {
         std::fs::create_dir_all(out_dir).unwrap();
         std::fs::write(
             out_dir.join("report_repro_combined.svg"),
-            &result.combined_svg,
+            result.combined_svg(),
         )
         .unwrap();
         for (i, svg) in result.page_svgs.iter().enumerate() {
@@ -555,7 +555,7 @@ mod tests {
         std::fs::create_dir_all(out_dir).unwrap();
         std::fs::write(
             out_dir.join("report_repro_merged_combined.svg"),
-            &result.combined_svg,
+            result.combined_svg(),
         )
         .unwrap();
         for (i, svg) in result.page_svgs.iter().enumerate() {

@@ -21,7 +21,7 @@ fn write_output(case: &str, result: &jagua_utils::NestingResult) {
     for (i, page) in result.page_svgs.iter().enumerate() {
         std::fs::write(dir.join(format!("page-{i}.svg")), page).expect("write page");
     }
-    std::fs::write(dir.join("combined.svg"), &result.combined_svg).expect("write combined");
+    std::fs::write(dir.join("combined.svg"), result.combined_svg()).expect("write combined");
 }
 
 #[test]

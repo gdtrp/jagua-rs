@@ -71,7 +71,7 @@ fn write_output(case: &str, result: &NestingResult) {
     for (i, svg) in result.page_svgs.iter().enumerate() {
         std::fs::write(dir.join(format!("page-{i}.svg")), svg).unwrap();
     }
-    std::fs::write(dir.join("combined.svg"), &result.combined_svg).unwrap();
+    std::fs::write(dir.join("combined.svg"), result.combined_svg()).unwrap();
 }
 
 /// Axis-aligned bbox `(x0, y0, x1, y1)` of a placed part in sheet coordinates.
@@ -184,5 +184,5 @@ fn leftovers_are_never_strewn_along_a_shared_sheet() {
     }
 
     // Deterministic.
-    assert_eq!(nest(&qa_request()).combined_svg, result.combined_svg);
+    assert_eq!(nest(&qa_request()).combined_svg(), result.combined_svg());
 }

@@ -121,7 +121,7 @@ fn write_output(case: &str, result: &NestingResult) {
     for (i, svg) in result.page_svgs.iter().enumerate() {
         std::fs::write(dir.join(format!("page-{i}.svg")), svg).unwrap();
     }
-    std::fs::write(dir.join("combined.svg"), &result.combined_svg).unwrap();
+    std::fs::write(dir.join("combined.svg"), result.combined_svg()).unwrap();
     std::fs::write(
         dir.join("pages.json"),
         serde_json::to_string_pretty(&result.pages).unwrap(),
@@ -358,7 +358,8 @@ fn run_set(name: &str, fixtures: &[Fixture], parts: &[PartInput]) {
         // Deterministic: a second run is byte-identical.
         let again = nest(parts, direction, StartCorner::TopLeft, 4);
         assert_eq!(
-            again.combined_svg, top_left.combined_svg,
+            again.combined_svg(),
+            top_left.combined_svg(),
             "{label}: not deterministic"
         );
     }

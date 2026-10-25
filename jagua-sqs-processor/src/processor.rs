@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use aws_sdk_s3::Client as S3Client;
 use base64::{engine::general_purpose, Engine as _};
+use bytes::Bytes;
 use jagua_utils::svg_nesting::{AdaptiveNestingStrategy, NestingResult, PageResult, PartInput};
 use log::{debug, error, info, warn};
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
@@ -18,14 +19,18 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use crate::kafka::{
-    retry_headers, KafkaSettings, OffsetWatermark, RecordHeaders, PRODUCER_MAX_MESSAGE_BYTES,
-    PRODUCER_MESSAGE_OVERHEAD_BYTES,
+    decode_inflight, retry_headers, CrashMark, CrashVerdict, KafkaSettings, OffsetWatermark,
+    RecordHeaders, PRODUCER_MAX_MESSAGE_BYTES, PRODUCER_MESSAGE_OVERHEAD_BYTES,
 };
 use crate::metrics::metrics;
 use crate::s3::S3Settings;
 
 /// Default maximum concurrent processing tasks
 const DEFAULT_MAX_CONCURRENT_TASKS: usize = 20;
+
+/// How long the poll loop waits for a partition's committed offset (and its in-flight metadata)
+/// the first time it sees the partition.
+const COMMITTED_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum retry attempts for AWS operations
 const MAX_RETRY_ATTEMPTS: u32 = 3;
@@ -229,7 +234,7 @@ where
 /// Determine the last page SVG bytes based on nesting result
 /// Returns None if all parts placed (no unplaced sheet needed),
 /// unplaced parts SVG if available, otherwise the last filled page
-fn determine_last_page_svg(result: &NestingResult, first_page_bytes: &[u8]) -> Option<Vec<u8>> {
+fn determine_last_page_svg(result: &NestingResult) -> Option<Bytes> {
     if result.parts_placed == result.total_parts_requested {
         // All parts placed - no last page needed
         info!(
@@ -243,9 +248,9 @@ fn determine_last_page_svg(result: &NestingResult, first_page_bytes: &[u8]) -> O
             "Some parts unplaced ({} of {}), using unplaced parts SVG",
             result.parts_placed, result.total_parts_requested
         );
-        Some(unplaced_svg.clone())
+        Some(Bytes::from(unplaced_svg.clone()))
     } else {
-        // No unplaced parts SVG - use last filled page or first page
+        // No unplaced parts SVG - use last filled page, or the (empty) combined document
         info!(
             "No unplaced parts SVG available, using last filled page (parts_placed: {} of {})",
             result.parts_placed, result.total_parts_requested
@@ -254,8 +259,8 @@ fn determine_last_page_svg(result: &NestingResult, first_page_bytes: &[u8]) -> O
             result
                 .page_svgs
                 .last()
-                .unwrap_or(&first_page_bytes.to_vec())
-                .clone(),
+                .cloned()
+                .unwrap_or_else(|| Bytes::from(result.combined_svg())),
         )
     }
 }
@@ -281,6 +286,9 @@ fn get_execution_timeout() -> Duration {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CancellationEntry {
     pub(crate) cancelled: bool,
+    /// A job for this correlation_id has registered and not yet finished. A running entry is
+    /// never expired, so a cancel for a job longer than the TTL is not forgotten mid-run.
+    pub(crate) running: bool,
     pub(crate) created_at: Instant,
 }
 
@@ -348,23 +356,22 @@ pub struct NestingProcessor {
 }
 
 impl NestingProcessor {
-    /// Mark a correlation_id as cancelled. Returns true if it was already registered.
+    /// Mark a correlation_id as cancelled. Returns true if its job is running.
+    ///
+    /// A cancel for a job that has not registered yet is kept as an entry, and
+    /// [`Self::register_correlation_id`] honours it: the job may still be waiting for a semaphore
+    /// permit, or — after a crash — be redelivered together with its cancel (cutl-tests#393).
     fn mark_cancelled(&self, correlation_id: &str) -> bool {
         let mut registry = safe_lock(&self.cancellation_registry);
-        if let Some(entry) = registry.get_mut(correlation_id) {
-            entry.cancelled = true;
-            true
-        } else {
-            // Insert new entry for future cancellation check
-            registry.insert(
-                correlation_id.to_string(),
-                CancellationEntry {
-                    cancelled: true,
-                    created_at: Instant::now(),
-                },
-            );
-            false
-        }
+        let entry = registry
+            .entry(correlation_id.to_string())
+            .or_insert_with(|| CancellationEntry {
+                cancelled: true,
+                running: false,
+                created_at: Instant::now(),
+            });
+        entry.cancelled = true;
+        entry.running
     }
 
     /// Check if a correlation_id is cancelled
@@ -376,16 +383,19 @@ impl NestingProcessor {
             .unwrap_or(false)
     }
 
-    /// Register a correlation_id in the cancellation registry
-    fn register_correlation_id(&self, correlation_id: &str) {
+    /// Register a correlation_id's job as running. Returns true if the job was cancelled before
+    /// it started; the caller must then skip it. A cancel that arrived first is never cleared.
+    fn register_correlation_id(&self, correlation_id: &str) -> bool {
         let mut registry = safe_lock(&self.cancellation_registry);
-        registry.insert(
-            correlation_id.to_string(),
-            CancellationEntry {
+        let entry = registry
+            .entry(correlation_id.to_string())
+            .or_insert_with(|| CancellationEntry {
                 cancelled: false,
+                running: false,
                 created_at: Instant::now(),
-            },
-        );
+            });
+        entry.running = true;
+        entry.cancelled
     }
 
     /// Remove a correlation_id from the cancellation registry
@@ -402,7 +412,7 @@ impl NestingProcessor {
 
         let expired_keys: Vec<String> = registry
             .iter()
-            .filter(|(_, entry)| now.duration_since(entry.created_at) > ttl)
+            .filter(|(_, entry)| !entry.running && now.duration_since(entry.created_at) > ttl)
             .map(|(key, _)| key.clone())
             .collect();
 
@@ -689,7 +699,7 @@ async fn upload_svg_to_s3_internal(
     s3_client: &S3Client,
     s3: &S3Settings,
     s3_bucket: &str,
-    svg_bytes: &[u8],
+    svg_bytes: Bytes,
     s3_prefix: &str,
     filename: &str,
 ) -> Result<String> {
@@ -707,7 +717,7 @@ async fn upload_svg_to_s3_internal(
         .put_object()
         .bucket(s3_bucket)
         .key(&s3_key)
-        .body(aws_sdk_s3::primitives::ByteStream::from(svg_bytes.to_vec()))
+        .body(aws_sdk_s3::primitives::ByteStream::from(svg_bytes))
         .content_type("image/svg+xml")
         // `None` sends no ACL, which is the default and what AWS has always used.
         // VK Object Storage has no bucket policies, so an object a browser fetches
@@ -1291,8 +1301,18 @@ impl NestingProcessor {
         request: &SqsNestingRequest,
         output_queue_url: &str,
     ) -> Result<()> {
-        // Register correlation_id in cancellation registry
-        self.register_correlation_id(&request.correlation_id);
+        // Register correlation_id in cancellation registry. A cancel can arrive before this point:
+        // while the job waits for a permit, or in the same batch after a crash redelivery. The
+        // backend has already marked such a run CANCELLED and ignores late answers, so the job is
+        // skipped without a response — a cancelled heavy run must cost nothing (cutl-tests#393).
+        if self.register_correlation_id(&request.correlation_id) {
+            info!(
+                "Skipping correlation_id={}: cancelled before it started",
+                request.correlation_id
+            );
+            self.unregister_correlation_id(&request.correlation_id);
+            return Ok(());
+        }
 
         // Ensure cleanup happens even on error
         let result = async {
@@ -1412,6 +1432,7 @@ impl NestingProcessor {
             let s3_settings_for_task = Arc::clone(&self.s3);
             let output_queue_url_for_task = output_queue_url.to_string();
             let correlation_id_for_task = request.correlation_id.clone();
+            let processor_for_task = self.clone();
 
             // `tokio::spawn` does NOT inherit the caller's span — the spawned future
             // starts with an empty span stack. Without this, `inject_current` inside
@@ -1425,10 +1446,17 @@ impl NestingProcessor {
                 info!("Improvement task started, waiting for messages...");
                 while let Some(result) = rx.recv().await {
                     info!("Improvement task received message: {} parts placed, {} pages", result.parts_placed, result.page_svgs.len());
+                    // A cancelled run uploads and publishes nothing more; drain the channel.
+                    if processor_for_task.is_cancelled(&correlation_id_for_task) {
+                        continue;
+                    }
 
                     // Upload all page SVGs to S3
                     let mut page_svg_urls: Vec<String> = Vec::new();
                     for (page_idx, page_bytes) in result.page_svgs.iter().enumerate() {
+                        if processor_for_task.is_cancelled(&correlation_id_for_task) {
+                            break;
+                        }
                         let filename = format!("page-{}.svg", page_idx);
                         match retry_with_backoff(&format!("upload improvement page {}", page_idx), || {
                             let client = s3_client_for_task.clone();
@@ -1438,7 +1466,7 @@ impl NestingProcessor {
                             let prefix = s3_prefix_for_task.clone();
                             let fname = filename.clone();
                             async move {
-                                upload_svg_to_s3_internal(&client, &s3, &bucket, &bytes, &prefix, &fname).await
+                                upload_svg_to_s3_internal(&client, &s3, &bucket, bytes, &prefix, &fname).await
                             }
                         }).await {
                             Ok(url) => {
@@ -1452,12 +1480,7 @@ impl NestingProcessor {
                     }
 
                     // Upload last page (unplaced parts) only if there are unplaced parts
-                    let first_page_bytes = result.page_svgs.first()
-                        .unwrap_or(&result.combined_svg);
-                    let last_page_svg_url = if let Some(last_page_bytes) = determine_last_page_svg(
-                        &result,
-                        first_page_bytes,
-                    ) {
+                    let last_page_svg_url = if let Some(last_page_bytes) = determine_last_page_svg(&result) {
                         match retry_with_backoff("upload improvement last page", || {
                             let client = s3_client_for_task.clone();
                             let bucket = s3_bucket_for_task.clone();
@@ -1465,7 +1488,7 @@ impl NestingProcessor {
                             let bytes = last_page_bytes.clone();
                             let prefix = s3_prefix_for_task.clone();
                             async move {
-                                upload_svg_to_s3_internal(&client, &s3, &bucket, &bytes, &prefix, "last-page.svg").await
+                                upload_svg_to_s3_internal(&client, &s3, &bucket, bytes, &prefix, "last-page.svg").await
                             }
                         }).await {
                             Ok(url) => {
@@ -1572,6 +1595,16 @@ impl NestingProcessor {
             let cancellation_check_count_for_final_log = cancellation_check_count.clone();
             let timed_out_for_check = timed_out.clone();
 
+            // The deterministic fast paths do not poll the checker; a cancel that landed during
+            // the download stops the job here, before any packing.
+            if self.is_cancelled(&request.correlation_id) {
+                info!(
+                    "Cancelled before nesting started, skipping: correlation_id={}",
+                    request.correlation_id
+                );
+                return Ok(());
+            }
+
             // Run nest() in a blocking task to avoid blocking the async runtime
             // The cancellation checker handles timeout detection cooperatively
             info!("Starting nesting optimization in spawn_blocking task (timeout: {:?})", execution_timeout);
@@ -1662,6 +1695,16 @@ impl NestingProcessor {
             }
             info!("Improvement task completed");
 
+            // Cancelled mid-run: the strategy returned its best layout so far, but the backend
+            // has already closed the run. Uploading a large result would cost minutes for nothing.
+            if self.is_cancelled(&request.correlation_id) {
+                info!(
+                    "Cancelled during the run, skipping upload and final response: correlation_id={}",
+                    request.correlation_id
+                );
+                return Ok(());
+            }
+
             info!(
                 "Nesting complete: {} parts placed out of {} requested ({} page SVGs generated)",
                 nesting_result.parts_placed,
@@ -1684,6 +1727,13 @@ impl NestingProcessor {
             // Upload all page SVGs to S3
             let mut page_svg_urls: Vec<String> = Vec::new();
             for (page_idx, page_bytes) in nesting_result.page_svgs.iter().enumerate() {
+                if self.is_cancelled(&request.correlation_id) {
+                    info!(
+                        "Cancelled during upload, stopping at page {}: correlation_id={}",
+                        page_idx, request.correlation_id
+                    );
+                    return Ok(());
+                }
                 let filename = format!("page-{}.svg", page_idx);
                 match retry_with_backoff(&format!("upload final page {}", page_idx), || {
                     let s3_client = self.s3_client.clone();
@@ -1693,7 +1743,7 @@ impl NestingProcessor {
                     let prefix = final_prefix.clone();
                     let fname = filename.clone();
                     async move {
-                        upload_svg_to_s3_internal(&s3_client, &s3, &bucket, &bytes, &prefix, &fname).await
+                        upload_svg_to_s3_internal(&s3_client, &s3, &bucket, bytes, &prefix, &fname).await
                     }
                 }).await {
                     Ok(url) => {
@@ -1716,12 +1766,7 @@ impl NestingProcessor {
             }
 
             // Upload last page (unplaced parts) only if there are unplaced parts
-            let first_page_bytes = nesting_result.page_svgs.first()
-                .unwrap_or(&nesting_result.combined_svg);
-            let last_page_svg_url = if let Some(last_page_bytes) = determine_last_page_svg(
-                &nesting_result,
-                first_page_bytes,
-            ) {
+            let last_page_svg_url = if let Some(last_page_bytes) = determine_last_page_svg(&nesting_result) {
                 match retry_with_backoff("upload final last page", || {
                     let s3_client = self.s3_client.clone();
                     let bucket = final_bucket.clone();
@@ -1729,7 +1774,7 @@ impl NestingProcessor {
                     let bytes = last_page_bytes.clone();
                     let prefix = final_prefix.clone();
                     async move {
-                        upload_svg_to_s3_internal(&s3_client, &s3, &bucket, &bytes, &prefix, "last-page.svg").await
+                        upload_svg_to_s3_internal(&s3_client, &s3, &bucket, bytes, &prefix, "last-page.svg").await
                     }
                 }).await {
                     Ok(url) => {
@@ -1840,6 +1885,10 @@ impl NestingProcessor {
         // advanced on the loop thread, where the single mutable copy lives.
         let mut active_tasks: JoinSet<CompletedRecord> = JoinSet::new();
         let mut watermark = OffsetWatermark::new();
+        // A task reports here when its handler actually starts (it holds its permits), so the
+        // in-flight set in the commit metadata names only jobs that were running, never jobs
+        // still queued on the semaphore — those cannot have caused a crash.
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel::<StartedRecord>();
 
         let mut last_cleanup = Instant::now();
         let cleanup_interval = Duration::from_secs(60);
@@ -1883,6 +1932,14 @@ impl NestingProcessor {
                     }
                 }
 
+                Some(started) = started_rx.recv() => {
+                    watermark.start(&started.topic, started.partition, started.offset, started.mark);
+                    // A suspect's start is committed synchronously: if it crashes again, the
+                    // next owner must see that it ran alone, or the loop would not end.
+                    let mode = if started.mark.exclusive { CommitMode::Sync } else { CommitMode::Async };
+                    self.commit_partition(&consumer, &watermark, &started.topic, started.partition, mode);
+                }
+
                 received = consumer.recv() => {
                     let borrowed = match received {
                         Ok(m) => m,
@@ -1910,6 +1967,10 @@ impl NestingProcessor {
                     };
 
                     metrics().messages_consumed.with_label_values(&[&record.topic]).inc();
+                    if watermark.needs_prior(&record.topic, record.partition) {
+                        let prior = self.load_inflight(&consumer, &record.topic, record.partition);
+                        watermark.set_prior(&record.topic, record.partition, prior);
+                    }
                     watermark.observe(&record.topic, record.partition, record.offset);
 
                     // ── Cancellations short-circuit here, before the semaphore ──
@@ -1925,6 +1986,44 @@ impl NestingProcessor {
                         self.advance_and_commit(&consumer, &mut watermark, &done);
                         continue;
                     }
+
+                    // ── Crash guard (cutl-tests#392): was this record running when the last
+                    // owner of the partition died? ──
+                    let prior = watermark.take_prior(&record.topic, record.partition, record.offset);
+                    let verdict = CrashVerdict::decide(prior, self.kafka.attempt_budget);
+                    if let CrashVerdict::GiveUp { crashes } = verdict {
+                        error!(
+                            "Record {}-{}-{} killed the worker {} time(s), the last while running alone; \
+                             answering with an error instead of running it again",
+                            record.topic, record.partition, record.offset, crashes
+                        );
+                        metrics().record_retries_exhausted(&record.topic);
+                        let processor = self.clone();
+                        metrics().inflight_jobs.inc();
+                        active_tasks.spawn(async move {
+                            processor.answer_crashed_request(&record.payload, crashes).await;
+                            CompletedRecord::ok(&record)
+                        });
+                        continue;
+                    }
+                    if let CrashVerdict::RunAlone { crashes } = verdict {
+                        warn!(
+                            "Record {}-{}-{} was running when the worker died ({} crash(es)); \
+                             running it alone to find out whether it is the cause",
+                            record.topic, record.partition, record.offset, crashes
+                        );
+                    }
+                    let permits = match verdict {
+                        CrashVerdict::RunAlone { .. } => max_concurrent as u32,
+                        _ => 1,
+                    };
+                    let started = StartedRecord {
+                        topic: record.topic.clone(),
+                        partition: record.partition,
+                        offset: record.offset,
+                        mark: verdict.mark(),
+                    };
+                    let started_tx = started_tx.clone();
 
                     let processor = self.clone();
                     let semaphore_clone = semaphore.clone();
@@ -1947,13 +2046,18 @@ impl NestingProcessor {
                     }
 
                     active_tasks.spawn(async move {
-                        let _permit = match semaphore_clone.acquire().await {
+                        // The semaphore is FIFO, so a suspect waiting for every permit also
+                        // holds back the jobs behind it: it starts alone, once the jobs ahead
+                        // of it finish.
+                        let _permit = match semaphore_clone.acquire_many(permits).await {
                             Ok(permit) => permit,
                             Err(e) => {
                                 error!("Failed to acquire semaphore permit: {}", e);
                                 return CompletedRecord::failed(&record);
                             }
                         };
+                        // The poll loop outlives every task, so the receiver is still there.
+                        let _ = started_tx.send(started);
 
                         let result = processor
                             .process_message(&record.key.clone().unwrap_or_default(), &record.payload)
@@ -2118,44 +2222,179 @@ impl NestingProcessor {
         }
     }
 
-    /// Advance the watermark for a finished record and commit if the contiguous
-    /// prefix moved.
+    /// Advance the watermark for a finished record and commit.
+    ///
+    /// Commits even when the contiguous prefix did not move: the record has left the in-flight
+    /// set, and the metadata must say so, or a later crash would blame it.
     fn advance_and_commit(
         &self,
         consumer: &StreamConsumer,
         watermark: &mut OffsetWatermark,
         done: &CompletedRecord,
     ) {
-        let Some(commit_at) = watermark.complete(&done.topic, done.partition, done.offset) else {
+        if watermark
+            .complete(&done.topic, done.partition, done.offset)
+            .is_none()
+        {
             debug!(
                 "{}-{}-{} done but an earlier offset is still in flight; holding the commit",
                 done.topic, done.partition, done.offset
             );
+        }
+        self.commit_partition(
+            consumer,
+            watermark,
+            &done.topic,
+            done.partition,
+            CommitMode::Async,
+        );
+    }
+
+    /// Commit a partition's watermark together with its in-flight set as metadata.
+    ///
+    /// **Every commit on the request topic goes through here.** A commit without the metadata
+    /// would clear the in-flight set, and a request that kills the worker would be redelivered
+    /// forever again (cutl-tests#392).
+    fn commit_partition(
+        &self,
+        consumer: &StreamConsumer,
+        watermark: &OffsetWatermark,
+        topic: &str,
+        partition: i32,
+        mode: CommitMode,
+    ) {
+        let Some((commit_at, metadata)) = watermark.commit_point(topic, partition) else {
             return;
         };
 
         let mut tpl = TopicPartitionList::new();
-        if let Err(e) =
-            tpl.add_partition_offset(&done.topic, done.partition, Offset::Offset(commit_at))
-        {
-            error!("Failed to build commit list for {}: {}", done.topic, e);
-            return;
+        match tpl.add_partition_offset(topic, partition, Offset::Offset(commit_at)) {
+            Ok(()) => {
+                if let Some(mut elem) = tpl.find_partition(topic, partition) {
+                    elem.set_metadata(metadata);
+                }
+            }
+            Err(e) => {
+                error!("Failed to build commit list for {}: {}", topic, e);
+                return;
+            }
         }
 
-        // Async: a synchronous commit here would block the receive loop, and
+        // Async by default: a synchronous commit here would block the receive loop, and
         // blocking the receive loop is what makes cancellation stop working.
-        if let Err(e) = consumer.commit(&tpl, CommitMode::Async) {
+        if let Err(e) = consumer.commit(&tpl, mode) {
             // Not fatal. The watermark keeps its position and the next commit
             // carries this offset too; worst case a record is redelivered.
-            warn!("Commit of {}@{} failed: {}", done.topic, commit_at, e);
+            warn!("Commit of {}@{} failed: {}", topic, commit_at, e);
             return;
         }
 
         metrics()
             .committed_offset
-            .with_label_values(&[&done.topic, &done.partition.to_string()])
+            .with_label_values(&[topic, &partition.to_string()])
             .set(commit_at);
     }
+
+    /// Read the in-flight set the partition's previous owner committed. Once per partition.
+    ///
+    /// Blocks the poll loop for at most [`COMMITTED_FETCH_TIMEOUT`], once per partition per
+    /// process. On failure the guard is off for this partition (logged), never the partition.
+    pub(crate) fn load_inflight(
+        &self,
+        consumer: &StreamConsumer,
+        topic: &str,
+        partition: i32,
+    ) -> std::collections::BTreeMap<i64, CrashMark> {
+        let mut tpl = TopicPartitionList::new();
+        if let Err(e) = tpl
+            .add_partition(topic, partition)
+            .set_offset(Offset::Invalid)
+        {
+            warn!("Crash guard off for {topic}-{partition}: {e}");
+            return Default::default();
+        }
+        match consumer.committed_offsets(tpl, COMMITTED_FETCH_TIMEOUT) {
+            Ok(committed) => {
+                let prior = committed
+                    .find_partition(topic, partition)
+                    .map(|elem| decode_inflight(elem.metadata()))
+                    .unwrap_or_default();
+                if !prior.is_empty() {
+                    warn!(
+                        "{topic}-{partition}: the previous owner stopped with {} job(s) running: {:?}",
+                        prior.len(),
+                        prior.keys().collect::<Vec<_>>()
+                    );
+                }
+                prior
+            }
+            Err(e) => {
+                warn!(
+                    "Crash guard off for {topic}-{partition}: committed offsets unavailable: {e}"
+                );
+                Default::default()
+            }
+        }
+    }
+
+    /// Answer a request that kept killing the worker with a final error, so the backend marks
+    /// the run FAILED instead of waiting for a result that will never come.
+    pub(crate) async fn answer_crashed_request(&self, payload: &str, crashes: u32) {
+        let body: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Cannot answer a crashed request with an unreadable payload: {e}");
+                return;
+            }
+        };
+        let Some(correlation_id) = body.get("correlationId").and_then(|v| v.as_str()) else {
+            error!("Cannot answer a crashed request without a correlationId");
+            return;
+        };
+        let output_queue_url = body
+            .get("outputQueueUrl")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.response_topic.clone());
+        let response = SqsNestingResponse {
+            correlation_id: correlation_id.to_string(),
+            first_page_svg_url: None,
+            last_page_svg_url: None,
+            sheets: None,
+            sheets_total: None,
+            page_svg_urls: None,
+            pages: None,
+            pages_url: None,
+            parts_placed: 0,
+            utilisation: 0.0,
+            is_improvement: false,
+            is_final: true,
+            timestamp: current_timestamp(),
+            error_message: Some(format!(
+                "The nesting worker stopped {crashes} time(s) while processing this request, \
+                 most likely out of memory. Reduce the number of parts or split the run."
+            )),
+        };
+        match self
+            .send_to_output_queue(&output_queue_url, &response)
+            .await
+        {
+            Ok(()) => {
+                info!("Answered crashed request correlation_id={correlation_id} with an error")
+            }
+            Err(e) => {
+                error!("Failed to answer crashed request correlation_id={correlation_id}: {e}")
+            }
+        }
+    }
+}
+
+/// A handler that just started, reported from its task to the poll loop.
+struct StartedRecord {
+    topic: String,
+    partition: i32,
+    offset: i64,
+    mark: CrashMark,
 }
 
 /// A record lifted out of rdkafka's borrowed message so it can cross a task
@@ -2304,6 +2543,20 @@ mod tests {
         )
     }
 
+    /// [`test_processor`] with an S3 client aimed at a closed port, so any S3 call fails fast.
+    async fn test_processor_with_dead_s3() -> NestingProcessor {
+        let processor = test_processor().await;
+        let aws = aws_config::defaults(BehaviorVersion::latest())
+            .endpoint_url("http://127.0.0.1:1")
+            .region(aws_config::Region::new("us-east-1"))
+            .load()
+            .await;
+        NestingProcessor {
+            s3_client: aws_sdk_s3::Client::new(&aws),
+            ..processor
+        }
+    }
+
     #[test]
     fn test_cancellation_registry_insert_and_get() {
         let registry: Arc<Mutex<HashMap<String, CancellationEntry>>> =
@@ -2316,6 +2569,7 @@ mod tests {
                 "test-id-1".to_string(),
                 CancellationEntry {
                     cancelled: true,
+                    running: false,
                     created_at: Instant::now(),
                 },
             );
@@ -2341,6 +2595,7 @@ mod tests {
                 "test-id-1".to_string(),
                 CancellationEntry {
                     cancelled: false,
+                    running: false,
                     created_at: Instant::now(),
                 },
             );
@@ -3045,6 +3300,88 @@ mod tests {
         let registry = processor.cancellation_registry_handle();
         let reg = registry.lock().unwrap();
         assert!(reg.get("test-cleanup").is_none());
+    }
+
+    /// cutl-tests#393: a cancel that lands before its job registers — the job is still waiting
+    /// for a permit, or a crash redelivered request N and cancel N+1 in one batch — must survive
+    /// the registration. It used to be overwritten with `cancelled: false`.
+    #[tokio::test]
+    async fn cancel_before_register_is_kept() {
+        let processor = test_processor().await;
+
+        assert!(!processor.mark_cancelled("early"), "no job is running yet");
+        assert!(
+            processor.register_correlation_id("early"),
+            "registration reports the earlier cancel"
+        );
+        assert!(processor.is_cancelled("early"));
+    }
+
+    #[tokio::test]
+    async fn cancel_after_register_reaches_the_running_job() {
+        let processor = test_processor().await;
+
+        assert!(!processor.register_correlation_id("late"));
+        assert!(processor.mark_cancelled("late"), "the job is running");
+        assert!(processor.is_cancelled("late"));
+    }
+
+    /// A job can outlive the TTL; its entry must not be expired while it runs, or a later cancel
+    /// would be recorded as "not yet started" and never reach it.
+    #[tokio::test]
+    async fn cleanup_keeps_entries_of_running_jobs() {
+        let processor = test_processor().await;
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(CANCELLATION_REGISTRY_TTL_SECS + 1))
+            .expect("monotonic clock is past the TTL");
+        processor.register_correlation_id("running");
+        processor.mark_cancelled("stale");
+        {
+            let registry = processor.cancellation_registry_handle();
+            let mut reg = registry.lock().unwrap();
+            for entry in reg.values_mut() {
+                entry.created_at = old;
+            }
+        }
+
+        processor.cleanup_expired_entries();
+
+        let registry = processor.cancellation_registry_handle();
+        let reg = registry.lock().unwrap();
+        assert!(reg.contains_key("running"));
+        assert!(!reg.contains_key("stale"));
+    }
+
+    /// The replay of run 4a930f88 after a restart: the cancel is seen before the request starts.
+    /// The job must return without touching S3. The processor's S3 endpoint points at a closed
+    /// port, so any download attempt fails the call instead of passing.
+    #[tokio::test]
+    async fn request_cancelled_before_start_does_no_work() {
+        let request = include_str!("../tests/testdata/cutl-tests-392/request.json");
+        let cancel = include_str!("../tests/testdata/cutl-tests-392/cancel.json");
+        let processor = test_processor_with_dead_s3().await;
+
+        let correlation_id = peek_cancellation(cancel).expect("production cancel shape");
+        processor.mark_cancelled(&correlation_id);
+        processor
+            .process_message("", request)
+            .await
+            .expect("a pre-cancelled job is skipped, not failed");
+
+        let registry = processor.cancellation_registry_handle();
+        assert!(
+            !registry.lock().unwrap().contains_key(&correlation_id),
+            "the skipped job unregisters"
+        );
+    }
+
+    /// Control for the test above: without the cancel, the same request does reach S3 and fails.
+    #[tokio::test]
+    async fn request_without_cancel_reaches_s3() {
+        let request = include_str!("../tests/testdata/cutl-tests-392/request.json");
+        let processor = test_processor_with_dead_s3().await;
+
+        assert!(processor.process_message("", request).await.is_err());
     }
 
     #[tokio::test]

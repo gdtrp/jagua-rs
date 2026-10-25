@@ -15,9 +15,10 @@ use crate::svg_nesting::parsing::{
 };
 use crate::svg_nesting::strategy::PartInput;
 use crate::svg_nesting::svg_generation::{
-    NestingResult, PageResult, PlacedPartInfo, combine_svg_documents, post_process_svg_multi,
+    NestingResult, PageResult, PlacedPartInfo, post_process_svg_multi,
 };
 use anyhow::Result;
+use bytes::Bytes;
 use jagua_rs::collision_detection::CDEConfig;
 use jagua_rs::entities::{Container, Instance, Item, Layout};
 use jagua_rs::geometry::fail_fast::SPSurrogateConfig;
@@ -329,16 +330,15 @@ pub(crate) fn render_periodic(
     remainder: &[Placement],
     total_parts_requested: usize,
 ) -> NestingResult {
-    let mut page_svg_strings: Vec<String> = Vec::new();
-    let mut page_svgs: Vec<Vec<u8>> = Vec::new();
+    let mut page_svgs: Vec<Bytes> = Vec::new();
     let mut page_results: Vec<PageResult> = Vec::new();
     let mut total_placed = 0;
 
     if full_sheets > 0 && !stencil.is_empty() {
         let (svg, infos, util) = render_one_page(ctx, stencil, 0);
+        let svg = Bytes::from(svg);
         for i in 0..full_sheets {
-            page_svg_strings.push(svg.clone());
-            page_svgs.push(svg.clone().into_bytes());
+            page_svgs.push(svg.clone());
             total_placed += infos.len();
             page_results.push(PageResult {
                 page_index: i,
@@ -355,8 +355,7 @@ pub(crate) fn render_periodic(
         let idx = page_results.len();
         let (svg, infos, util) = render_one_page(ctx, remainder, idx);
         total_placed += infos.len();
-        page_svg_strings.push(svg.clone());
-        page_svgs.push(svg.into_bytes());
+        page_svgs.push(Bytes::from(svg));
         page_results.push(PageResult {
             page_index: idx,
             utilisation: util,
@@ -367,8 +366,6 @@ pub(crate) fn render_periodic(
         });
     }
 
-    let combined_svg =
-        combine_svg_documents(&page_svg_strings, ctx.bin_width, ctx.bin_height).into_bytes();
     let utilisation = if page_results.is_empty() {
         0.0
     } else {
@@ -376,8 +373,9 @@ pub(crate) fn render_periodic(
     };
 
     NestingResult {
-        combined_svg,
         page_svgs,
+        sheet_width: ctx.bin_width,
+        sheet_height: ctx.bin_height,
         parts_placed: total_placed,
         total_parts_requested,
         unplaced_parts_svg: None,
@@ -399,31 +397,25 @@ pub(crate) fn render_page_list(
     pages: &[Vec<Placement>],
     total_parts_requested: usize,
 ) -> NestingResult {
-    let mut page_svg_strings: Vec<String> = Vec::with_capacity(pages.len());
-    let mut page_svgs: Vec<Vec<u8>> = Vec::with_capacity(pages.len());
+    let mut page_svgs: Vec<Bytes> = Vec::with_capacity(pages.len());
     let mut page_results: Vec<PageResult> = Vec::with_capacity(pages.len());
     let mut total_placed = 0;
 
-    let mut cached: Option<(Vec<Placement>, String, Vec<PlacedPartInfo>, f32)> = None;
+    let mut cached: Option<(Vec<Placement>, Bytes, Vec<PlacedPartInfo>, f32)> = None;
     for (idx, placements) in pages.iter().enumerate() {
         let (svg, infos, util) = match &cached {
             Some((prev, svg, infos, util)) if prev == placements => {
                 (svg.clone(), infos.clone(), *util)
             }
             _ => {
-                let rendered = render_one_page(ctx, placements, idx);
-                cached = Some((
-                    placements.clone(),
-                    rendered.0.clone(),
-                    rendered.1.clone(),
-                    rendered.2,
-                ));
-                rendered
+                let (svg, infos, util) = render_one_page(ctx, placements, idx);
+                let svg = Bytes::from(svg);
+                cached = Some((placements.clone(), svg.clone(), infos.clone(), util));
+                (svg, infos, util)
             }
         };
         total_placed += infos.len();
-        page_svg_strings.push(svg.clone());
-        page_svgs.push(svg.into_bytes());
+        page_svgs.push(svg);
         page_results.push(PageResult {
             page_index: idx,
             utilisation: util,
@@ -434,8 +426,6 @@ pub(crate) fn render_page_list(
         });
     }
 
-    let combined_svg =
-        combine_svg_documents(&page_svg_strings, ctx.bin_width, ctx.bin_height).into_bytes();
     let utilisation = if page_results.is_empty() {
         0.0
     } else {
@@ -443,8 +433,9 @@ pub(crate) fn render_page_list(
     };
 
     NestingResult {
-        combined_svg,
         page_svgs,
+        sheet_width: ctx.bin_width,
+        sheet_height: ctx.bin_height,
         parts_placed: total_placed,
         total_parts_requested,
         unplaced_parts_svg: None,

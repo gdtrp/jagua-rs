@@ -1,6 +1,7 @@
 //! SVG generation and post-processing utilities
 
 use anyhow::Result;
+use bytes::Bytes;
 use jagua_rs::geometry::OriginalShape;
 use jagua_rs::geometry::geo_traits::Transformable;
 use jagua_rs::geometry::primitives::{Point, SPolygon};
@@ -56,10 +57,14 @@ pub struct PageResult {
 /// Result data returned after nesting SVG parts.
 #[derive(Clone, Debug)]
 pub struct NestingResult {
-    /// Combined SVG of all pages as bytes.
-    pub combined_svg: Vec<u8>,
-    /// Individual page SVGs (ordered by container id).
-    pub page_svgs: Vec<Vec<u8>>,
+    /// Individual page SVGs (ordered by container id). Identical pages share one buffer: a
+    /// part with thousands of holes makes a multi-MB page, and a run of 150 identical sheets
+    /// used to hold 150 copies of it (cutl-tests#396 — 1.4 GiB for one request). `Bytes`
+    /// clones are reference-counted, so keep pages as clones of one another, never as copies.
+    pub page_svgs: Vec<Bytes>,
+    /// Sheet size the pages were laid out on; [`NestingResult::combined_svg`] stacks pages with it.
+    pub sheet_width: f32,
+    pub sheet_height: f32,
     /// Number of parts placed.
     pub parts_placed: usize,
     /// Total number of parts requested (original amount_of_parts).
@@ -81,6 +86,14 @@ pub struct NestingResult {
     /// fast paths know this immediately, enabling a determinate progress bar — CUTL-160 #1). `None`
     /// for the general LBF path, where the sheet count is only known once the run finishes.
     pub sheets_total_estimate: Option<usize>,
+}
+
+impl NestingResult {
+    /// All pages stacked into one SVG document. Built on demand: nothing in production uploads
+    /// it, and materialising it eagerly cost one more full copy of every page per result.
+    pub fn combined_svg(&self) -> Vec<u8> {
+        combine_svg_documents(&self.page_svgs, self.sheet_width, self.sheet_height).into_bytes()
+    }
 }
 
 /// Overlays detected offcuts onto a page SVG as a dashed green `<g id="offcuts">` group,
@@ -493,7 +506,11 @@ fn extract_svg_inner_content(svg_str: &str) -> String {
 
 /// Combines multiple SVG documents into a single valid SVG document.
 /// Pages are stacked vertically with a gap between them.
-pub fn combine_svg_documents(svg_documents: &[String], bin_width: f32, bin_height: f32) -> String {
+pub fn combine_svg_documents<S: AsRef<[u8]>>(
+    svg_documents: &[S],
+    bin_width: f32,
+    bin_height: f32,
+) -> String {
     let num_pages = svg_documents.len();
     let gap = bin_height * 0.02; // small gap between pages
     let total_height = num_pages as f32 * bin_height + (num_pages.saturating_sub(1)) as f32 * gap;
@@ -507,7 +524,7 @@ pub fn combine_svg_documents(svg_documents: &[String], bin_width: f32, bin_heigh
 
     for (i, svg_doc) in svg_documents.iter().enumerate() {
         let y_offset = i as f32 * (bin_height + gap);
-        let inner_content = extract_svg_inner_content(svg_doc);
+        let inner_content = extract_svg_inner_content(&String::from_utf8_lossy(svg_doc.as_ref()));
         combined.push_str(&format!(
             "<g transform=\"translate(0,{})\">\n{}\n</g>\n",
             y_offset, inner_content

@@ -46,7 +46,8 @@ fn strategies() -> Vec<(&'static str, AdaptiveNestingStrategy)> {
 
 fn assert_same(label: &str, baseline: &NestingResult, other: &NestingResult) {
     assert_eq!(
-        other.combined_svg, baseline.combined_svg,
+        other.combined_svg(),
+        baseline.combined_svg(),
         "{label}: combined_svg"
     );
     assert_eq!(other.page_svgs, baseline.page_svgs, "{label}: page_svgs");
