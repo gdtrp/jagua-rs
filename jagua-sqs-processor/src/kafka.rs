@@ -22,7 +22,7 @@
 //!    `seek()`-back head-of-line-blocks the partition on a poison message. Retry is
 //!    republish-to-the-next-tier-and-commit.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -331,6 +331,102 @@ struct PartitionState {
     /// record is seen, because the starting offset depends on where the group
     /// resumed.
     next_expected: Option<i64>,
+    /// Jobs whose handler has started and not finished. Written into every commit's
+    /// metadata, so after a SIGKILL the next owner knows which records were running.
+    started: BTreeMap<i64, CrashMark>,
+    /// What the previous owner's last commit said was running. `None` until loaded.
+    prior: Option<BTreeMap<i64, CrashMark>>,
+}
+
+/// Crash bookkeeping for one in-flight record (cutl-tests#392).
+///
+/// An OOM kill (SIGKILL) never reaches [`crate::processor::NestingProcessor::escalate`],
+/// and a redelivered record is the original from cutl-backend, with no attempt header.
+/// Headers on a consumed record cannot be changed, so the count rides in the one place
+/// Kafka keeps per-partition state for a consumer group: the offset commit's metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CrashMark {
+    /// How many times a process died while this record was running.
+    pub crashes: u32,
+    /// The record was running alone (it held every permit), so a crash is its own.
+    pub exclusive: bool,
+}
+
+/// What to do with a record, given what the previous owner's commit said about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashVerdict {
+    /// Not running at the last crash (or no crash): handle normally.
+    Run,
+    /// Running at a crash, alongside others: run it alone, so the next crash is its own.
+    RunAlone { crashes: u32 },
+    /// Crashed while running alone, or crashed `attempt_budget` times: answer with an
+    /// error and commit. Running it again would kill the worker again.
+    GiveUp { crashes: u32 },
+}
+
+impl CrashVerdict {
+    pub fn decide(prior: Option<CrashMark>, attempt_budget: u32) -> Self {
+        let Some(prior) = prior else {
+            return CrashVerdict::Run;
+        };
+        let crashes = prior.crashes + 1;
+        if prior.exclusive || crashes >= attempt_budget {
+            CrashVerdict::GiveUp { crashes }
+        } else {
+            CrashVerdict::RunAlone { crashes }
+        }
+    }
+
+    /// The mark to record when the handler starts.
+    pub fn mark(self) -> CrashMark {
+        match self {
+            CrashVerdict::Run => CrashMark::default(),
+            CrashVerdict::RunAlone { crashes } | CrashVerdict::GiveUp { crashes } => CrashMark {
+                crashes,
+                exclusive: true,
+            },
+        }
+    }
+}
+
+/// Version tag of the commit-metadata format. Unknown formats decode as "nothing in flight".
+const INFLIGHT_METADATA_PREFIX: &str = "jagua-inflight-v1;";
+
+/// Encode the in-flight set as commit metadata: `jagua-inflight-v1;187:1:x,190:0:-`.
+/// At most `MAX_CONCURRENT_TASKS` entries of ~20 bytes, far below the broker's 4 KiB limit.
+pub fn encode_inflight(started: &BTreeMap<i64, CrashMark>) -> String {
+    let entries: Vec<String> = started
+        .iter()
+        .map(|(offset, m)| {
+            format!(
+                "{offset}:{}:{}",
+                m.crashes,
+                if m.exclusive { "x" } else { "-" }
+            )
+        })
+        .collect();
+    format!("{INFLIGHT_METADATA_PREFIX}{}", entries.join(","))
+}
+
+/// Decode [`encode_inflight`]. Malformed entries are skipped: losing a crash count costs at
+/// most one more crash, while refusing to start would stop the partition.
+pub fn decode_inflight(metadata: &str) -> BTreeMap<i64, CrashMark> {
+    let Some(body) = metadata.strip_prefix(INFLIGHT_METADATA_PREFIX) else {
+        return BTreeMap::new();
+    };
+    body.split(',')
+        .filter_map(|entry| {
+            let mut fields = entry.split(':');
+            let offset = fields.next()?.parse().ok()?;
+            let crashes = fields.next()?.parse().ok()?;
+            let exclusive = match fields.next()? {
+                "x" => true,
+                "-" => false,
+                _ => return None,
+            };
+            Some((offset, CrashMark { crashes, exclusive }))
+        })
+        .collect()
 }
 
 impl OffsetWatermark {
@@ -362,6 +458,8 @@ impl OffsetWatermark {
             .entry((topic.to_string(), partition))
             .or_default();
 
+        state.started.remove(&offset);
+
         // A completion for an offset we never observed still establishes the
         // start, so a caller that skips `observe` degrades gracefully.
         let next = *state.next_expected.get_or_insert(offset);
@@ -388,6 +486,50 @@ impl OffsetWatermark {
         Some(cursor)
     }
 
+    /// Whether the previous owner's in-flight set is still to be loaded for a partition.
+    pub fn needs_prior(&self, topic: &str, partition: i32) -> bool {
+        self.partitions
+            .get(&(topic.to_string(), partition))
+            .is_none_or(|s| s.prior.is_none())
+    }
+
+    /// Install what the last commit's metadata said was running.
+    pub fn set_prior(&mut self, topic: &str, partition: i32, prior: BTreeMap<i64, CrashMark>) {
+        self.partitions
+            .entry((topic.to_string(), partition))
+            .or_default()
+            .prior = Some(prior);
+    }
+
+    /// The crash mark the previous owner left for this offset, if it was running then.
+    /// Taken, so the same offset delivered twice is not counted twice.
+    pub fn take_prior(&mut self, topic: &str, partition: i32, offset: i64) -> Option<CrashMark> {
+        self.partitions
+            .get_mut(&(topic.to_string(), partition))?
+            .prior
+            .as_mut()?
+            .remove(&offset)
+    }
+
+    /// Record that a record's handler started. Commit [`Self::commit_point`] right after.
+    pub fn start(&mut self, topic: &str, partition: i32, offset: i64, mark: CrashMark) {
+        self.partitions
+            .entry((topic.to_string(), partition))
+            .or_default()
+            .started
+            .insert(offset, mark);
+    }
+
+    /// The offset and metadata to commit for a partition: the watermark and the in-flight set.
+    /// `None` before the partition's first record.
+    ///
+    /// **Every commit for a partition must carry this metadata.** A commit without it clears
+    /// the in-flight set, and the next crash would be invisible again.
+    pub fn commit_point(&self, topic: &str, partition: i32) -> Option<(i64, String)> {
+        let state = self.partitions.get(&(topic.to_string(), partition))?;
+        Some((state.next_expected?, encode_inflight(&state.started)))
+    }
+
     /// Offsets still in flight for a partition, for diagnostics.
     pub fn pending(&self, topic: &str, partition: i32) -> usize {
         self.partitions
@@ -402,6 +544,136 @@ mod tests {
     use super::*;
 
     const T: &str = "nesting-request";
+
+    const RAN_WITH_OTHERS: CrashMark = CrashMark {
+        crashes: 0,
+        exclusive: false,
+    };
+
+    #[test]
+    fn inflight_metadata_round_trips() {
+        let started = BTreeMap::from([
+            (
+                187,
+                CrashMark {
+                    crashes: 1,
+                    exclusive: true,
+                },
+            ),
+            (190, RAN_WITH_OTHERS),
+        ]);
+        let encoded = encode_inflight(&started);
+        assert_eq!(encoded, "jagua-inflight-v1;187:1:x,190:0:-");
+        assert_eq!(decode_inflight(&encoded), started);
+        assert_eq!(
+            decode_inflight(&encode_inflight(&BTreeMap::new())),
+            BTreeMap::new()
+        );
+    }
+
+    /// Metadata written by something else (or nothing) must not stop the partition.
+    #[test]
+    fn foreign_or_damaged_metadata_decodes_as_nothing_running() {
+        assert!(decode_inflight("").is_empty());
+        assert!(decode_inflight("some other client's note").is_empty());
+        assert_eq!(
+            decode_inflight("jagua-inflight-v1;bad,187:2:x,190:1:?"),
+            BTreeMap::from([(
+                187,
+                CrashMark {
+                    crashes: 2,
+                    exclusive: true
+                }
+            )]),
+            "damaged entries are skipped, intact ones kept"
+        );
+    }
+
+    /// The decision table behind cutl-tests#392, with the default budget of 3.
+    #[test]
+    fn crash_verdicts() {
+        assert_eq!(CrashVerdict::decide(None, 3), CrashVerdict::Run);
+        assert_eq!(
+            CrashVerdict::decide(Some(RAN_WITH_OTHERS), 3),
+            CrashVerdict::RunAlone { crashes: 1 },
+            "first crash among other jobs: run it alone"
+        );
+        assert_eq!(
+            CrashVerdict::decide(
+                Some(CrashMark {
+                    crashes: 1,
+                    exclusive: true
+                }),
+                3
+            ),
+            CrashVerdict::GiveUp { crashes: 2 },
+            "crashed while alone: it is the cause"
+        );
+        assert_eq!(
+            CrashVerdict::decide(
+                Some(CrashMark {
+                    crashes: 2,
+                    exclusive: false
+                }),
+                3
+            ),
+            CrashVerdict::GiveUp { crashes: 3 },
+            "the budget caps a record that can never run alone (retry tiers)"
+        );
+        assert_eq!(CrashVerdict::Run.mark(), RAN_WITH_OTHERS);
+        assert_eq!(
+            CrashVerdict::RunAlone { crashes: 1 }.mark(),
+            CrashMark {
+                crashes: 1,
+                exclusive: true
+            }
+        );
+    }
+
+    /// Run 4a930f88 on staging: offset 187 started, the pod died, the next owner reads it back.
+    #[test]
+    fn commit_point_carries_running_jobs_until_they_finish() {
+        let mut w = OffsetWatermark::new();
+        w.observe(T, 1, 186);
+        w.observe(T, 1, 187);
+        w.start(T, 1, 186, RAN_WITH_OTHERS);
+        w.start(T, 1, 187, RAN_WITH_OTHERS);
+        assert_eq!(
+            w.commit_point(T, 1),
+            Some((186, "jagua-inflight-v1;186:0:-,187:0:-".into()))
+        );
+
+        w.complete(T, 1, 186);
+        let (offset, metadata) = w.commit_point(T, 1).unwrap();
+        assert_eq!(offset, 187);
+
+        // The pod is OOM-killed here. The next owner of partition 1:
+        let mut next = OffsetWatermark::new();
+        assert!(next.needs_prior(T, 1));
+        next.set_prior(T, 1, decode_inflight(&metadata));
+        assert!(!next.needs_prior(T, 1));
+        assert_eq!(next.take_prior(T, 1, 187), Some(RAN_WITH_OTHERS));
+        assert_eq!(
+            next.take_prior(T, 1, 187),
+            None,
+            "a second delivery is not a second crash"
+        );
+        assert_eq!(next.take_prior(T, 1, 188), None);
+    }
+
+    #[test]
+    fn a_finished_job_leaves_the_inflight_set_even_behind_a_gap() {
+        let mut w = OffsetWatermark::new();
+        w.observe(T, 0, 10);
+        w.observe(T, 0, 11);
+        w.start(T, 0, 10, RAN_WITH_OTHERS);
+        w.start(T, 0, 11, RAN_WITH_OTHERS);
+        assert_eq!(w.complete(T, 0, 11), None, "10 still holds the watermark");
+        assert_eq!(
+            w.commit_point(T, 0),
+            Some((10, "jagua-inflight-v1;10:0:-".into()))
+        );
+    }
 
     #[test]
     fn in_order_completion_advances_every_time() {

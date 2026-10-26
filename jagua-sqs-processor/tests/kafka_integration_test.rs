@@ -316,6 +316,68 @@ async fn committing_an_offset_acknowledges_everything_below_it() -> Result<()> {
     Ok(())
 }
 
+/// cutl-tests#392: the crash guard keeps its in-flight set in the offset commit's metadata.
+/// That only works if the broker stores the metadata and hands it to the *next* consumer of the
+/// group — the process that wrote it is dead by then.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the docker-compose harness; run via `make test-integration`"]
+async fn commit_metadata_survives_a_consumer_restart() -> Result<()> {
+    use jagua_sqs_processor::kafka::{decode_inflight, encode_inflight, CrashMark};
+    use std::collections::BTreeMap;
+
+    let group = format!("jagua-nesting-it-inflight-{}", std::process::id());
+    let consumer_for = |group: &str| -> Result<StreamConsumer> {
+        Ok(test_client_config()
+            .set("group.id", group)
+            .set("enable.auto.commit", "false")
+            .create()?)
+    };
+    let running = BTreeMap::from([(
+        187,
+        CrashMark {
+            crashes: 1,
+            exclusive: true,
+        },
+    )]);
+
+    {
+        let first = consumer_for(&group)?;
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset(REQUEST_TOPIC, 1, Offset::Offset(187))?;
+        tpl.find_partition(REQUEST_TOPIC, 1)
+            .expect("partition just added")
+            .set_metadata(encode_inflight(&running));
+        // A consumer that has never polled may not know its group coordinator yet, and
+        // the broker then answers NotCoordinator. jagua commits only after it consumes,
+        // so this is a test-setup race: retry until the coordinator is found.
+        let mut attempts = 0;
+        loop {
+            match first.commit(&tpl, rdkafka::consumer::CommitMode::Sync) {
+                Ok(()) => break,
+                Err(e) if attempts < 20 => {
+                    attempts += 1;
+                    eprintln!("commit attempt {attempts}: {e}; retrying");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Dropped without a graceful close, as an OOM kill would leave it.
+    }
+
+    let second = consumer_for(&group)?;
+    let mut query = TopicPartitionList::new();
+    query.add_partition(REQUEST_TOPIC, 1);
+    let committed = second.committed_offsets(query, Duration::from_secs(10))?;
+    let elem = committed
+        .find_partition(REQUEST_TOPIC, 1)
+        .expect("committed partition");
+
+    assert_eq!(elem.offset(), Offset::Offset(187));
+    assert_eq!(decode_inflight(elem.metadata()), running);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 4. Retry ladder
 // ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@
 //! While a partition is paused the loop keeps calling `recv()`, which is what
 //! keeps the client heartbeating and the group membership alive.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -38,7 +38,7 @@ use rdkafka::{Offset, TopicPartitionList};
 use tokio::sync::broadcast;
 use tracing::Instrument;
 
-use crate::kafka::{KafkaSettings, RecordHeaders};
+use crate::kafka::{encode_inflight, CrashMark, CrashVerdict, KafkaSettings, RecordHeaders};
 use crate::metrics::metrics;
 use crate::processor::NestingProcessor;
 
@@ -72,6 +72,8 @@ pub async fn run_tier(
 
     // Partitions currently held back, and when each may resume.
     let mut paused: HashMap<i32, tokio::time::Instant> = HashMap::new();
+    // Per partition: what the previous owner's last commit said was running (cutl-tests#392).
+    let mut prior: HashMap<i32, BTreeMap<i64, CrashMark>> = HashMap::new();
 
     loop {
         // Resume anything whose delay has elapsed, before polling again.
@@ -165,6 +167,32 @@ pub async fn run_tier(
                 // Delay satisfied — run the same handler the main loop uses.
                 metrics().messages_consumed.with_label_values(&[&topic]).inc();
 
+                // Crash guard. A tier runs one record at a time but beside the main loop's jobs,
+                // so it cannot run a suspect alone: it only counts crashes, up to the budget.
+                let mark = prior
+                    .entry(partition)
+                    .or_insert_with(|| processor.load_inflight(&consumer, &topic, partition))
+                    .remove(&offset)
+                    .map(|m| CrashMark { exclusive: false, ..m });
+                let verdict = CrashVerdict::decide(mark, settings.attempt_budget);
+                if let CrashVerdict::GiveUp { crashes } = verdict {
+                    error!(
+                        "Tier {tier}: {topic}-{partition}-{offset} killed the worker {crashes} time(s); \
+                         answering with an error instead of running it again"
+                    );
+                    metrics().record_retries_exhausted(&headers.origin_or(&topic));
+                    processor.answer_crashed_request(&payload, crashes).await;
+                    commit(&consumer, &topic, partition, offset + 1, String::new(), CommitMode::Async);
+                    continue;
+                }
+                let running = CrashMark {
+                    exclusive: false,
+                    ..verdict.mark()
+                };
+                // Synchronous, before the handler: a crash during it must find this mark.
+                let metadata = encode_inflight(&BTreeMap::from([(offset, running)]));
+                commit(&consumer, &topic, partition, offset, metadata, CommitMode::Sync);
+
                 let span = tracing::info_span!(
                     "nesting.retry",
                     messaging.system = "kafka",
@@ -200,16 +228,7 @@ pub async fn run_tier(
                 // Commit regardless of outcome. An uncommitted failure would make
                 // this tier redeliver forever, which is the head-of-line blocking
                 // the ladder exists to avoid — escalation already moved it on.
-                let mut tpl = TopicPartitionList::new();
-                tpl.add_partition_offset(&topic, partition, Offset::Offset(offset + 1))?;
-                if let Err(e) = consumer.commit(&tpl, CommitMode::Async) {
-                    warn!("Tier {tier}: commit of {topic}@{} failed: {e}", offset + 1);
-                } else {
-                    metrics()
-                        .committed_offset
-                        .with_label_values(&[&topic, &partition.to_string()])
-                        .set(offset + 1);
-                }
+                commit(&consumer, &topic, partition, offset + 1, String::new(), CommitMode::Async);
             }
         }
     }
@@ -218,6 +237,36 @@ pub async fn run_tier(
         warn!("Tier {tier}: final commit failed: {e}");
     }
     Ok(())
+}
+
+/// Commit one tier partition with its in-flight metadata (empty: nothing running).
+fn commit(
+    consumer: &rdkafka::consumer::StreamConsumer,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    metadata: String,
+    mode: CommitMode,
+) {
+    let mut tpl = TopicPartitionList::new();
+    if let Err(e) = tpl
+        .add_partition(topic, partition)
+        .set_offset(Offset::Offset(offset))
+    {
+        warn!("Commit list for {topic}-{partition}@{offset}: {e}");
+        return;
+    }
+    if let Some(mut elem) = tpl.find_partition(topic, partition) {
+        elem.set_metadata(metadata);
+    }
+    if let Err(e) = consumer.commit(&tpl, mode) {
+        warn!("Commit of {topic}-{partition}@{offset} failed: {e}");
+    } else {
+        metrics()
+            .committed_offset
+            .with_label_values(&[topic, &partition.to_string()])
+            .set(offset);
+    }
 }
 
 /// Wall-clock time since a Kafka record timestamp, saturating at zero.

@@ -8,11 +8,10 @@ use crate::svg_nesting::{
         reverse_winding, sanitize_polygon,
     },
     strategy::{NestingStrategy, PartInput, is_single_part_type},
-    svg_generation::{
-        NestingResult, PageResult, PlacedPartInfo, combine_svg_documents, post_process_svg_multi,
-    },
+    svg_generation::{NestingResult, PageResult, PlacedPartInfo, post_process_svg_multi},
 };
 use anyhow::Result;
+use bytes::Bytes;
 use jagua_rs::collision_detection::CDEConfig;
 use jagua_rs::entities::{Container, Instance, Item, Layout};
 use jagua_rs::geometry::DTransformation;
@@ -361,8 +360,7 @@ impl AdaptiveNestingStrategy {
 
         // Generate SVG output and extract placement data
         let svg_options = SvgDrawOptions::default();
-        let mut page_svg_strings: Vec<String> = Vec::new();
-        let mut page_svgs: Vec<Vec<u8>> = Vec::new();
+        let mut page_svgs: Vec<Bytes> = Vec::new();
         let mut pages: Vec<PageResult> = Vec::new();
 
         let mut layout_entries: Vec<_> = solution.layout_snapshots.iter().collect();
@@ -376,10 +374,8 @@ impl AdaptiveNestingStrategy {
             let is_last = page_index == num_pages - 1;
 
             if skip_middle && !is_first && !is_last {
-                // Clone first page's SVG for middle pages (visually identical for single-part)
-                let first_svg_str = page_svg_strings[0].clone();
-                page_svg_strings.push(first_svg_str.clone());
-                page_svgs.push(first_svg_str.into_bytes());
+                // Middle pages share the first page's SVG (visually identical for single-part)
+                page_svgs.push(page_svgs[0].clone());
             } else {
                 let svg_doc = s_layout_to_svg(
                     layout_snapshot,
@@ -389,8 +385,7 @@ impl AdaptiveNestingStrategy {
                 );
                 let svg_str = svg_doc.to_string();
                 let processed_svg = post_process_svg_multi(&svg_str, item_id_to_holes);
-                page_svg_strings.push(processed_svg.clone());
-                page_svgs.push(processed_svg.into_bytes());
+                page_svgs.push(Bytes::from(processed_svg));
             }
 
             // Reported utilisation counts each part's separation halo as consumed sheet.
@@ -433,13 +428,13 @@ impl AdaptiveNestingStrategy {
             });
         }
 
-        // Combine all page SVGs into a single valid SVG document
-        let combined_svg = combine_svg_documents(&page_svg_strings, bin_width, bin_height);
-
         // Verify the count matches what's actually in the SVG
-        use regex::Regex;
+        use regex::bytes::Regex;
         let re_item_use = Regex::new(r##"<use[^>]*href=["']#item_\d+["']"##).unwrap();
-        let items_in_svg = re_item_use.find_iter(&combined_svg).count();
+        let items_in_svg: usize = page_svgs
+            .iter()
+            .map(|page| re_item_use.find_iter(page).count())
+            .sum();
 
         // Use the actual count from SVG as the source of truth
         let corrected_count = items_in_svg;
@@ -475,8 +470,9 @@ impl AdaptiveNestingStrategy {
         log::debug!("Average bin utilisation: {:.1}%", utilisation * 100.0);
 
         Ok(NestingResult {
-            combined_svg: combined_svg.into_bytes(),
             page_svgs,
+            sheet_width: bin_width,
+            sheet_height: bin_height,
             parts_placed: corrected_count,
             total_parts_requested,
             unplaced_parts_svg: None,
@@ -589,7 +585,6 @@ fn truncate_to_first_page(result: &mut NestingResult) {
         result.parts_placed = 0;
         result.total_parts_requested = 0;
         result.page_svgs.clear();
-        result.combined_svg.clear();
         result.unplaced_parts_svg = None;
         result.utilisation = 0.0;
         return;
@@ -599,10 +594,7 @@ fn truncate_to_first_page(result: &mut NestingResult) {
     result.parts_placed = first.parts_placed;
     result.total_parts_requested = first.parts_placed;
     result.utilisation = first.utilisation;
-    if !result.page_svgs.is_empty() {
-        result.page_svgs.truncate(1);
-        result.combined_svg = result.page_svgs[0].clone();
-    }
+    result.page_svgs.truncate(1);
     result.unplaced_parts_svg = None;
 }
 
@@ -1073,8 +1065,9 @@ impl AdaptiveNestingStrategy {
                             return Ok(best);
                         }
                         return Ok(NestingResult {
-                            combined_svg: Vec::new(),
                             page_svgs: Vec::new(),
+                            sheet_width: bin_width,
+                            sheet_height: bin_height,
                             parts_placed: 0,
                             total_parts_requested,
                             unplaced_parts_svg: None,
@@ -1317,8 +1310,9 @@ impl AdaptiveNestingStrategy {
                 Ok(best)
             }
             None => Ok(NestingResult {
-                combined_svg: Vec::new(),
                 page_svgs: Vec::new(),
+                sheet_width: bin_width,
+                sheet_height: bin_height,
                 parts_placed: 0,
                 total_parts_requested,
                 unplaced_parts_svg: None,

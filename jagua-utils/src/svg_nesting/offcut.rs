@@ -17,9 +17,8 @@ use jagua_rs::geometry::primitives::{Rect, SPolygon};
 use jagua_rs::probs::bpp::entities::BPSolution;
 use serde::{Deserialize, Serialize};
 
-use crate::svg_nesting::svg_generation::{
-    NestingResult, PageResult, combine_svg_documents, overlay_offcuts_svg,
-};
+use crate::svg_nesting::svg_generation::{NestingResult, PageResult, overlay_offcuts_svg};
+use bytes::Bytes;
 
 /// Ramer–Douglas–Peucker tolerance (mm) used to collapse the staircase edges that small
 /// parts leave on the convex hull. The effective epsilon is `max(kerf, this)`.
@@ -105,9 +104,9 @@ pub(crate) fn apply_offcuts(
     overlay_result_offcuts(result, policy.kerf_mm, bin_width, bin_height);
 }
 
-/// Draw every page's `offcuts` onto its page SVG and rebuild the combined SVG. Pages with no
-/// offcuts are returned untouched. Shared by the LBF path (after detection) and the row/column
-/// fill (whose single remnant is closed-form, see `fill.rs`).
+/// Draw every page's `offcuts` onto its page SVG. Pages with no offcuts are returned untouched.
+/// Shared by the LBF path (after detection) and the row/column fill (whose single remnant is
+/// closed-form, see `fill.rs`).
 pub(crate) fn overlay_result_offcuts(
     result: &mut NestingResult,
     kerf: f32,
@@ -116,20 +115,35 @@ pub(crate) fn overlay_result_offcuts(
 ) {
     // Stroke sized to the sheet so the overlay is visible at any scale.
     let stroke = (bin_width.min(bin_height) * 0.002).max(0.5);
-    let patched: Vec<String> = result
-        .page_svgs
-        .iter()
-        .enumerate()
-        .map(|(i, bytes)| {
-            let svg = String::from_utf8_lossy(bytes).into_owned();
-            let offcuts = result.pages.get(i).map(|p| &p.offcuts[..]).unwrap_or(&[]);
+    let mut patched: Vec<Bytes> = Vec::with_capacity(result.page_svgs.len());
+    // A page that shares its buffer with the previous one and carries the same offcuts gets the
+    // previous patched page, so identical sheets stay one allocation (see `NestingResult`).
+    let mut previous: Option<(&Bytes, &[Offcut], Bytes)> = None;
+    for (i, page) in result.page_svgs.iter().enumerate() {
+        let offcuts = result.pages.get(i).map(|p| &p.offcuts[..]).unwrap_or(&[]);
+        if let Some((prev_page, prev_offcuts, prev_out)) = &previous
+            && prev_page.as_ptr() == page.as_ptr()
+            && prev_page.len() == page.len()
+            && *prev_offcuts == offcuts
+        {
+            patched.push(prev_out.clone());
+            continue;
+        }
+        let out = if offcuts.is_empty() {
+            page.clone()
+        } else {
             let bands = kerf_band_paths(offcuts, kerf);
-            overlay_offcuts_svg(&svg, offcuts, &bands, stroke)
-        })
-        .collect();
-
-    result.page_svgs = patched.iter().map(|s| s.clone().into_bytes()).collect();
-    result.combined_svg = combine_svg_documents(&patched, bin_width, bin_height).into_bytes();
+            Bytes::from(overlay_offcuts_svg(
+                &String::from_utf8_lossy(page),
+                offcuts,
+                &bands,
+                stroke,
+            ))
+        };
+        previous = Some((page, offcuts, out.clone()));
+        patched.push(out);
+    }
+    result.page_svgs = patched;
 }
 
 /// Populate `offcuts` on every page of a final result from its solution.

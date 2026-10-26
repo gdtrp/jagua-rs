@@ -426,7 +426,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
 
         // Write combined SVG
         let combined_path = output_dir.join("combined.svg");
-        std::fs::write(&combined_path, &nesting_result.combined_svg).expect("write combined SVG");
+        std::fs::write(&combined_path, nesting_result.combined_svg()).expect("write combined SVG");
         println!("Wrote combined SVG: {}", combined_path.display());
 
         // Write unplaced parts SVG if present
@@ -972,7 +972,7 @@ M 2876.87,-1439.31 L 2875.07,-1439.97 L 2873.61,-1441.19 L 2872.65,-1442.85 L 28
         let _ = fs::remove_dir_all(&output_dir);
         fs::create_dir_all(&output_dir).expect("create output dir");
         let page_path = output_dir.join("page-0.svg");
-        fs::write(&page_path, &nr.combined_svg).expect("write page-0.svg");
+        fs::write(&page_path, nr.combined_svg()).expect("write page-0.svg");
         println!("Wrote result SVG: {}", page_path.display());
 
         // Theoretical naive grid: floor(1800/(240+20)) * floor(1800/(141+20))

@@ -90,8 +90,9 @@ fn process_request_direct(
             shared_results.lock().unwrap().push(result.clone());
         }
 
-        let first_page_bytes = result.page_svgs.first().unwrap_or(&result.combined_svg);
-        let last_page_bytes = result.page_svgs.last().unwrap_or(first_page_bytes);
+        let combined = result.combined_svg();
+        let first_page_bytes: &[u8] = result.page_svgs.first().map_or(&combined, |p| p);
+        let last_page_bytes: &[u8] = result.page_svgs.last().map_or(first_page_bytes, |p| p);
         let _encoded_first = general_purpose::STANDARD.encode(first_page_bytes);
         let _encoded_last = general_purpose::STANDARD.encode(last_page_bytes);
         let response = SqsNestingResponse {
@@ -647,8 +648,9 @@ fn process_request_with_cancellation(
     };
 
     let callback = move |result: NestingResult| -> Result<()> {
-        let first_page_bytes = result.page_svgs.first().unwrap_or(&result.combined_svg);
-        let last_page_bytes = result.page_svgs.last().unwrap_or(first_page_bytes);
+        let combined = result.combined_svg();
+        let first_page_bytes: &[u8] = result.page_svgs.first().map_or(&combined, |p| p);
+        let last_page_bytes: &[u8] = result.page_svgs.last().map_or(first_page_bytes, |p| p);
         let _encoded_first = general_purpose::STANDARD.encode(first_page_bytes);
         let _encoded_last = general_purpose::STANDARD.encode(last_page_bytes);
         let response = SqsNestingResponse {
@@ -1368,7 +1370,8 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         parts_placed: final_responses[0].parts_placed,
                         total_parts_requested: request.amount_of_parts.unwrap_or(5),
                         page_svgs: vec![],
-                        combined_svg: vec![],
+                        sheet_width: request.bin_width.unwrap_or_default(),
+                        sheet_height: request.bin_height.unwrap_or_default(),
                         unplaced_parts_svg: None,
                         utilisation: final_responses[0].utilisation,
                         material_utilisation: final_responses[0].utilisation,
@@ -1442,10 +1445,10 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                         page_path.display()
                     );
                 }
-            } else if !intermediate_result.combined_svg.is_empty() {
+            } else if !intermediate_result.combined_svg().is_empty() {
                 let combined_path =
                     improvement_dir.join(format!("improvement_{}_combined.svg", idx));
-                fs::write(&combined_path, &intermediate_result.combined_svg)
+                fs::write(&combined_path, intermediate_result.combined_svg())
                     .context(format!("Failed to write improvement {} combined SVG", idx))?;
                 println!(
                     "  Saved improvement {} combined ({} parts placed) to: {}",
@@ -1479,10 +1482,10 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
                 println!("Saved final page {} SVG to: {}", i, page_path.display());
             }
         }
-    } else if !final_nesting_result.combined_svg.is_empty() {
+    } else if !final_nesting_result.combined_svg().is_empty() {
         // Fallback to combined_svg if page_svgs is empty
         let output_path = project_root.join("dr_e2e_result.svg");
-        fs::write(&output_path, &final_nesting_result.combined_svg)
+        fs::write(&output_path, final_nesting_result.combined_svg())
             .context("Failed to write result SVG to project root")?;
         println!("Saved final combined SVG to: {}", output_path.display());
     } else {
@@ -1500,7 +1503,7 @@ async fn test_e2e_processing_dr_svg() -> Result<()> {
         );
         println!(
             "  combined_svg length: {}",
-            final_nesting_result.combined_svg.len()
+            final_nesting_result.combined_svg().len()
         );
         println!(
             "  This suggests the solution had placed items but layout_snapshots was empty during SVG generation"
@@ -1732,10 +1735,10 @@ async fn test_e2e_processing_custom_svg() -> Result<()> {
                 println!("Saved final page {} SVG to: {}", i, page_path.display());
             }
         }
-    } else if !final_nesting_result.combined_svg.is_empty() {
+    } else if !final_nesting_result.combined_svg().is_empty() {
         // Fallback to combined_svg if page_svgs is empty
         let output_path = project_root.join("custom_svg_e2e_result.svg");
-        fs::write(&output_path, &final_nesting_result.combined_svg)
+        fs::write(&output_path, final_nesting_result.combined_svg())
             .context("Failed to write result SVG to project root")?;
         println!("Saved final combined SVG to: {}", output_path.display());
     } else {
@@ -2524,9 +2527,9 @@ fn test_multi_part_placements_real_svgs() -> Result<()> {
     }
 
     // Write combined SVG
-    if !nesting_result.combined_svg.is_empty() {
+    if !nesting_result.combined_svg().is_empty() {
         let combined_path = output_dir.join("combined.svg");
-        fs::write(&combined_path, &nesting_result.combined_svg).context("write combined.svg")?;
+        fs::write(&combined_path, nesting_result.combined_svg()).context("write combined.svg")?;
         println!("Wrote combined SVG: {}", combined_path.display());
     }
 
@@ -2773,10 +2776,10 @@ fn test_cutl_production_request_three_parts() -> Result<()> {
         fs::write(&path, page_svg).context(format!("write page-{}.svg", i))?;
     }
 
-    if !nesting_result.combined_svg.is_empty() {
+    if !nesting_result.combined_svg().is_empty() {
         fs::write(
             output_dir.join("combined.svg"),
-            &nesting_result.combined_svg,
+            nesting_result.combined_svg(),
         )
         .context("write combined.svg")?;
     }

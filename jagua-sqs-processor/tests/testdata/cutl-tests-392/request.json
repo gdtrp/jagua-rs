@@ -1,0 +1,20 @@
+{
+  "correlationId": "4a930f88-f7c5-4941-ab1c-273839364ce0",
+  "binWidth": 1250.0,
+  "binHeight": 2500.0,
+  "spacing": 2.0,
+  "amountOfRotations": 4,
+  "cancelled": false,
+  "parts": [
+    {
+      "svgUrl": "s3://cutl-tests-392/hive_with_holes.svg",
+      "amountOfParts": 150,
+      "itemId": "hive-with-holes"
+    },
+    {
+      "svgUrl": "s3://cutl-tests-392/hive_plain.svg",
+      "amountOfParts": 150,
+      "itemId": "hive-plain"
+    }
+  ]
+}

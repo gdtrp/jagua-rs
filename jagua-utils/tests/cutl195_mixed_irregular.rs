@@ -48,7 +48,7 @@ fn write_output(case: &str, result: &NestingResult) {
     for (i, page) in result.page_svgs.iter().enumerate() {
         std::fs::write(dir.join(format!("page-{i}.svg")), page).expect("write page");
     }
-    std::fs::write(dir.join("combined.svg"), &result.combined_svg).expect("write combined");
+    std::fs::write(dir.join("combined.svg"), result.combined_svg()).expect("write combined");
 }
 
 /// `(x, y, rotation, part_index)` of a page, sorted — the geometric content of a sheet.
@@ -70,7 +70,7 @@ fn layout_of(page: &jagua_utils::PageResult) -> Vec<(i64, i64, i64, usize)> {
 }
 
 /// Count how many leading pages of `pages` are byte-identical to the first one.
-fn identical_run(pages: &[Vec<u8>]) -> usize {
+fn identical_run<P: PartialEq>(pages: &[P]) -> usize {
     pages.iter().take_while(|p| **p == pages[0]).count()
 }
 
@@ -179,7 +179,8 @@ fn group_mode_keeps_each_types_identical_full_sheets() {
     // Deterministic: a second run is byte-identical.
     let again = nest(&[a, b], bin_w, bin_h);
     assert_eq!(
-        mixed.combined_svg, again.combined_svg,
+        mixed.combined_svg(),
+        again.combined_svg(),
         "group mode must be deterministic"
     );
 }

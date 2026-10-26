@@ -16,6 +16,8 @@ path = "src/main.rs"
 jagua-utils = { path = "../jagua-utils" }
 aws-sdk-s3 = "1.0"
 aws-config = "1.0"
+# Page SVGs are shared `Bytes` end to end: identical sheets hold one buffer (cutl-tests#396).
+bytes = "1"
 
 # ── Kafka transport (VK migration T9) ──
 # Replaces aws-sdk-sqs: `sqs.eu-north-1` is 0/6 reachable from a VK pod while
