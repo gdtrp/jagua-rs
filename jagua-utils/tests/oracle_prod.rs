@@ -399,11 +399,35 @@ fn oracle_corpus() {
                 eprintln!("{}: compared", case.name);
             }
             "production" => {
-                let strategy = strategy_for(&case, AdaptiveNestingStrategy::new());
+                // As jagua-sqs-processor runs a request without `maxSeconds`: no strategy time
+                // budget, and a cancellation checker that stops the solve after the execution
+                // timeout (EXECUTION_TIMEOUT_SECS, default 600 s; processor.rs:1391-1410).
+                let timeout = std::time::Duration::from_secs(
+                    std::env::var("EXECUTION_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(600),
+                );
+                let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = timed_out.clone();
+                let start = Instant::now();
+                let checker = move || {
+                    let late = start.elapsed() > timeout;
+                    if late {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    late
+                };
+                let strategy = strategy_for(
+                    &case,
+                    AdaptiveNestingStrategy::with_cancellation_checker(Box::new(checker)),
+                );
                 let result = run(&case, &strategy);
                 let doc = json!({
                     "case": case.name, "mode": mode, "partsTotal": case.total,
                     "ms": started.elapsed().as_millis() as u64,
+                    "timedOut": timed_out.load(std::sync::atomic::Ordering::SeqCst),
+                    "executionTimeoutS": timeout.as_secs(),
                     "parallelism": std::env::var("NEST_RUN_PARALLELISM").unwrap_or_default(),
                     "result": result.as_ref().map(result_json).unwrap_or(Value::Null),
                     "error": result.as_ref().err().map(|e| format!("{e:#}")),
@@ -416,9 +440,10 @@ fn oracle_corpus() {
                 )
                 .unwrap();
                 eprintln!(
-                    "{}: production {} ms",
+                    "{}: production {} ms timed out {}",
                     case.name,
-                    started.elapsed().as_millis()
+                    started.elapsed().as_millis(),
+                    timed_out.load(std::sync::atomic::Ordering::SeqCst)
                 );
             }
             other => panic!("unknown ORACLE_MODE {other}"),
