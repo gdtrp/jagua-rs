@@ -120,6 +120,16 @@ pub fn nest_auto(
     mode: PackingMode,
     improvement_callback: Option<ImprovementCallback>,
 ) -> Result<NestingResult> {
+    let class_note = |c: &str| {
+        if let Some(o) = strategy.oracle() {
+            o.note_class(c);
+        }
+    };
+    let packer_note = |p: &str| {
+        if let Some(o) = strategy.oracle() {
+            o.note_packer(p);
+        }
+    };
     let general = |cb| {
         strategy.nest(
             bin_width,
@@ -132,11 +142,16 @@ pub fn nest_auto(
     };
 
     match mode {
-        PackingMode::General => return general(improvement_callback),
+        PackingMode::General => {
+            class_note("ForcedGeneral");
+            return general(improvement_callback);
+        }
         PackingMode::Grid | PackingMode::Periodic => {
+            class_note("ForcedGrid");
             // Forced grid: only valid for a single part type that can sit at 0°.
             if parts.len() == 1 && single_part_allow_original(&parts[0]) {
                 let allow_swap = single_part_allow_swap(&parts[0], amount_of_rotations);
+                packer_note("grid");
                 return nest_periodic_grid(bin_width, bin_height, spacing, &parts[0], allow_swap);
             }
             return general(improvement_callback);
@@ -149,6 +164,8 @@ pub fn nest_auto(
     // `Staircase` default leaves everything below byte-for-byte as it was.
     let fill = strategy.sheet_fill();
     if !fill.is_staircase() {
+        class_note(&format!("Fill{:?}", fill.direction));
+        packer_note("fill");
         return match nest_fill(
             bin_width,
             bin_height,
@@ -170,11 +187,13 @@ pub fn nest_auto(
     }
 
     let class = classify(parts, bin_width, bin_height);
+    class_note(&format!("{class:?}"));
     match class {
         PackingClass::SingleHighFill | PackingClass::SingleRectangle
             if single_part_allow_original(&parts[0]) =>
         {
             let allow_swap = single_part_allow_swap(&parts[0], amount_of_rotations);
+            packer_note("grid");
             nest_periodic_grid(bin_width, bin_height, spacing, &parts[0], allow_swap)
         }
         // Pairing needs the grain-preserving 0°+180° flip; allowed when the part is unconstrained
@@ -185,6 +204,7 @@ pub fn nest_auto(
                 && effective_allowed(&parts[0].allowed_rotations).is_none() =>
         {
             let allow_swap = fit_orientations(&parts[0].allowed_rotations).1;
+            packer_note("pairing");
             nest_pairing(bin_width, bin_height, spacing, &parts[0], allow_swap)
         }
         // Mixed types (CUTL-195): every type gets its own run of identical full sheets — the exact
@@ -193,6 +213,7 @@ pub fn nest_auto(
         // does not fit, or when no type fills even one sheet (then LBF's co-packing is the better
         // tool and today's behaviour is kept).
         PackingClass::MixedFewTypes => {
+            packer_note("mixed");
             match nest_mixed(bin_width, bin_height, spacing, parts, amount_of_rotations) {
                 Ok(r) => Ok(r),
                 Err(_) => general(improvement_callback),
@@ -204,6 +225,7 @@ pub fn nest_auto(
         // single irregular parts; falls back to General only if the part can't fit at all.
         PackingClass::SingleIrregular if parts.len() == 1 => {
             let (rots, allow_double) = lattice_rotations(&parts[0], amount_of_rotations);
+            packer_note("lattice");
             match crate::svg_nesting::lattice::nest_lattice(
                 bin_width,
                 bin_height,
@@ -325,8 +347,20 @@ pub fn nest_max_fit_auto(
 ) -> Result<NestingResult> {
     // CUTL-198: under a row/column fill direction the max-fit stencil is the fill packer's own
     // full sheet, so it can never disagree with the sheets `nest_auto` repeats.
+    let class_note = |c: &str| {
+        if let Some(o) = strategy.oracle() {
+            o.note_class(c);
+        }
+    };
+    let packer_note = |p: &str| {
+        if let Some(o) = strategy.oracle() {
+            o.note_packer(p);
+        }
+    };
     let fill = strategy.sheet_fill();
     if mode == PackingMode::Auto && !fill.is_staircase() {
+        class_note(&format!("MaxFitFill{:?}", fill.direction));
+        packer_note("max_fit_fill");
         return match nest_max_fit_fill(
             bin_width,
             bin_height,
@@ -356,19 +390,23 @@ pub fn nest_max_fit_auto(
     if mode != PackingMode::General {
         // Forced grid/periodic: deterministic grid stencil (single part that can sit at 0°).
         if matches!(mode, PackingMode::Grid | PackingMode::Periodic) {
+            class_note("MaxFitForcedGrid");
             if single_part_allow_original(part) {
                 let allow_swap = single_part_allow_swap(part, amount_of_rotations);
+                packer_note("max_fit_grid");
                 return nest_max_fit_grid(bin_width, bin_height, spacing, part, allow_swap);
             }
             // forced mode but part can't sit at 0° → fall through to LBF below
         } else {
             // Auto: route by class exactly like `nest_auto`, each via the matching stencil builder.
             let class = classify(std::slice::from_ref(part), bin_width, bin_height);
+            class_note(&format!("MaxFit{class:?}"));
             let det: Option<Result<NestingResult>> = match class {
                 PackingClass::SingleHighFill | PackingClass::SingleRectangle
                     if single_part_allow_original(part) =>
                 {
                     let allow_swap = single_part_allow_swap(part, amount_of_rotations);
+                    packer_note("max_fit_grid");
                     Some(nest_max_fit_grid(
                         bin_width, bin_height, spacing, part, allow_swap,
                     ))
@@ -378,6 +416,7 @@ pub fn nest_max_fit_auto(
                         && effective_allowed(&part.allowed_rotations).is_none() =>
                 {
                     let allow_swap = fit_orientations(&part.allowed_rotations).1;
+                    packer_note("max_fit_pairing");
                     Some(nest_max_fit_pairing(
                         bin_width, bin_height, spacing, part, allow_swap,
                     ))
@@ -387,6 +426,7 @@ pub fn nest_max_fit_auto(
                 | PackingClass::SinglePairable
                 | PackingClass::SingleIrregular => {
                     let (rots, allow_double) = lattice_rotations(part, amount_of_rotations);
+                    packer_note("max_fit_lattice");
                     Some(nest_max_fit_lattice(
                         bin_width,
                         bin_height,

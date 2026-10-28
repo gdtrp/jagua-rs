@@ -3,6 +3,7 @@
 use crate::svg_nesting::{
     fill::{FillDirection, SheetFill, StartCorner},
     offcut::{OffcutPolicy, apply_offcuts},
+    oracle::{Oracle, RunCtx, RunRecord, traced_solve},
     parsing::{
         build_inflatable_shape, calculate_signed_area, extract_path_from_svg_bytes, parse_svg_path,
         reverse_winding, sanitize_polygon,
@@ -108,6 +109,8 @@ pub struct AdaptiveNestingStrategy {
     /// Fill direction + start corner (CUTL-198). Read by the `nest_auto` / `nest_max_fit_auto`
     /// routers only; the LBF paths on this strategy never look at it.
     sheet_fill: SheetFill,
+    /// Oracle mode (RFC-030 N0): count-based, reproducible, traced. `None` in production.
+    oracle: Option<Oracle>,
 }
 
 impl AdaptiveNestingStrategy {
@@ -118,6 +121,7 @@ impl AdaptiveNestingStrategy {
             offcut_policy: None,
             time_budget: None,
             sheet_fill: SheetFill::default(),
+            oracle: None,
         }
     }
 
@@ -130,6 +134,7 @@ impl AdaptiveNestingStrategy {
             offcut_policy: None,
             time_budget: None,
             sheet_fill: SheetFill::default(),
+            oracle: None,
         }
     }
 
@@ -152,6 +157,32 @@ impl AdaptiveNestingStrategy {
     pub fn with_layout(mut self, direction: FillDirection, corner: StartCorner) -> Self {
         self.sheet_fill = SheetFill::new(direction, corner);
         self
+    }
+
+    /// Run in oracle mode (see [`crate::svg_nesting::oracle`]): fixed wave size, no wall-clock
+    /// checks (each one that would have fired is counted), the route and every LBF run recorded,
+    /// and with a trace sink every sample decision hashed. For comparing a port, never production.
+    pub fn with_oracle(mut self, oracle: Oracle) -> Self {
+        self.oracle = Some(oracle);
+        self
+    }
+
+    pub(crate) fn oracle(&self) -> Option<&Oracle> {
+        self.oracle.as_ref()
+    }
+
+    /// A wall-clock check: in production, `fired`; in oracle mode never, but counted when it would
+    /// have fired.
+    fn time_guard(&self, fired: bool) -> bool {
+        match &self.oracle {
+            None => fired,
+            Some(o) => {
+                if fired {
+                    o.note_guard();
+                }
+                false
+            }
+        }
     }
 
     /// The layout choice set by [`Self::with_layout`] (default: today's packing).
@@ -257,13 +288,36 @@ impl AdaptiveNestingStrategy {
             // the predictive guard in nest_inner, which refuses to start a wave
             // that the running average says won't finish before the deadline.
             let cancellation_fn = || self.is_cancelled();
-            let solution = optimizer.solve_with_cancellation(Some(&cancellation_fn));
+            let solution = match &self.oracle {
+                Some(o) if o.traced() => traced_solve(
+                    &mut optimizer,
+                    Some(&cancellation_fn),
+                    o,
+                    RunCtx {
+                        run_no: seed_offset,
+                        loop_idx,
+                    },
+                ),
+                _ => optimizer.solve_with_cancellation(Some(&cancellation_fn)),
+            };
 
             let placed: usize = solution
                 .layout_snapshots
                 .values()
                 .map(|ls| ls.placed_items.len())
                 .sum();
+
+            if let Some(o) = &self.oracle {
+                o.note_run(RunRecord {
+                    run_no: seed_offset,
+                    loop_idx,
+                    seed,
+                    ls_frac,
+                    placements,
+                    samples: optimizer.sample_counter,
+                    placed,
+                });
+            }
 
             if placed > best_placed {
                 best_placed = placed;
@@ -612,6 +666,9 @@ impl AdaptiveNestingStrategy {
         bin_stock_override: Option<usize>,
         deadline: Option<Instant>,
     ) -> Result<NestingResult> {
+        if let Some(o) = &self.oracle {
+            o.note_packer("lbf");
+        }
         // Parse all part SVGs and build per-part data
         struct ParsedPart {
             item_shape: OriginalShape,
@@ -877,16 +934,19 @@ impl AdaptiveNestingStrategy {
         // Number of independent runs explored concurrently per wave. Defaults to
         // the machine's parallelism (override via NEST_RUN_PARALLELISM), clamped
         // so a single request can't spawn an unbounded fan-out.
-        let run_parallelism: usize = std::env::var("NEST_RUN_PARALLELISM")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-            })
-            .clamp(1, 32);
+        let run_parallelism: usize = match &self.oracle {
+            Some(o) => o.config.wave_size,
+            None => std::env::var("NEST_RUN_PARALLELISM")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                })
+                .clamp(1, 32),
+        };
         // Wall-clock safety ceiling for the whole optimization. The search
         // normally stops far earlier via convergence (no improvement across
         // several parallel waves); this cap only bounds pathological inputs and
@@ -929,7 +989,7 @@ impl AdaptiveNestingStrategy {
 
         'outer: loop {
             let elapsed_total = optimization_start.elapsed().as_secs();
-            if Instant::now() >= deadline {
+            if self.time_guard(Instant::now() >= deadline) {
                 log::info!(
                     "Reached maximum optimization time ({} seconds), stopping with {} parts placed",
                     elapsed_total,
@@ -969,8 +1029,10 @@ impl AdaptiveNestingStrategy {
                 // can't overrun and trigger redelivery (which spawns duplicate
                 // concurrent optimizations).
                 let elapsed_now = optimization_start.elapsed().as_secs();
-                if Instant::now() + Duration::from_secs(max_single_run_secs) >= deadline
-                    && let Some(mut best) = best_result.take()
+                if self.time_guard(
+                    Instant::now() + Duration::from_secs(max_single_run_secs) >= deadline
+                        && best_result.is_some(),
+                ) && let Some(mut best) = best_result.take()
                 {
                     log::info!(
                         "Projected next run (~{}s) would exceed the deadline at {}s elapsed; \
@@ -1020,8 +1082,12 @@ impl AdaptiveNestingStrategy {
                 let desired_wave = run_parallelism
                     .min(max_total_runs.saturating_sub(total_runs).saturating_add(1))
                     .max(1);
-                let reservation = reserve_routines(execution_id, desired_wave);
-                let wave_size = reservation.granted;
+                // Oracle mode: the wave is exactly `wave_size` wide, never shrunk by other requests.
+                let reservation = match &self.oracle {
+                    None => Some(reserve_routines(execution_id, desired_wave)),
+                    Some(_) => None,
+                };
+                let wave_size = reservation.as_ref().map_or(desired_wave, |r| r.granted);
                 if wave_size < desired_wave {
                     log::debug!(
                         "Global routine budget contended: wanted {} routines, granted {}",
@@ -1081,7 +1147,8 @@ impl AdaptiveNestingStrategy {
 
                 let run_duration = run_start.elapsed();
                 max_single_run_secs = max_single_run_secs.max(run_duration.as_secs());
-                let run_exceeded_time_limit = run_duration.as_secs() > MAX_RUN_DURATION_SECONDS;
+                let run_exceeded_time_limit =
+                    self.time_guard(run_duration.as_secs() > MAX_RUN_DURATION_SECONDS);
                 if run_exceeded_time_limit {
                     log::warn!(
                         "Run took {} seconds, exceeding limit of {} seconds. Will stop after processing result.",

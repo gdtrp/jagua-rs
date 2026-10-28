@@ -6,6 +6,7 @@ mod grid;
 mod lattice;
 mod mixed;
 mod offcut;
+pub mod oracle;
 mod pairing;
 mod parsing;
 mod periodic;

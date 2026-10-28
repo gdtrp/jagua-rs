@@ -34,6 +34,9 @@ dhat = "0.3"
 # so a plain `cargo test` skips them (they show as "ignored") and the CI `test`
 # job stays fast; `make test-slow` / the nightly `slow` CI job enable the feature.
 slow-tests = []
+# RFC-030 N0: the oracle harness over the production corpus (tests/oracle_prod.rs). Needs
+# $ORACLE_CORPUS and $ORACLE_OUT; see docker/jagua-oracle.Dockerfile.
+oracle = []
 
 [lints.rust]
 warnings = "deny"
