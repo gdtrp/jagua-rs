@@ -366,13 +366,31 @@ fn oracle_corpus() {
                 let rep = oracle.finish().unwrap();
                 let got_result = result.as_ref().map(result_json).unwrap_or(Value::Null);
                 let got_runs = report_json(&rep)["runs"].clone();
-                if got_result != traced["result"] {
+                // The traced side was read back from oracle.json, and serde_json's default float
+                // parser is not correctly rounded (offcut corners can come back one ulp off).
+                // Put the untraced side through the same text round trip so the comparison is
+                // of the written text, not of the parser.
+                let reparse = |v: &Value| -> Value {
+                    serde_json::from_slice(&serde_json::to_vec(v).unwrap()).unwrap()
+                };
+                // `$ORACLE_COMPARE_OUT` keeps the untraced answer for a diff against oracle.json.
+                if let Ok(dir) = std::env::var("ORACLE_COMPARE_OUT") {
+                    let dir = Path::new(&dir).join(&case.name);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let doc = json!({ "result": got_result, "oracle": report_json(&rep) });
+                    std::fs::write(
+                        dir.join("compare.json"),
+                        serde_json::to_vec_pretty(&doc).unwrap(),
+                    )
+                    .unwrap();
+                }
+                if reparse(&got_result) != traced["result"] {
                     failures.push(format!(
                         "{}: untraced layout differs from the traced",
                         case.name
                     ));
                 }
-                if got_runs != traced["oracle"]["runs"] {
+                if reparse(&got_runs) != traced["oracle"]["runs"] {
                     failures.push(format!(
                         "{}: untraced runs differ from the traced",
                         case.name
