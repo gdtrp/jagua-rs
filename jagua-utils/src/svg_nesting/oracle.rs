@@ -119,7 +119,10 @@ impl Oracle {
     }
 
     fn build(config: OracleConfig, sink: Option<Box<dyn Write + Send>>) -> Self {
-        assert!(config.wave_size > 0, "an oracle wave runs at least one seed");
+        assert!(
+            config.wave_size > 0,
+            "an oracle wave runs at least one seed"
+        );
         assert!(config.checkpoint_every > 0, "checkpoints need a period");
         Self {
             config,
@@ -203,8 +206,12 @@ impl Oracle {
             st.write_line(&line);
         }
         st.report.sample_events = n + 1;
-        if (n + 1) % self.config.checkpoint_every == 0 {
-            let line = format!("{{\"k\":\"chk\",\"n\":{},\"h\":\"{:016x}\"}}", n + 1, st.hash.0);
+        if (n + 1).is_multiple_of(self.config.checkpoint_every) {
+            let line = format!(
+                "{{\"k\":\"chk\",\"n\":{},\"h\":\"{:016x}\"}}",
+                n + 1,
+                st.hash.0
+            );
             st.write_line(&line);
         }
     }
@@ -420,7 +427,16 @@ fn traced_search_layouts(
             layout: pos as u32,
         };
         let placement = match &item.min_quality {
-            None => traced_search(cde, item, config, rng, sample_counter, &NoFilter, oracle, at),
+            None => traced_search(
+                cde,
+                item,
+                config,
+                rng,
+                sample_counter,
+                &NoFilter,
+                oracle,
+                at,
+            ),
             Some(min_quality) => {
                 let filter = HazKeyFilter::from_irrelevant_qzones(*min_quality, &cde.hazards_map);
                 traced_search(cde, item, config, rng, sample_counter, &filter, oracle, at)
@@ -633,11 +649,22 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         // event 1 in full (the window), a checkpoint after 2 events, the end line.
         assert_eq!(lines.len(), 3, "{text}");
-        assert!(lines[0].starts_with("{\"k\":\"s\",\"n\":1,"), "{}", lines[0]);
+        assert!(
+            lines[0].starts_with("{\"k\":\"s\",\"n\":1,"),
+            "{}",
+            lines[0]
+        );
         assert!(lines[0].contains("\"r\":\"3fc00000\""), "{}", lines[0]);
         assert!(lines[0].contains("\"y\":\"c0400000\""), "{}", lines[0]);
-        assert!(lines[1].starts_with("{\"k\":\"chk\",\"n\":2,"), "{}", lines[1]);
-        assert_eq!(lines[2], format!("{{\"k\":\"end\",\"n\":3,\"h\":\"{:016x}\"}}", want.0));
+        assert!(
+            lines[1].starts_with("{\"k\":\"chk\",\"n\":2,"),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(
+            lines[2],
+            format!("{{\"k\":\"end\",\"n\":3,\"h\":\"{:016x}\"}}", want.0)
+        );
     }
 
     #[test]
@@ -706,7 +733,10 @@ mod tests {
         let report = o.finish().unwrap();
         assert_eq!(report.guards_fired, 1);
         assert_eq!(report.runs.len(), 1);
-        assert!(buf.text().starts_with("{\"k\":\"run\",\"run\":3,\"loop\":1,\"seed\":3001,"));
+        assert!(
+            buf.text()
+                .starts_with("{\"k\":\"run\",\"run\":3,\"loop\":1,\"seed\":3001,")
+        );
     }
 
     #[test]

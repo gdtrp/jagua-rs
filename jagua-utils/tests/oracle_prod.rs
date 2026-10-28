@@ -10,6 +10,7 @@
 //! - `production`: the production strategy as a 1-CPU pod runs it (`NEST_RUN_PARALLELISM=1` set by
 //!   the caller, the 600 s budget, wall-clock checks live) → `production.json`, the quality
 //!   reference.
+//!
 //! `$ORACLE_CASE` restricts the run to one case. `$ORACLE_WINDOW=a..b` writes sample events a..b in
 //! full. Cases run one at a time: the warning counter is a process-wide logger.
 //!
@@ -53,11 +54,14 @@ fn load_case(dir: &Path) -> Option<Case> {
         let item_id = item.get("itemId").and_then(Value::as_str)?;
         let count = item.get("count").and_then(Value::as_u64)? as usize;
         // allowedRotations: present ⇒ Some(degrees); empty ⇒ any rotation; absent ⇒ None.
-        let allowed_rotations = item.get("allowedRotations").and_then(Value::as_array).map(|a| {
-            a.iter()
-                .filter_map(|n| n.as_f64().map(|d| d as f32))
-                .collect::<Vec<f32>>()
-        });
+        let allowed_rotations = item
+            .get("allowedRotations")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.as_f64().map(|d| d as f32))
+                    .collect::<Vec<f32>>()
+            });
         let svg = std::fs::read(dir.join(format!("{item_id}.svg"))).ok()?;
         total += count;
         parts.push(PartInput {
@@ -310,12 +314,17 @@ fn oracle_corpus() {
                     },
                     Box::new(std::io::BufWriter::new(trace)),
                 );
-                let strategy =
-                    strategy_for(&case, AdaptiveNestingStrategy::new().with_oracle(oracle.clone()));
+                let strategy = strategy_for(
+                    &case,
+                    AdaptiveNestingStrategy::new().with_oracle(oracle.clone()),
+                );
                 let result = run(&case, &strategy);
                 let rep = oracle.finish().unwrap();
                 if rep.guards_fired > 0 {
-                    failures.push(format!("{}: {} time guards fired", case.name, rep.guards_fired));
+                    failures.push(format!(
+                        "{}: {} time guards fired",
+                        case.name, rep.guards_fired
+                    ));
                 }
                 let doc = json!({
                     "case": case.name, "mode": mode, "partsTotal": case.total,
@@ -326,8 +335,11 @@ fn oracle_corpus() {
                     "warnings": warnings_json(),
                     "versions": versions(),
                 });
-                std::fs::write(out.join("oracle.json"), serde_json::to_vec_pretty(&doc).unwrap())
-                    .unwrap();
+                std::fs::write(
+                    out.join("oracle.json"),
+                    serde_json::to_vec_pretty(&doc).unwrap(),
+                )
+                .unwrap();
                 eprintln!(
                     "{}: {:?} placed {:?} samples {} hash {:016x}",
                     case.name,
@@ -346,17 +358,25 @@ fn oracle_corpus() {
                     }
                 };
                 let oracle = Oracle::new(OracleConfig::default());
-                let strategy =
-                    strategy_for(&case, AdaptiveNestingStrategy::new().with_oracle(oracle.clone()));
+                let strategy = strategy_for(
+                    &case,
+                    AdaptiveNestingStrategy::new().with_oracle(oracle.clone()),
+                );
                 let result = run(&case, &strategy);
                 let rep = oracle.finish().unwrap();
                 let got_result = result.as_ref().map(result_json).unwrap_or(Value::Null);
                 let got_runs = report_json(&rep)["runs"].clone();
                 if got_result != traced["result"] {
-                    failures.push(format!("{}: untraced layout differs from the traced", case.name));
+                    failures.push(format!(
+                        "{}: untraced layout differs from the traced",
+                        case.name
+                    ));
                 }
                 if got_runs != traced["oracle"]["runs"] {
-                    failures.push(format!("{}: untraced runs differ from the traced", case.name));
+                    failures.push(format!(
+                        "{}: untraced runs differ from the traced",
+                        case.name
+                    ));
                 }
                 eprintln!("{}: compared", case.name);
             }
@@ -377,10 +397,90 @@ fn oracle_corpus() {
                     serde_json::to_vec_pretty(&doc).unwrap(),
                 )
                 .unwrap();
-                eprintln!("{}: production {} ms", case.name, started.elapsed().as_millis());
+                eprintln!(
+                    "{}: production {} ms",
+                    case.name,
+                    started.elapsed().as_millis()
+                );
             }
             other => panic!("unknown ORACLE_MODE {other}"),
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The traced copy of LBF against the library solver on two production cases committed in this
+/// repository (no corpus needed): case-047 routes straight to LBF, case-018 is a MixedFewTypes
+/// request that falls back to it. Both must give the library's layout and runs, and the trace
+/// hash recorded by the N0 oracle run of 78d3703b (`oracle/case-NNN/oracle.json`).
+#[test]
+fn traced_copy_matches_the_library_on_committed_cases() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../jagua-sqs-processor/tests/testdata/prod-tests");
+    for (name, class, fell_back, hash) in [
+        ("case-047", "General", false, "423826ed1ab08280"),
+        ("case-018", "MixedFewTypes", true, "21d8e4d7b63eb321"),
+    ] {
+        let case = load_case(&root.join(name)).expect(name);
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let traced = {
+            let oracle = Oracle::with_trace(
+                OracleConfig {
+                    sample_window: 0..50,
+                    ..OracleConfig::default()
+                },
+                Box::new(SharedBuf(buf.clone())),
+            );
+            let sink = oracle.clone();
+            let result = run(
+                &case,
+                &strategy_for(&case, AdaptiveNestingStrategy::new().with_oracle(sink)),
+            )
+            .expect(name);
+            let rep = oracle.finish().unwrap();
+            (result_json(&result), report_json(&rep))
+        };
+        let plain = {
+            let oracle = Oracle::new(OracleConfig::default());
+            let result = run(
+                &case,
+                &strategy_for(
+                    &case,
+                    AdaptiveNestingStrategy::new().with_oracle(oracle.clone()),
+                ),
+            )
+            .expect(name);
+            (result_json(&result), report_json(&oracle.finish().unwrap()))
+        };
+        assert_eq!(traced.0, plain.0, "{name}: layout");
+        assert_eq!(traced.1["runs"], plain.1["runs"], "{name}: runs");
+        assert_eq!(traced.1["guardsFired"], 0, "{name}: guards");
+        assert_eq!(traced.1["route"]["class"], class, "{name}: class");
+        assert_eq!(traced.1["route"]["fellBack"], fell_back, "{name}: fallback");
+        assert_eq!(traced.1["route"]["packer"], "lbf", "{name}: packer");
+        assert_eq!(traced.1["traceHash"], hash, "{name}: trace hash");
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.lines().any(|l| l.starts_with("{\"k\":\"s\"")),
+            "{name}: no window sample line"
+        );
+        assert!(
+            text.lines()
+                .last()
+                .is_some_and(|l| l.starts_with("{\"k\":\"end\"")),
+            "{name}: no end line"
+        );
+    }
+}
+
+struct SharedBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
