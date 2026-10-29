@@ -158,10 +158,13 @@ struct Counter;
 
 impl log::Log for Counter {
     fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-        m.level() <= log::Level::Warn
+        m.level() <= log::max_level()
     }
     fn log(&self, r: &log::Record<'_>) {
         if r.level() > log::Level::Warn {
+            // `$ORACLE_LOG_INFO=1`: info lines go to stderr with the seconds since the logger
+            // started, to see where a request spends its wall clock.
+            eprintln!("[{:9.3}] {}", log_clock().elapsed().as_secs_f64(), r.args());
             return;
         }
         let msg = r.args().to_string();
@@ -181,11 +184,22 @@ impl log::Log for Counter {
     fn flush(&self) {}
 }
 
+fn log_clock() -> &'static Instant {
+    static T: OnceLock<Instant> = OnceLock::new();
+    T.get_or_init(Instant::now)
+}
+
 fn install_counter() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         log::set_boxed_logger(Box::new(Counter)).expect("logger");
-        log::set_max_level(log::LevelFilter::Warn);
+        let info = std::env::var("ORACLE_LOG_INFO").is_ok_and(|v| v == "1");
+        log::set_max_level(if info {
+            log::LevelFilter::Info
+        } else {
+            log::LevelFilter::Warn
+        });
+        log_clock();
     });
     *warnings().lock().unwrap() = Warnings::default();
 }
