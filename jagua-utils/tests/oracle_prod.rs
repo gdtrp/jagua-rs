@@ -107,7 +107,13 @@ fn backend_offcut_policy() -> OffcutPolicy {
 }
 
 fn strategy_for(case: &Case, base: AdaptiveNestingStrategy) -> AdaptiveNestingStrategy {
-    let s = base.with_offcut_policy(backend_offcut_policy());
+    // The worker attaches the offcut policy on the normal path only, never on max-fit
+    // (jagua-sqs-processor processor.rs:1574-1582).
+    let s = if case.max_fit {
+        base
+    } else {
+        base.with_offcut_policy(backend_offcut_policy())
+    };
     match case.fill {
         Some((d, c)) => s.with_layout(d, c),
         None => s,

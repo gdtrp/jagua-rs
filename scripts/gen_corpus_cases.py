@@ -59,6 +59,7 @@ def signature(binw, binh, rot, spacing, max_fit, fill, corner, items):
 
 
 def main(csv_path, cases_dir, dxf_dir, vk):
+    csv.field_size_limit(sys.maxsize)  # request_data of a large job exceeds the 128 KB default
     existing = sorted(glob.glob(os.path.join(cases_dir, "case-*")))
     seen = set()
     for d in existing:
