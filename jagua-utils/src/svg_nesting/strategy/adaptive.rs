@@ -881,6 +881,11 @@ impl AdaptiveNestingStrategy {
         let bin_stock = bin_stock_override.unwrap_or(total_parts_requested);
         let bin = Bin::new(container_template.clone(), bin_stock, 0);
         let instance = BPInstance::new(items, vec![bin]);
+        if let Some(o) = &self.oracle
+            && o.traced()
+        {
+            o.note_instance(&instance, &item_id_to_part_id, spacing, (bin_width, bin_height));
+        }
 
         // Adaptive optimization loop
         let optimization_start = Instant::now();

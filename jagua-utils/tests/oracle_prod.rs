@@ -109,7 +109,10 @@ fn backend_offcut_policy() -> OffcutPolicy {
 fn strategy_for(case: &Case, base: AdaptiveNestingStrategy) -> AdaptiveNestingStrategy {
     // The worker attaches the offcut policy on the normal path only, never on max-fit
     // (jagua-sqs-processor processor.rs:1574-1582).
-    let s = if case.max_fit {
+    // $ORACLE_NO_OFFCUTS=1 (RFC-030 N3's s-window recordings): offcut detection runs after the
+    // solve and changes no LBF decision, and on the large cases it costs hours (JK-6).
+    let no_offcuts = std::env::var("ORACLE_NO_OFFCUTS").is_ok_and(|v| v == "1");
+    let s = if case.max_fit || no_offcuts {
         base
     } else {
         base.with_offcut_policy(backend_offcut_policy())

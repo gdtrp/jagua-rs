@@ -216,6 +216,65 @@ impl Oracle {
         }
     }
 
+    /// The instance an LBF solve runs on, once per request (RFC-030 N3: the Go port's verdict
+    /// replay builds the same items from the part SVGs and checks them against this line). Item
+    /// ids are part indices; `part` is the part's itemId; shapes are the internal (inflated,
+    /// centred) outlines and the deflated sheet, as f32 bits.
+    pub(crate) fn note_instance(
+        &self,
+        instance: &jagua_rs::probs::bpp::entities::BPInstance,
+        part_ids: &[Option<String>],
+        spacing: f32,
+        bin: (f32, f32),
+    ) {
+        use jagua_rs::geometry::geo_enums::RotationRange;
+        let pts = |p: &jagua_rs::geometry::primitives::SPolygon| {
+            p.vertices
+                .iter()
+                .map(|v| format!("\"{:08x} {:08x}\"", v.0.to_bits(), v.1.to_bits()))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let items = instance
+            .items
+            .iter()
+            .map(|(it, qty)| {
+                let rot = match &it.allowed_rotation {
+                    RotationRange::None => "\"none\"".to_string(),
+                    RotationRange::Continuous => "\"cont\"".to_string(),
+                    RotationRange::Discrete(a) => format!(
+                        "[{}]",
+                        a.iter().map(|r| format!("\"{:08x}\"", r.to_bits())).collect::<Vec<_>>().join(",")
+                    ),
+                };
+                let part = part_ids.get(it.id).cloned().flatten().unwrap_or_default();
+                format!(
+                    "{{\"id\":{},\"part\":\"{}\",\"qty\":{},\"rot\":{},\"shape\":[{}]}}",
+                    it.id,
+                    part,
+                    qty,
+                    rot,
+                    pts(&it.shape_cd)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let bins = instance
+            .bins
+            .iter()
+            .map(|b| format!("{{\"stock\":{},\"outer\":[{}]}}", b.stock, pts(&b.container.outer_cd)))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.event(format!(
+            "{{\"k\":\"inst\",\"spacing\":\"{:08x}\",\"bin\":[\"{:08x}\",\"{:08x}\"],\"bins\":[{}],\"items\":[{}]}}",
+            spacing.to_bits(),
+            bin.0.to_bits(),
+            bin.1.to_bits(),
+            bins,
+            items
+        ));
+    }
+
     fn event(&self, line: String) {
         self.lock().write_line(&line);
     }
