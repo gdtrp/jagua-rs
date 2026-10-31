@@ -984,3 +984,79 @@ mod tests {
         );
     }
 }
+
+/// RFC-030 N4 (dxf-processor): the packer-side geometry jagua-rs computes on real part SVGs, so the Go
+/// port (dxfcalc/internal/nestengine/pack) is checked value for value: measure_part, prepare, the
+/// lattice's outer ring, inflation, decimation and centred polygons. Test-only, oracle feature;
+/// nothing here runs in production.
+///   KERNEL_SVG_DIR=/svg cargo test -p jagua-utils --features oracle --lib pack_vectors -- --nocapture
+#[cfg(all(test, feature = "oracle"))]
+mod pack_vectors {
+    use super::*;
+    use crate::svg_nesting::render::measure_part;
+
+    fn b(v: f32) -> String {
+        format!("{:08x}", v.to_bits())
+    }
+    fn pts(p: &[Point]) -> Vec<String> {
+        p.iter().map(|q| format!("{} {}", b(q.0), b(q.1))).collect()
+    }
+    fn spoly(p: &Result<SPolygon>) -> serde_json::Value {
+        match p {
+            Ok(p) => serde_json::json!({
+                "vertices": pts(&p.vertices), "area": b(p.area), "diameter": b(p.diameter),
+                "poles": p.surrogate.as_ref().map(|s| s.poles.iter().map(|c| [b(c.center.0), b(c.center.1), b(c.radius)]).collect::<Vec<_>>()),
+            }),
+            Err(e) => serde_json::json!({"error": e.to_string()}),
+        }
+    }
+
+    #[test]
+    fn pack_vectors() {
+        let dir = std::env::var("KERNEL_SVG_DIR").expect("KERNEL_SVG_DIR");
+        let out = format!("{}/pack_vectors", std::env::var("ORACLE_OUT").expect("ORACLE_OUT"));
+        std::fs::create_dir_all(&out).unwrap();
+        let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "svg")).collect();
+        paths.sort();
+        for path in paths {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            let part = PartInput { svg_bytes: std::fs::read(&path).unwrap(), count: 1, item_id: None, allowed_rotations: None };
+            let m = measure_part(&part).unwrap();
+            let rr = RotationRange::Discrete(vec![0.0]);
+            let (prepared, _ctx) = prepare(std::slice::from_ref(&part), std::slice::from_ref(&rr), 100000.0, 100000.0, 1).unwrap();
+            let p = &prepared[0];
+            let raw = outer_ring(&part).unwrap();
+            let raw_poly = SPolygon::new(raw.clone()).unwrap();
+            let c = raw_poly.centroid();
+            let raw_centered = centered_spolygon(&raw);
+            let mut spacings = vec![];
+            for s in [0.2f32, 2.0, 6.0, 20.0] {
+                let infl = inflate_ring(&raw, s / 2.0);
+                let diam = raw_centered.as_ref().map(|r| r.diameter).unwrap_or(0.0);
+                let mut tol = (diam * 0.01).max(0.05);
+                let mut search = decimate(&infl, tol);
+                let mut tols = vec![b(tol)];
+                for _ in 0..8 {
+                    if search.len() <= 20 {
+                        break;
+                    }
+                    tol *= 1.7;
+                    search = decimate(&infl, tol);
+                    tols.push(b(tol));
+                }
+                spacings.push(serde_json::json!({
+                    "spacing": b(s), "infl": pts(&infl), "tols": tols, "search": pts(&search),
+                    "base0": spoly(&centered_spolygon(&search)), "full_infl": spoly(&centered_spolygon(&infl)),
+                }));
+            }
+            let doc = serde_json::json!({
+                "name": name,
+                "measure": {"bbox_w": b(m.bbox_w), "bbox_h": b(m.bbox_h), "area": b(m.area), "n_vertices": m.n_vertices, "n_holes": m.n_holes, "rect": b(m.rectangularity())},
+                "prepare": {"bbox_w": b(p.bbox_w), "bbox_h": b(p.bbox_h), "cx_off": b(p.cx_off), "cy_off": b(p.cy_off), "centroid": [b(c.0), b(c.1)], "area": b(raw_poly.area)},
+                "ring": pts(&raw), "raw_centered": spoly(&raw_centered), "spacings": spacings,
+            });
+            std::fs::write(format!("{out}/{name}.json"), serde_json::to_string(&doc).unwrap()).unwrap();
+            eprintln!("{name}: done");
+        }
+    }
+}
