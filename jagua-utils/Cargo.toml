@@ -22,6 +22,8 @@ geo = "0.24"
 geo-buffer = { workspace = true }
 
 [dev-dependencies]
+# RFC-030 N3: the RNG/sampler vector writer (tests/rng_vectors.rs) draws Normal<f32> directly.
+rand_distr = { workspace = true }
 env_logger = { workspace = true }
 serde_json = { workspace = true }
 # Heap accounting for the memory regression test (cutl_tests392_hive_memory.rs): a counting

@@ -2070,6 +2070,7 @@ dependencies = [
  "lbf",
  "log",
  "rand 0.10.0",
+ "rand_distr",
  "rayon",
  "regex",
  "serde",
