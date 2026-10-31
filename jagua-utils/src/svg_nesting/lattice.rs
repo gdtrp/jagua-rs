@@ -1049,7 +1049,17 @@ mod pack_vectors {
                     "base0": spoly(&centered_spolygon(&search)), "full_infl": spoly(&centered_spolygon(&infl)),
                 }));
             }
+            // lattice_single_sheet itself, on a 3000 x 1500 sheet, both base rotations, double allowed.
+            let mut lattices = vec![];
+            for s in [2.0f32, 5.0, 20.0] {
+                let st = lattice_single_sheet(3000.0, 1500.0, s, &part, &[0.0, std::f32::consts::FRAC_PI_2], true);
+                lattices.push(match st {
+                    Ok((_, pls)) => serde_json::json!({"spacing": b(s), "placements": pls.iter().map(|p| format!("{} {} {}", b(p.rotation), b(p.x), b(p.y))).collect::<Vec<_>>()}),
+                    Err(e) => serde_json::json!({"spacing": b(s), "error": e.to_string()}),
+                });
+            }
             let doc = serde_json::json!({
+                "lattices": lattices,
                 "name": name,
                 "measure": {"bbox_w": b(m.bbox_w), "bbox_h": b(m.bbox_h), "area": b(m.area), "n_vertices": m.n_vertices, "n_holes": m.n_holes, "rect": b(m.rectangularity())},
                 "prepare": {"bbox_w": b(p.bbox_w), "bbox_h": b(p.bbox_h), "cx_off": b(p.cx_off), "cy_off": b(p.cy_off), "centroid": [b(c.0), b(c.1)], "area": b(raw_poly.area)},
