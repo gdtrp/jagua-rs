@@ -386,6 +386,9 @@ fn oracle_corpus() {
                 // RFC-030 N5's f64 quality lane, jagua's side: each seed set ($ORACLE_SEEDS, 30)
                 // in oracle mode (counted samples, no clock), untraced; per seed the sheets, the
                 // parts placed, the utilisation and the runs.
+                if out.join("quality.json").exists() {
+                    continue; // done in an earlier run: the lane resumes
+                }
                 let seeds: usize = std::env::var("ORACLE_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
                 let mut per_seed = Vec::new();
                 for s in 1..=seeds {
