@@ -43,6 +43,10 @@ pub struct OracleConfig {
     pub sample_window: Range<u64>,
     /// Sample events per checkpoint line.
     pub checkpoint_every: u64,
+    /// The first run's number (RFC-030 N5 quality lane): run k of a nest is first_run + k − 1, its
+    /// seeds (first_run + k − 1)·1000 + loop and its ls_frac by that number. 1 is production's.
+    /// Only the numbering moves; the run count and every other decision are unchanged.
+    pub first_run: usize,
 }
 
 impl Default for OracleConfig {
@@ -51,6 +55,7 @@ impl Default for OracleConfig {
             wave_size: 1,
             sample_window: 0..0,
             checkpoint_every: 1000,
+            first_run: 1,
         }
     }
 }

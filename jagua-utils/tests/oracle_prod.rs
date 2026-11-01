@@ -295,12 +295,20 @@ fn window() -> std::ops::Range<u64> {
 fn cases() -> Vec<PathBuf> {
     let root = env_path("ORACLE_CORPUS");
     let only = std::env::var("ORACLE_CASE").ok();
+    // $ORACLE_CASES: a comma-separated list (the quality lane's LBF cases)
+    let list: Option<Vec<String>> = std::env::var("ORACLE_CASES")
+        .ok()
+        .map(|v| v.split(',').map(str::to_string).collect());
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
         .expect("corpus")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.join("data.json").exists())
         .filter(|p| match &only {
             Some(c) => p.file_name().is_some_and(|n| n.to_string_lossy() == *c),
+            None => true,
+        })
+        .filter(|p| match &list {
+            Some(l) => p.file_name().is_some_and(|n| l.iter().any(|c| *c == n.to_string_lossy())),
             None => true,
         })
         .collect();
@@ -333,6 +341,8 @@ fn oracle_corpus() {
                 let oracle = Oracle::with_trace(
                     OracleConfig {
                         sample_window: window(),
+                        // $ORACLE_FIRST_RUN: the run numbering's start (the quality lane's seed sets)
+                        first_run: std::env::var("ORACLE_FIRST_RUN").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
                         ..OracleConfig::default()
                     },
                     Box::new(std::io::BufWriter::new(trace)),
@@ -371,6 +381,38 @@ fn oracle_corpus() {
                     rep.sample_events,
                     rep.trace_hash
                 );
+            }
+            "quality" => {
+                // RFC-030 N5's f64 quality lane, jagua's side: each seed set ($ORACLE_SEEDS, 30)
+                // in oracle mode (counted samples, no clock), untraced; per seed the sheets, the
+                // parts placed, the utilisation and the runs.
+                let seeds: usize = std::env::var("ORACLE_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+                let mut per_seed = Vec::new();
+                for s in 1..=seeds {
+                    let started = Instant::now();
+                    let oracle = Oracle::new(OracleConfig { first_run: 1 + (s - 1) * 1000, ..OracleConfig::default() });
+                    let strategy = strategy_for(&case, AdaptiveNestingStrategy::new().with_oracle(oracle.clone()));
+                    let result = run(&case, &strategy);
+                    let rep = oracle.finish().unwrap();
+                    if rep.guards_fired > 0 {
+                        failures.push(format!("{} seed {s}: {} time guards fired", case.name, rep.guards_fired));
+                    }
+                    per_seed.push(json!({
+                        "seed": s, "firstRun": 1 + (s - 1) * 1000,
+                        "sheets": result.as_ref().map(|r| r.pages.len()).ok(),
+                        "partsPlaced": result.as_ref().map(|r| r.parts_placed).ok(),
+                        "utilisation": result.as_ref().map(|r| r.utilisation as f64).ok(),
+                        "runs": report_json(&rep)["runs"].as_array().map(|a| a.len()),
+                        "ms": started.elapsed().as_millis() as u64,
+                        "error": result.as_ref().err().map(|e| format!("{e:#}")),
+                    }));
+                    eprintln!("{} seed {s}: {:?} sheets", case.name, result.as_ref().map(|r| r.pages.len()).ok());
+                }
+                std::fs::write(
+                    out.join("quality.json"),
+                    serde_json::to_vec_pretty(&json!({ "case": case.name, "seeds": per_seed })).unwrap(),
+                )
+                .unwrap();
             }
             "compare" => {
                 let traced: Value = match std::fs::read(out.join("oracle.json")) {

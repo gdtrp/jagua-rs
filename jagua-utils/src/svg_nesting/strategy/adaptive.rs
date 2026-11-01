@@ -1100,13 +1100,15 @@ impl AdaptiveNestingStrategy {
                         wave_size
                     );
                 }
+                // Oracle-only (RFC-030 N5 quality lane): the run numbering may start elsewhere.
+                let run_offset = self.oracle.as_ref().map_or(0, |o| o.config.first_run.saturating_sub(1));
                 let optimization_result = self.run_parallel_wave(
                     &instance,
                     &cde_config,
                     spacing,
                     loops,
                     placements,
-                    total_runs,
+                    total_runs + run_offset,
                     wave_size,
                 );
                 drop(reservation);
