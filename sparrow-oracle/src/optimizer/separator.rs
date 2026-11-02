@@ -180,12 +180,11 @@ impl Separator {
 
         debug!("[MOD] optimizers w_o's: {:?}",self.workers.iter().map(|opt| opt.ct.get_total_weighted_loss()).collect_vec());
         crate::oracle::add_evals(sep_report.total_evals);
-        let mut winner = 0;
-        for (i, w) in self.workers.iter().enumerate() {
-            if w.ct.get_total_weighted_loss() < self.workers[winner].ct.get_total_weighted_loss() {
-                winner = i;
-            }
-        }
+        // the winner as the selection below picks it: the first minimum in OrderedFloat order
+        let winner = self.workers.iter().enumerate()
+            .min_by_key(|(_, opt)| OrderedFloat(opt.ct.get_total_weighted_loss()))
+            .map(|(i, _)| i)
+            .unwrap();
         let mut it = Vec::with_capacity(12 * self.workers.len() + 8);
         for w in self.workers.iter() {
             it.extend_from_slice(&w.trace.to_le_bytes());

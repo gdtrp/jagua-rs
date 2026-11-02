@@ -12,6 +12,11 @@ Changes to Sparrow, all instrumentation or the 2.0.0 migration, none a fix:
 - hooks that call it in `optimizer/{worker,separator,explore,compress,lbf}.rs`;
 - `src/bin/oracle.rs`: one run; simplification off, compression's decay `FailureBased`.
 
+The trace's winner is the selection's own (`min_by_key(OrderedFloat)`, NaN above everything).
+Reference traces come from the **amd64** build (`CARGO_TARGET_DIR=target-amd64`, `--platform
+linux/amd64`): production and the Go parity lane are amd64, and arm64 differs (its default NaN is
+`7fc00000`, x86's `ffc00000`; glibc's float32 trig can round differently).
+
 Build and run (its own workspace, outside the fork's):
 
     docker run --rm -v "$PWD:/src" -w /src rust:1.90-bookworm cargo build --release --bin oracle
