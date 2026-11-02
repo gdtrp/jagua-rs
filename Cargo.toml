@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["jagua-rs", "lbf", "jagua-utils", "jagua-sqs-processor"]
+# sparrow-oracle is its own workspace: it builds on jagua-rs 2.0.0, not the fork (RFC-030 N10)
+exclude = ["sparrow-oracle"]
 
 [workspace.dependencies]
 ndarray = "0.17"
