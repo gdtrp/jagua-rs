@@ -38,7 +38,13 @@ fn main() -> anyhow::Result<()> {
     let instance = jagua_rs::probs::spp::io::import_instance(&importer, &ext_instance)?;
     let initial = ext_solution.map(|e| jagua_rs::probs::spp::io::import_solution(&instance, &e)).transpose()?;
 
-    oracle::start(&a[2])?;
+    // "-" as the trace runs untraced and prints one timing line (RFC-030 N11's bench): no trace I/O
+    // inside the time.
+    let traced = a[2] != "-";
+    let started = std::time::Instant::now();
+    if traced {
+        oracle::start(&a[2])?;
+    }
     oracle::line(&format!(
         "{{\"k\":\"cfg\",\"seed\":{seed},\"expl\":{expl},\"cmpr\":{cmpr},\"workers\":{workers},\"warm\":{}}}",
         initial.is_some()
@@ -62,7 +68,32 @@ fn main() -> anyhow::Result<()> {
         oracle::evals()
     ));
     oracle::finish();
+    if !traced {
+        let (cpu_ms, rss) = proc_usage();
+        println!(
+            "{{\"engine\":\"rust\",\"mode\":\"sparrow\",\"ms\":{},\"evals\":{},\"width\":{},\"cpuMs\":{},\"peakRssKiB\":{}}}",
+            started.elapsed().as_millis(),
+            oracle::evals(),
+            sol.strip_width(),
+            cpu_ms,
+            rss
+        );
+    }
     let ext = jagua_rs::probs::spp::io::export(&sol, *sparrow::EPOCH);
     io::write_json(&ext, Path::new(&a[3]), log::Level::Info)?;
     Ok(())
+}
+
+/// utime + stime in ms and VmHWM in KiB from /proc/self (Linux).
+fn proc_usage() -> (u64, u64) {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let f: Vec<&str> = stat.rsplit_once(')').map(|(_, r)| r).unwrap_or("").split_whitespace().collect();
+    let t = |i: usize| f.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let hwm = std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find(|l| l.starts_with("VmHWM:"))
+        .and_then(|l| l.split_whitespace().nth(1).and_then(|n| n.parse().ok()))
+        .unwrap_or(0);
+    ((t(11) + t(12)) * 10, hwm)
 }
