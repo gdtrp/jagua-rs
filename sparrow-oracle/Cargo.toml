@@ -20,6 +20,10 @@ path = "src/bench.rs"
 name = "oracle"
 path = "src/bin/oracle.rs"
 
+[[bin]]
+name = "rng_vectors"
+path = "src/bin/rng_vectors.rs"
+
 [dependencies]
 jagua-rs = { features = ["spp"], git = "https://github.com/JeroenGar/jagua-rs", rev = "4661c08efa9cd9bbf4404abcb73ad337ca8fc778" }
 rand = "0.10"
