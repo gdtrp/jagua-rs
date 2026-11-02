@@ -4,7 +4,8 @@
 //! production router (`nest_auto`, or `nest_max_fit_auto` when the request asked for max-fit) and
 //! its answer is written to `$ORACLE_OUT/case-NNN/`. `$ORACLE_MODE` picks the run:
 //! - `oracle` (default): oracle mode with a trace: wave of 1, no wall-clock check, the route,
-//!   every LBF run and every sample decision recorded (`oracle.json`, `trace.jsonl`);
+//!   every LBF run and every sample decision recorded (`oracle.json`, `trace.jsonl`; with
+//!   `$ORACLE_SVG=1` also the page SVGs, `page-<i>.svg` and `last-page.svg`);
 //! - `compare`: oracle mode without the trace (the library solver), checked against the traced
 //!   run's `oracle.json`: the traced copy of LBF must be a copy, not a fork;
 //! - `production`: the production strategy as a 1-CPU pod runs it (`NEST_RUN_PARALLELISM=1` set by
@@ -219,6 +220,20 @@ fn bits(f: f32) -> String {
     format!("{:08x}", f.to_bits())
 }
 
+/// $ORACLE_SVG=1 (RFC-030 N6a's page parity): every page SVG as `page-<i>.svg` and the
+/// unplaced-parts sheet as `last-page.svg`, the bytes the worker would upload.
+fn write_svgs(out: &std::path::Path, r: &NestingResult) {
+    if !std::env::var("ORACLE_SVG").is_ok_and(|v| v == "1") {
+        return;
+    }
+    for (i, page) in r.page_svgs.iter().enumerate() {
+        std::fs::write(out.join(format!("page-{i}.svg")), page).unwrap();
+    }
+    if let Some(last) = &r.unplaced_parts_svg {
+        std::fs::write(out.join("last-page.svg"), last).unwrap();
+    }
+}
+
 fn result_json(r: &NestingResult) -> Value {
     let pages: Vec<Value> = r
         .pages
@@ -373,6 +388,9 @@ fn oracle_corpus() {
                     serde_json::to_vec_pretty(&doc).unwrap(),
                 )
                 .unwrap();
+                if let Ok(r) = &result {
+                    write_svgs(&out, r);
+                }
                 eprintln!(
                     "{}: {:?} placed {:?} samples {} hash {:016x}",
                     case.name,
